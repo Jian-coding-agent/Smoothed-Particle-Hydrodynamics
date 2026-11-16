@@ -1,0 +1,137 @@
+SPH - 3D SPH fluid-structure interaction solver (CMake / Visual Studio)
+=======================================================================
+
+REQUIREMENTS
+  * Visual Studio 2019 (16.x) with the "Desktop development with C++"
+    workload, INCLUDING a Windows 10/11 SDK.  The v142 toolset is what this
+    project targets; build.bat also falls back to VS2022/v143 if needed.
+  * CMake >= 3.20 (the one bundled with Visual Studio is fine)
+
+BUILD
+  Double-click build.bat          (Release)
+  or
+    build.bat -Configuration Debug
+
+  Manual alternative:
+    mkdir build
+    cd build
+    cmake ..
+    powershell -ExecutionPolicy Bypass -File ..\tools\finalize-generated.ps1 -Sln SPH.sln
+    cmake --build . --config Release --target SPH
+
+RUN IN VISUAL STUDIO
+  Open  build\SPH.sln  in Visual Studio, pick "x64 | Release" (or Debug),
+  press F5.
+
+MOVING THE FOLDER TO ANOTHER MACHINE / PATH
+  Copy ONLY the sources: 1.cpp, CMakeLists.txt, CMakePresets.json,
+  build.bat, build.ps1, tools\*, input.dat.
+
+  NEVER copy the  build\  directory to another machine.  A CMake build tree
+  is not portable: CMakeCache.txt and the generated projects remember the
+  absolute paths, the exact cl.exe path and the Windows SDK version of the
+  machine that created it.  Reusing such a cache is the classic cause of
+
+      C1083: cannot open include file: 'ctype.h'
+
+  because the compiler is told to look for headers in paths that only exist
+  on the other machine.
+
+  The Windows SDK version is no longer pinned: after configuring, the
+  generated project asks for "10.0", which means "newest installed SDK".
+  Before this change the project pinned the exact SDK of the build machine
+  (e.g. 10.0.26100.0), and that alone produced the C1083 ctype.h error.
+
+  You can also patch it by hand in Visual Studio instead of deleting build\:
+    SPH -> Properties -> Configuration Properties -> General
+        -> Windows SDK Version -> pick the one installed here
+    (or: right click the solution -> Retarget Solution)
+  Rebuild afterwards.  This is only a stop-gap: those values live in the
+  CMake-generated SPH.vcxproj and are overwritten by the next cmake run.
+
+  If you already copied a build\ directory over: just delete it and run
+  build.bat again.
+  again.  (build.bat also detects a foreign/stale cache by itself, prints
+  why, wipes it and reconfigures - close Visual Studio first if it refuses
+  to delete build\ because files are in use.)
+
+RUN FROM THE COMMAND LINE
+  Start it from the project root, because the program reads input.dat and
+  writes result<N>.dat relative to the current directory:
+
+    build\Release\SPH.exe
+
+  Optional environment variables:
+    SPH_THREADS   number of OpenMP threads (max 32)
+    SPH_MAXSTEP   maximum number of time steps (default 10000001)
+
+DEBUG / RELEASE
+  build.bat builds BOTH Release and Debug by default, so whichever
+  configuration you select in Visual Studio there is always an executable
+  (build\Release\SPH.exe and build\Debug\SPH.exe).
+
+  Release also produces a PDB now.  Visual Studio used to sit in the status
+  bar at "Loading symbols..." because a Release exe without symbols makes it
+  query the (slow, often unreachable) symbol servers.  If it still stalls:
+    Tools -> Options -> Debugging -> Symbols :
+        uncheck every symbol server (keep only the local cache)
+    or simply start the solver without the debugger (Ctrl+F5), or run
+        build\Release\SPH.exe
+  directly - for a long simulation you do not need the debugger at all.
+
+WHAT BUILD.BAT PRINTS FIRST
+  [0/3] environment
+        cmake : <path>
+        Visual Studio 2019 Community  toolsets: 14.29.30133
+        Windows SDK (ucrt) : 10.0.19041.0, 10.0.26100.0
+  Use that block to see what the machine is actually missing.
+
+TROUBLESHOOTING
+  1) C1083: cannot open include file: 'ctype.h'
+     (and afterwards Visual Studio says it cannot find SPH.exe)
+
+     Cause: the machine has no Windows SDK C-runtime headers, so compiling
+     fails and no SPH.exe is produced - "cannot find the exe" is only a
+     consequence of the failed build, not a startup-project problem.
+
+     Fix: Visual Studio Installer -> Modify -> in "Desktop development with
+     C++" make sure a "Windows 10 SDK" / "Windows 11 SDK" is checked,
+     install, then run build.bat again.
+
+  2) MSB8020: The build tools for v142 cannot be found
+     Fix: VS Installer -> Individual components -> install "MSVC v142 - VS
+     2019 C++ x64/x86 build tools", or use another toolset:
+       build.bat -Generator "Visual Studio 17 2022" -Toolset v143
+
+  3) CMake cannot find an instance of Visual Studio
+     Install Visual Studio with the C++ workload, or pass -Generator.
+
+  4) "The solution contains ALL_BUILD" / VS tries to run ALL_BUILD
+     You generated the solution with a bare "cmake .." instead of build.bat,
+     so CMake re-added its helper project. Re-run:
+       powershell -ExecutionPolicy Bypass -File tools\finalize-generated.ps1 -Sln build\SPH.sln
+
+  5) Debug run aborts immediately (exit code 3) / "Debug Assertion Failed"
+     Was a bug in 1.cpp, fixed in this package:
+       * pair_i[k] / pair_j[k] were read beyond vector::size() (the pair list
+         is filled through data() without resizing), and the Debug STL bounds
+         check aborts on that -> now pair_i.data()[k] / pair_j.data()[k];
+       * the OpenMP reduction loops wrote the shared global 'i' from several
+         threads (data race).  In Debug this zeroed the deformation gradient,
+         which produced log10(0)/0-0 = -nan in the output -> the four reduction
+         pragmas now carry firstprivate(i).
+     If you still see exit code 3, send the message printed by the CRT.
+
+NOTES
+  * Zero absolute paths in the project files: everything is relative, so the
+    folder can be copied anywhere (including paths with Chinese characters).
+  * ALL_BUILD / ZERO_CHECK helper projects are removed automatically after
+    configuring, so the solution contains only SPH and F5 launches it.
+  * tools\CompareResults.exe <dirA> <dirB> compares two result sets.
+
+WHAT CHANGED IN 1.cpp (vs the original solver)
+  1. pair_i[k]/pair_j[k]      -> pair_i.data()[k]/pair_j.data()[k]   (6 places)
+  2. 4x "#pragma omp parallel for schedule(static) num_threads(nth)"
+                              -> add firstprivate(i)
+  Both are bug fixes without changing the scheme; Release results stay
+  equivalent (only the usual last-digit differences between runs).

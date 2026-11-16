@@ -1,0 +1,803 @@
+# SPH on CUDA  -  design and porting notes
+
+A GPU port of the three-dimensional smoothed-particle-hydrodynamics fluid-structure
+interaction solver that lives in `1.cpp` of the original package.  The solver is
+templated on the scalar type, so the same code runs in double (default) or single
+precision.
+
+Everything below is measured on the machine used for the port:
+
+| | |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5080, `sm_120`, 84 SMs, 16 GB, driver 610.88 |
+| CUDA | 13.3 (nvcc 13.3.73) |
+| Host | MSVC 14.51 (Visual Studio 2026 / 18.7), CMake 4.2.1, Windows 11 26200 |
+| CPU (reference baseline) | Ryzen 9 9950X, 16C/32T, 253 GB RAM |
+
+---
+
+## 1. Summary
+
+| | |
+|---|---|
+| Particles | 237 298 = 101 250 fluid (`itype=2`) + 60 320 solid (`itype=-20`) + 75 728 wall (`itype=-2`) |
+| Neighbour pairs | 11 102 707 at t=0 (~94 per particle), 3x3x3 cells of edge 0.03 m over a fixed box |
+| Reference (CPU, 32 threads) | 500 steps in 105.6 s -> **211 ms/step** |
+| Port, fp64 | **12.42 ms/step** -> 17.0x vs the 32-thread CPU |
+| Port, fp32 | **2.43 ms/step** -> 87x vs the 32-thread CPU |
+| Validation | intermediate arrays agree to 1e-15...1e-9 relative at step 1; 500- and 3000-step output within the CPU's own run-to-run noise |
+
+---
+
+## 2. The reference solver (`1.cpp`)
+
+### 2.1 Algorithm
+
+Weakly compressible SPH whose pair interactions are evaluated through an
+**approximate Riemann solver** (Riemann-SPH style), plus a total-Lagrangian SPH
+solid and a mirror-Riemann fluid-structure coupling.
+
+* Kernel: **quintic spline**, `h = 1.5*hsml`, support `2h = 3*hsml = 0.03 m`:
+
+  `W(q) = 21/(256 pi h^3) * (1+2q)(2-q)^4`, `q = r/h in [0,2]`
+
+* Equation of state (fluid, **linear**): `p = c0^2(rho - 1000)`, `c0 = 48 m/s`,
+  clamped to `p = 0` for `rho < 1000`.
+* Continuity: `drho_i/dt = -2 rho_i (m_j/rho_j) (U_L - U*) * dW/dr`
+* Momentum: `dv_i/dt = -2 m_j (P*/(rho_i rho_j)) gradW`
+* Riemann state:
+
+  `U* = 1/2(U_L+U_R) + 1/2(p_L-p_R)/(1/2(rho_L+rho_R)c0)`
+
+  `P* = 1/2(p_L+p_R) + 1/2(1/2(rho_L+rho_R))c0(U_L-U_R)*min(3*max(U_L-U_R,0)/c0, 1)`
+
+* Viscosity: Morris-type Laplacian, `2 m_j eta S (v_i-v_j)/(rho_j(r^2+0.01h^2))`,
+  `S = gradW*r`; `eta` switches between `2e-5` and `1e-3` (50x) depending on `|SurFD|`.
+* Solid: total Lagrangian.  `F` from the reference configuration with a fixed
+  gradient-correction matrix `A` (computed once by `GraCorrec`), `J = det F`,
+  `rho = rho0/J`, and
+
+  `P = mu(F - F^-^T) + lambda*log10(J)*F^-^T + P_D`
+
+  where `P_D` is a Kelvin-Voigt-like friction term.  Note **log10**, not ln.
+* Fluid/solid and fluid/wall pairs use the solid's surface normal `vecn`
+  (computed once at t=0) to build a mirror velocity and then the same Riemann
+  solver; the resulting `SForce` is applied to both sides.
+* Time integration: explicit Euler, fixed `dt = 1e-5`, velocity capped at 30 m/s.
+
+### 2.2 Data layout and sizes
+
+Component-major SoA: `double x[3][num]`, `vx[3][num]`, `X0[3][num]`, `vecn[3][num]`,
+`PIJW[3][num]`, `SForce[3][num]`, `dvxdt[3][num]`, `viscos[3][num]`, plus scalars
+(`rho, rho0, mass, p, itype, SurF, SurFD, drhodt`) and four 3x3 tensors stored as
+nine separate arrays (`A, F, DFdt, Pia`).
+
+69 doubles per particle = 552 B -> 131 MB of state, plus the OpenMP accumulation
+buffer `nth x 35 x num` doubles = **2.03 GB at 32 threads**.
+
+### 2.3 One time step
+
+```
+1. direct_find()        rebuild the uniform cell list, enumerate the pair list
+2. continue_density()
+   2.0 serial:  SurFD := SurF;  p := c0^2(rho-1000)  (clamped at 0)
+   2.1 pass1 over all pairs:
+         fluid/fluid        -> drhodt, dvxdt, viscos, SurF
+         fluid/(solid|wall) -> same, using the neighbour's normal
+         solid/solid        -> F, DFdt
+   2.2 reduce the 32 thread-private buffers back to the globals
+   2.3 solid constitution (per solid): DFdtB, J, rho = rho0/J, SD, PD, F^-^-1, Pia
+   2.4 pass2 over pairs that contain a solid:
+         solid/solid -> PIJW ; fluid/solid -> SForce on both sides
+   2.5 reduce again
+3. integrate: fluid rho and v (with gravity and a speed cap), solid v (with the
+   boundary clamp), then x += dt*v for every particle
+4. every 50 steps write result<N>.dat (237 298 lines x 14 columns)
+```
+
+### 2.4 Initialisation (once)
+
+* `init_grid()`  -  fixed box `[-0.10,0.70]x[-0.10,0.70]x[-0.10,1.20]`, cell edge
+  `3*hsml = 0.03` -> 27x27x44 = 32 076 cells (7.4 particles per cell).
+* `NorVector()`  -  one neighbour pass builds `vecn` (surface normals) for the
+  solid/wall particles.
+* `GraCorrec()`  -  one neighbour pass over solid/solid pairs builds the gradient
+  correction matrix `a`, then inverts it into `A`.
+
+### 2.5 Behaviours that had to be reproduced exactly
+
+These are the places where a "reasonable" rewrite silently changes the physics.
+
+| # | Source | Behaviour |
+|---|---|---|
+| 1 | `eta` | two consecutive `if`s, the second overwrites the first -> **both** sides of a pair use `SurFD[j]` (j = the higher-indexed particle) |
+| 2 | `SurF` | assigned every step from the pair sum (not accumulated); it is the "surface indicator" that drives `eta` |
+| 3 | `PRii` in pass2 | contains `PIJW[i]`, which is never written for fluid particles -> always 0 |
+| 4 | `AveV`, `DisGrad*`, `GLStrain*` | computed but never read (`GLStrain()` is commented out) -> dropped |
+| 5 | `dr` epsilons | pass1 adds `1e-13`, pass2 none, `NorVector` adds `1e-12` |
+| 6 | pair ordering | pairs are emitted with i<j, but every pair term is symmetric, so a gather is equivalent |
+| 7 | type tests | fluid `itype>0`, solid `itype<-10`, wall `itype=-2` (not a solid) |
+| 8 | output `p` | fluid: `p[i]`; otherwise `Pia11+Pia22+Pia33` (wall -> 0) |
+| 9 | `paii` | `0.25*rho0*1000*hsml`  -  the 1000 is a literal, not `rho0` |
+| 10 | solid density | overwritten by `rho0/J`; `abs(J)<1e-6` -> 1000, but `log10(J)` is still evaluated |
+
+---
+
+## 3. Port design
+
+### 3.1 Gather instead of the pair loop
+
+The CPU code walks the pair list once per pass and updates **both** particles of
+each pair.  On a GPU that needs either ~500 M atomics per step or 32 private
+buffers plus a reduction  -  and the reduction alone costs 22 % of the CPU runtime.
+
+Every pair term in this solver is symmetric in (i,j) once you notice that
+`e_j = -e_i`, `dwdx` is odd in its first argument and `UL-UR` is the same seen
+from either side.  So each particle can accumulate **its own half** of every
+interaction, and no atomics or reductions are needed at all:
+
+| quantity | gather form used here |
+|---|---|
+| `drhodt` | `-2rho_p(m_q/rho_q)(U_L-U_momentum)dwdr(dr)` |
+| `dvxdt` | `-2m_q(P*/(rho_prho_q))gradW(x_p-x_q)` |
+| `viscos` | `2m_qetaS(v_p-v_q)/(rho_q(r^2+0.01h^2))` |
+| `SurF` | `S*m_q/rho_q` |
+| `F`, `DFdt` | `(m_q/rho0_q)(x_q-x_p)(x)(A_p*g0_pq)` and `(m_q/rho0_q)(v_q-v_p)(x)g0_pq` |
+| `PIJW` | `(m_q/(rho_prho_q))[Pia_p*(A_p g0_pq) - Pia_q*(A_q g0_qp)]` |
+| `SForce` | each side uses its own coefficient and the other side's normal |
+
+The only asymmetric quantity is `eta` (item 1 above), which needs
+`SurFD[max(p,q)]`  -  this was the one real functional bug of the first version
+(sec.7.1).
+
+### 3.2 Kernel map (one thread per particle)
+
+| kernel | threads | work |
+|---|---|---|
+| `k_prepare` | 0...NUM | `SurFD := SurF`, `p`, `irho = 1/rho` |
+| `k_cell_hist` / `k_cell_scan` / `k_cell_scatter` | 0...NUM / 1 block / 0...NUM | counting sort of the particles into the fixed grid; `cellSolid` / `cellFluid` counts come out of the histogram |
+| `k_copy_xf` | 0...NUM | float copy of `x` for the A4 pre-filter (once; `k_update_pos` keeps it current) |
+| `k_pass1_fluid_fast` | 0...NTOTAL | fluid forces, factored inner loop (A5; `k_pass1_fluid` is the literal version) |
+| `k_pass1_solid_static` | NTOTAL...NALL | `F`, `DFdt` from the static solid pair list (A3; `k_pass1_solid` walks the grid) |
+| `k_constitution` | NTOTAL...NALL | 3x3 constitutive update, `rho = rho0/J`, `Pia` |
+| `k_pass2_fluid` | 0...NTOTAL | `SForce` from solid neighbours |
+| `k_pass2_solid_static` | NTOTAL...NALL | `PIJW` from the static list, `SForce` from fluid neighbours (A3) |
+| `k_update_fluid` / `k_update_solid` / `k_update_pos` | ranges | integration |
+| `k_nor_sumvecn`, `k_nor_normalize`, `k_gra_correc`, `k_gra_invert`, `k_build_solid_pack` | once | initialisation |
+| `k_solid_pair_count`, `k_solid_pair_fill` | once | A3 pair list, two passes over the reference configuration |
+
+### 3.3 Neighbour search
+
+Same fixed grid, same domain, same cell size, same clamping as `direct_find`.
+Each particle scans the 27 cells around its own cell and filters `r^2 < (3hsml)^2`.
+The membership test uses `__dadd_rn`/`__dmul_rn` instead of ordinary `+`/`*`, so
+the compiler cannot fuse them into an FMA: the lattice puts a large number of
+pairs exactly on `r = 3hsml` and without this the fp64 pair count differed from
+`direct_find()` by ~0.01 %.
+
+`sph_neigh2()` is the ILP variant: two neighbours per loop iteration, same
+neighbour set and same accumulation order (sec.6.3).
+
+Since A4 (sec.11) each candidate is first rejected by a **float** estimate of
+`r^2` against `r2max*(1+1e-4)`; only the survivors take the exact test above,
+which alone decides membership.  In the fp32 build the pre-filter is compiled out
+entirely (`if constexpr`), because there the exact test is already fp32.
+
+### 3.4 Memory
+
+| allocation | size (fp64) | size (fp32) |
+|---|---|---|
+| state (69 Reals/particle) | 131 MB | 65 MB |
+| `solidPack`  -  `{X0[3], A[9], rho0, mass}` per solid, built once | 6.8 MB | 3.4 MB |
+| `Pia`  -  12 Reals per solid (9 used + 3 pad), AoS, 16-B aligned | 5.8 MB | 2.9 MB |
+| A3 pair list: 5 371 593 pairs x (9 Reals + 1 int) | 389 MB | 210 MB |
+| `xf`  -  float copy of the positions (A4) | 2.8 MB | 2.8 MB |
+| cell list + sorted indices | 1.1 MB | 1.1 MB |
+| **total** | **~475 MB** (versus 2.03 GB of OpenMP buffers on the CPU) | **~233 MB** |
+
+The CPU's 2 GB per-thread accumulation buffer disappears completely because
+each particle's accumulators are private to its own thread.
+
+The A3 list is the one allocation that grew; 389 MB of 15.9 GB is not a
+constraint here, and the fp32 build needs 210 MB of it.  The list can be halved
+by dropping `sB` (see sec.12).
+
+### 3.5 Output
+
+`result<N>.dat` keeps the reference column layout (14 columns, tab separated,
+`%.6g`).  All values are converted to `double` before formatting, so the fp32 and
+fp64 builds produce files that the existing comparison tool can read unchanged.
+
+Since A2 the text is produced by `std::to_chars(..., general, 6)` instead of
+`snprintf("%.6g")` and in up to 8 contiguous chunks formatted on worker threads,
+written in order.  The result is byte-identical to the old single-threaded
+`snprintf` output (verified on all ten files, both precisions) and about five
+times faster: 0.34 s -> 0.07 s per file.
+
+---
+
+## 4. Precision template
+
+The solver is a template on `Real`; both instantiations are compiled into the
+same executable and selected at start-up.
+
+```bat
+sph_cuda.exe                 :: fp64 (default)
+sph_cuda.exe --fp32          :: fp32
+set SPH_PRECISION=fp32       :: same, via the environment
+```
+
+CMake side: `SPH_ENABLE_FP64`, `SPH_ENABLE_FP32` (both ON by default; switching
+one off halves the build time) and `SPH_DEFAULT_PRECISION`.
+
+Two implementation details matter:
+
+1. **Every floating-point literal is written `Real(x)`.**  Otherwise `0.5*(a+b)`
+   would silently promote parts of the fp32 path to double, and FP64 on this GPU
+   is 1/67 of FP32  -  one promotion eats the whole speed-up.  `cuobjdump -sass`
+   on an fp32-only build confirms there is no double arithmetic left.
+2. **Neighbour-list rounding stays explicit** (`sph_add_rn`/`sph_mul_rn`), which
+   for fp32 maps to `__fadd_rn`/`__fmul_rn`.
+
+---
+
+## 5. Validation
+
+### 5.1 Method
+
+Three independent checks, all against the **pristine** reference package:
+
+1. **Array-by-array**: both implementations dump `F`, `DFdt`, `rho`, `Pia`,
+   `SForce`, `PIJW`, `drhodt`, `dvxdt`, `viscos`, `SurF`, `vecn`, `a`, `A` after
+   one step; compare in binary (not through the 6-digit text output).
+2. **Trajectory**: compare `result0..9.dat` with `tools/CompareResults`.
+3. **Sanitisers**: `compute-sanitizer` `memcheck`, `initcheck`, `racecheck`,
+   `synccheck`.
+
+### 5.2 Reference case (500 steps)
+
+| column | differing values | maxAbs | CPU's own rerun-to-rerun noise |
+|---|---|---|---|
+| `x0 x1 x2` | **0** | **0** | 0 |
+| `rho`, `mass`, `itype`, `X00..X02`, `rho0` | **0** | **0** | 0 |
+| `p` | 81 155 | **1e-3** | 0.01 |
+| `vx0 / vx1 / vx2` | 245 / 1 372 / 13 | **1e-9** | 1e-9 |
+
+Every column sits inside the CPU's own reproducibility, and `p` is one order of
+magnitude tighter.  Bulk quantities over the same 500 steps: kinetic energy
+0.02 %, mean pressure 0.05 %, maximum pressure identical to five digits, mean
+plate displacement 0.0000 %.
+
+### 5.3 Intermediate arrays (1 step)
+
+| array | maxAbs | note |
+|---|---|---|
+| `F11` | 2.2e-15 | solid deformation gradient |
+| `DFdt11` | 2.0e-17 | |
+| `rho` (solid) | 3.0e-12 | |
+| `Pia11` | 2.5e-8 | stress |
+| `SForce0` | 2.8e-13 | fluid/solid coupling (second case) |
+| `PIJW0` | 1.3e-9 | |
+| `vecn0` | 7.5e-11 | surface normal |
+| `a11 / A11` | 2.7e-15 | gradient correction |
+| `drhodt` | 1.6e-11 | |
+| `viscos0` | 4.9e-15 | |
+| `SurF` | 4.9e-15 | |
+
+These are GPU-versus-**CPU** deviations, measured before A3/A4/A5 (which move the
+GPU away from the CPU by a further 1e-15/1e-12-relative; see sec.11.0 for the
+optimisation-versus-optimisation numbers).
+
+### 5.4 A second case is required
+
+The reference case has **zero fluid/solid pairs** (the plate does not touch the
+fluid; all coupling goes through walls).  That means `SForce`, `vecn` and `PRii`
+never execute, and their comparison is vacuous.  A second case was therefore
+built by relabelling all 75 728 wall particles as solid (`itype=-2 -> -20`),
+which produces a large number of fluid/solid pairs (`SForce` ~3.7e2).  Both
+implementations then agree to 1e-13 on `SForce` and to 1e-6 on the 200-step
+output.  A third case (particles given a 1e6x initial velocity and a density of
+500) exercises the speed cap and the density floor.
+
+### 5.4b Post-contact validation, 3000 steps
+
+An external review found that the 500-step reference set ends *before* the fluid
+reaches the plate: the first fluid/solid pair appears at **step 566**, so nothing
+in `result0..9.dat` exercises the coupling in the real geometry.
+
+The comparison was therefore extended to 3000 steps against the pristine CPU
+build (486 s CPU, 39.6 s GPU).  Result, over all 60 output files:
+
+| column | differing values | maxAbs |
+|---|---|---|
+| `x0 x1 x2`, `rho`, `mass`, `itype`, `X0`, `rho0` | **0** | **0** |
+| `p` | 486 257 | **0.01** |
+| `vx0 / vx1 / vx2` | 3 766 / 6 482 / 420 | **1e-9 / 1e-9 / 1e-8** |
+
+The per-file spread does not grow after contact (still ~8 300 lines and
+maxAbs <= 0.01 at file 59, same as at file 1), so the coupling path
+(`pass2_fluid`, the fluid branch of `pass2_solid`, the fluid/solid branch of
+`pass1_fluid`) tracks the CPU as well as the uncoupled phases do.  This run was
+made with A3+A4+A5 all enabled, i.e. the shipped configuration.
+
+### 5.5 Not exercised by any case
+
+| branch | why |
+|---|---|
+| `abs(Jacb) < 1e-6 -> rho = 1000` | `log10(Jacb)` is still evaluated, so both implementations produce NaN; only the NaN *locations* could be compared |
+| `abs(Da) < 1e-6 -> A = I` | needs a nearly singular reference configuration |
+| `min(3*dU/c0, 1)` limiter | `dU ~ 1e-2`, `c0 = 48` -> the limiter never activates |
+
+---
+
+## 6. Performance
+
+### 6.1 Per-kernel profile (`SPH_BENCH=1`, 20 iterations each, fp64)
+
+Shipped configuration (A3+A4+A5), RTX 5080:
+
+| kernel | ms/iter | share |
+|---|---|---|
+| `pass1_fluid` | 8.78 | 71 % |
+| `pass2_solid` | 1.15 | 9 % |
+| `pass1_solid` | 1.05 | 8 % |
+| cell list | 0.128 | 1 % |
+| `pass2_fluid` | 0.128 | 1 % |
+| constitution | 0.052 | |
+| prepare + three update kernels | 0.034 | |
+| **sum** | **11.32** | (12.42 ms/step measured; the rest is launch overhead) |
+
+For comparison, the same build with the pre-optimisation paths forced on
+(`SPH_SOLDDYN=1 SPH_LITERALFLUID=1`): `pass1_fluid` 11.18, `pass1_solid` 4.99,
+`pass2_solid` 5.94 -> sum 17.4 ms.  fp32 (all optimisations on).  Run-to-run variation of the bench numbers is about 1 %:
+
+| kernel | ms/iter |
+|---|---|
+| `pass1_fluid` | 0.760 |
+| `pass2_solid` | 0.636 |
+| `pass1_solid` | 0.552 |
+| cell list | 0.127 |
+| `pass2_fluid` | 0.105 |
+| constitution | 0.062 |
+| prepare + updates | 0.022 |
+| **sum** | **2.26** (2.43 ms/step measured) |
+
+fp32 is now spread thin: no single kernel dominates, so only the launch
+overhead (0.17 ms, 7 %) and `pass1_fluid` are worth attacking.
+
+### 6.2 How the bottleneck was identified
+
+`ncu` is installed (`C:\Program Files\NVIDIA Corporation\Nsight Compute ...`) but
+refuses to run: `ERR_NVGPUCTRPERM`, hardware counters need administrator rights
+and this account cannot write the driver's `RmProfilingAdminOnly` key.  So the
+analysis was done with controlled probes instead:
+
+* a probe kernel that performs **the same neighbour traversal and the same 13
+  loads but no arithmetic** -> 3.66 ms (fp64), 3.65 ms with the loads replaced by
+  coalesced addresses.  Scattered reads cost nothing here: within a warp the
+  particles are adjacent in cell order, so their neighbour lists overlap and the
+  L1/L2 hit rate is high.
+* therefore `pass1_fluid` = 3.7 ms of traversal + **10.6 ms of arithmetic**
+  (both figures are the pre-A3/A4/A5 baseline; today the same probe reports
+  2.15 ms and `pass1_fluid` is 8.78 ms).
+* `cuobjdump -sass` on the innermost loop then showed why the arithmetic is slow:
+  **17 `CALL.REL.NOINC` instructions**  -  every FP64 division and square root on
+  this GPU is a software subroutine.
+
+### 6.3 What worked, what did not
+
+| change | effect |
+|---|---|
+| Hoist `1/dr`, `1/(rho_i+rho_j)`, `1/(dr^2+0.01h^2)`, `1/rho` (new `irho` array), compile-time `1/h` | 17 -> 4 division calls per visit, **56 -> 37 ms/step** |
+| Share the kernel polynomial between `dwdr` and the three `dwdx` components | -24 FP64 ops per visit, **37 -> 31 ms** |
+| `__launch_bounds__(256, 4/5/6)` occupancy sweep | 14.5 / 14.3 / 14.3 ms  -  **no effect** |
+| Solid static data pack (`X0`, `A`, `rho0`, `mass`), 14 scattered loads -> 1-2 lines | `pass1_solid` 6.7 -> 6.3 ms |
+| Per-cell solid flag -> skip the empty `pass2_fluid` traversal | 2.28 -> 0.44 ms |
+| `Pia` AoS + `double2` vectorised loads (loads 64 -> 42) | **no gain**  -  the solid kernels are not load bound either |
+| `rsqrt` instead of `1/sqrt` | **slower** (14.3 -> 15.3 ms) |
+| ILP: 2 neighbours per loop iteration (`sph_neigh2`) | fp64 unchanged, **fp32 2.96 -> 2.48 ms** |
+| A3 static solid pair list (sec.12) | `pass1_solid` 4.96 -> **1.05**, `pass2_solid` 5.91 -> **1.14 ms** |
+| A5 factored `pass1_fluid` loop (sec.11.1) | 11.16 -> **8.78 ms** |
+| A4 float pre-filter in the neighbour test (sec.11.2) | traversal probe 4.17 -> **1.76 ms**, `pass1_fluid` 9.51 -> **8.78 ms** |
+| A4 also applied to the fp32 build | **slower** (+12 %, the exact test there is already fp32) -> guarded by `if constexpr` |
+| A2 `std::to_chars` + chunked formatting on worker threads | 0.34 -> **0.07 s per result file**, byte-identical text |
+| A6a merge the 3 x-cells of a row into one range (bit-identical) | **slower**: fp64 `pass1_fluid` 8.78 -> 9.79 ms, traversal probe 1.76 -> 1.82; reverted |
+
+The last two lines are the interesting ones: the fp64 kernels are limited by
+**FP64 pipe throughput**, not latency and not memory, which is why adding warps,
+reducing loads and adding instruction-level parallelism all fail to move them.
+fp32 is latency limited, so ILP pays off there.
+
+### 6.4 Current numbers
+
+After the external review, its two patches (sec. 7.4-7.7) and the review's three
+acceleration items A3/A4/A5 (sec. 11, 12).
+
+| | ms/step | vs 32-thread CPU (211 ms/step) |
+|---|---|---|
+| fp64 | **12.42** | **17.0x** |
+| fp32 | **2.43** | **87x** |
+
+The same trajectory, per change, fp64 500 steps:
+
+| build | ms/step |
+|---|---|
+| as reviewed (patches 01/02 + E7 + V2) | 25.19 |
+| + A3 static solid pair list | 15.77 |
+| + A5 factored `pass1_fluid` loop | 13.26 |
+| + A4 float neighbour pre-filter (shipped) | **12.42** |
+
+fp32 stayed near 2.43 ms/step throughout -- it is latency bound, not FP64-pipe
+bound, so removing FP64 operations buys little there.  Measured in the shipped
+binary against its own pre-optimisation paths: `pass1_fluid` 0.814 (literal) ->
+0.763 (A5), `pass1_solid` 0.699 -> 0.555 (A3), `pass2_solid` 0.752 -> 0.637 (A3),
+and A4 is compiled out (applying it there was measured as a 12 % *loss*).
+
+fp32 accuracy, measured over 500 steps against the fp64 build at result9:
+
+| quantity | before the fp32 fix | after |
+|---|---|---|
+| `x` maxAbs | 1.3e-5 m | **1e-6 m** |
+| solid `p` median / max | 72.9 Pa / 1291 Pa | **0.01 Pa / 0.17 Pa** |
+| fluid `p` maxAbs | 8.5 Pa | **0.2 Pa** |
+| `vx` maxAbs | 2.4e-3 m/s | **1e-5 m/s** |
+| `rho` maxAbs | 0.09 kg/m^3 | **0.01 kg/m^3** |
+| bulk: kinetic energy / mean pressure | 0.000 % / 0.18 % | 0.000 % / ~0.2 % |
+
+An earlier version of this document blamed the fp32 solid error on the
+conditioning of `lambda*log10(J)*F^-T`.  That is only the smaller part: the
+dominant cause was that **the state updates themselves fell below float
+resolution** (see sec. 7.4).  With that fixed, the remaining fp32 error is at the
+float quantisation floor: `p = c0^2(rho-1000)` with `rho` near 1000 has an ulp of
+6.1e-5, i.e. 0.14 Pa per pressure step.
+
+---
+
+## 7. Bugs found during the port (and fixed)
+
+### 7.1 `eta` used the neighbour instead of the higher-indexed particle
+
+The first version differed from the reference by up to 80 Pa on `p` after 500
+steps.  The cause was not chaos (an earlier and wrong conclusion): in `1.cpp`
+
+```c
+if(fabs(SurFD[i])<2.5){eta = 0.001;}else{eta = 0.00002;}
+if(fabs(SurFD[j])<2.5){eta = 0.001;}else{eta = 0.00002;}   // overwrites the first
+```
+
+so **both** sides of a pair use `SurFD[j]`, where `j` is the higher-indexed
+particle.  The gather used the neighbour's value, which is only correct when the
+current particle happens to be the `i` side; on the `j` side the artificial
+viscosity was off by a factor of 50.
+
+It is invisible at step 0 because `SurFD` is 0 there (it is a copy of `SurF`,
+which has not been computed yet), while after the first step **96 802 of
+101 250** fluid particles have `|SurF| >= 2.5`.  Fix: `SurFD[(p>q) ? p : q]`.
+
+### 7.2 `solidPack` read out of range
+
+The static pack only covers `[NTOTAL, NALL)`, but a particle with `itype<-10` can
+live outside that range (the second test case does exactly that).  The index ran
+past the end of the pack and produced NaNs.  Fix: an `inpack` test that falls
+back to the SoA arrays  -  `A` is 0 for those particles in `1.cpp` too.
+
+### 7.3 Debug dump still assumed the old `Pia` layout
+
+After the AoS change, the intermediate dump read `g.Pia + 8*NUM`, i.e. far past
+the 12*SOLNUM buffer, and `cudaMemcpy` failed with "invalid argument".  Fix: a
+dedicated `dump_pia()` that scatters the AoS blocks into nine `NUM`-long arrays.
+
+### 7.4 fp32: state updates below float resolution (review E1, high)
+
+With `dt = 1e-5` the position increment `dt*v` is 1e-9 to 1e-5 m, while one float
+ulp of a coordinate between 0.25 and 1 m is 3e-8 to 6e-8 m.  So
+`s.x[i] + dt*s.vx[i]` rounded straight back to `s.x[i]` for every particle slower
+than ~2 mm/s: those particles never moved, however long the run.  `rho` had the
+same problem, and `F` - built from differences of quantised positions - was then
+noise at the 1e-5..1e-3 strain level the solid actually sees.
+
+Measured on the input state: the float update changed nothing for 100 % of the
+moving solid x coordinates, 97.9 % of solid y and 54.5 % of solid z.  After 500
+steps the solid kinetic energy came out 4x too high and the solid `p` was off by
+8 % median (1291 Pa worst).
+
+Fix (external patch 02, verified here on the GPU), applied only when
+`Real = float`:
+
+1. `x` and `rho` advance with a compensated (Kahan) sum, carrying the rounding
+   error of each step in `xc` / `rhoc`;
+2. solid particles integrate the displacement `u = x - X0` (formed in double at
+   load time), and `x = X0 + u` is rebuilt each step for the neighbour search;
+3. `k_pass1_solid` accumulates `F - I` from `u_j - u_i` (identical tensor, because
+   `sum_j w (X0_j - X0_i) tensor (A g0) = I` by construction of `A`);
+4. `k_constitution` evaluates in double for both precisions and adds `I` there.
+
+Measured after the fix: solid `p` median error 72.9 -> **0.01 Pa**, worst
+1291 -> **0.17 Pa**, `x` 1.3e-5 -> **1e-6 m**, `vx` 2.4e-3 -> **1e-5 m/s**.
+Cost: fp32 2.48 -> **2.80 ms/step** (+13 %); fp64 unchanged apart from run-to-run
+variance.
+
+### 7.5 `--precision=fp32` selected fp64 (review E2)
+
+The parser tested `v[3] == '3'`, but in `"fp32"` index 3 is `'2'`, so the long
+form silently ran fp64 while `--fp32` worked.  Both parsers are now one function
+that accepts `fp32/f32/float/single/32` and `fp64/f64/double/64` in any case and
+rejects anything else with a message.
+
+### 7.6 `build.bat` wiped the build tree on every run (review E7)
+
+It searched `CMakeCache.txt` for `CMAKE_MAKE_PROGRAM:FILEPATH=` with backslashes,
+but CMake stores the path with forward slashes, so the test never matched and
+every invocation deleted `build\` and recompiled everything.  Now both spellings
+are searched: a second `build.bat` prints `ninja: no work to do`.
+
+### 7.7 Diagnostic fixes (review E3-E6)
+
+* `SPH_LOADA` now runs before the solid pack is built (it used to leave `A` and
+  `solidPack` disagreeing);
+* the `pairs=` line rebuilds the cell list first (it used to count on a list built
+  before the previous position update, which was off by one at `T=3`);
+* `SPH_NBRLIST` checks the particle index and copies exactly `hn` entries;
+* the duplicated `loads x3 (scattered)` benchmark line is gone, `SPH_DUMPSTEP`
+  under `SPH_PROFILE` prints a note instead of silently doing nothing, and
+  `SPH_VERIFY` bins in `Real` rather than double;
+* a `static_assert` documents the `SPH_NCELL <= 1024*32` assumption of
+  `k_cell_scan`.
+
+
+### 7.8 Deterministic order inside a cell (review V2)
+
+`sorted[]` used to be filled by an atomic scatter, so the order in which
+neighbours were summed depended on the arrival order and two identical runs
+produced different bits (measured: 5e-15 m/s in `vx`, 1e-11 relative in `Pia`
+after 100 steps).  A 20-line `k_cell_sort` (one thread per cell, insertion sort by
+particle index, cells hold at most 42 particles) fixes it: `sph_cuda.exe --fp64`
+twice in a row now produces byte-identical `result*.dat`, for both precisions.
+
+It also made the step **17 % faster** (30.4 -> 25.3 ms), because ascending index
+order is much better for the L1/L2 hit rate than the scatter order.
+
+### 7.9 Static solid pair list: the first attempt was abandoned, the second works
+
+The first attempt at the review's A3 produced the expected 6x on both solid
+kernels but the trajectory blew up (`p` error 8e-4 at step 50, NaN by step 100,
+in both the fluid and the solid columns), and it also made `--fp32` 900x slower
+(2152 ms/step).  It was reverted and recorded here as unexplained.
+
+Both symptoms had the same root cause, and it is worth writing down because the
+signature was misleading: an auxiliary kernel of that attempt read `Pia` with
+the **old component-major layout** (`Pia[c*NUM + p]`) after `Pia` had become
+AoS.  That is an out-of-bounds read of up to 8xNUM doubles past a
+12xSOLNUM buffer, i.e. arbitrary garbage into a stress tensor.  The fp64 build
+survived it for 50 steps by luck; the fp32 build -- whose neighbour list holds
+95 000 extra knife-edge pairs, so a different execution order -- produced NaN
+almost immediately.  Once a solid particle's `rho` is NaN, `sph_cell()` clamps it
+to cell 0, all 60 320 solid particles land in one cell, and every fluid particle
+near that cell scans 60 320 candidates per pass: that is the 2152 ms/step, not a
+CSR indexing bug.
+
+The second attempt has no auxiliary array: everything a solid kernel needs is
+either in the CSR entry or inlined from the AoS `Pia` block, and it was verified
+with A3 and A4 separately disabled (`SPH_SOLDDYN`, `SPH_LITERALFLUID`) so that
+every kernel could be compared against its own predecessor.  Details in sec.12.
+
+## 8. Files
+
+```
+CMakeLists.txt              build (no absolute paths), precision switches
+build.bat                   one-click build: vswhere -> vcvars64 -> CMake+Ninja
+src/sph.h                   constants, SphPtrsT<Real>, device math, prototypes
+src/sph_kernels.cu          all kernels + launch wrappers + explicit instantiation
+src/sph_host.cu             host driver: I/O, init, step loop, output, dispatch
+README.md                   quick start
+docs/DESIGN.md              this document
+```
+
+---
+
+## 9. Reproducing
+
+```bat
+build.bat Release                     :: -> build\sph_cuda.exe
+
+:: reference case (needs input.dat in the working directory)
+set SPH_MAXSTEP=500
+sph_cuda.exe --fp64                   :: writes result0..9.dat
+sph_cuda.exe --fp32
+
+:: compare against the reference package
+tools\CompareResults.exe <workdir> <reference-dir>
+```
+
+Diagnostics: `SPH_PROFILE=1` (per-phase timing), `SPH_BENCH=1` (per-kernel timing,
+including the pre-optimisation kernels side by side), `SPH_VERIFY=1` (validate
+the cell list), `SPH_DUMPSTEP=1` / `SPH_DUMPA=1` (dump intermediates for
+array-by-array comparison), `SPH_LOADA=<dir>` (use an externally supplied `A`
+matrix), `SPH_NBRLIST=<p>` (print one neighbour list),
+`SPH_SOLDDYN=1` (walk the grid in the solid kernels instead of the static list)
+and `SPH_LITERALFLUID=1` (literal `pass1_fluid` body instead of the A5 one).
+The last two exist so every optimisation can be A/B'd inside one binary.
+
+---
+
+## 10. What is left on the table
+
+In the review's numbering, A1 (fp32) A3 A4 A5 are done, and the remaining items
+are now the interesting ones because nothing else is big:
+
+| item | estimate | note |
+|---|---|---|
+| A7 fewer launches / CUDA graph | up to 1.1 ms of the 12.42 | 13 launches cost ~85 us each here; a captured graph removes the host round trips.  This is now the largest single remaining block. |
+| A6 half-size cells (5^3 stencil) | fp32 mostly | 425 candidates per particle instead of 687 |
+| A8 periodic reordering | - | protects long runs, needs an experiment first |
+| `pass1_fluid` arithmetic | ~1 ms | what is left is one sqrt + one division per neighbour (both are software routines on this GPU) |
+
+**A6 row merging does not pay on this GPU** (tried, measured, reverted): merging
+the three x-cells of a row into one contiguous `sorted[]` range, which is
+bit-identical and removes 18 of 27 loop headers, made fp64 `pass1_fluid`
+8.78 -> 9.79 ms and the pure-traversal probe 1.76 -> 1.82 ms; the extra register
+pressure per loop costs more than the loop headers.  See sec.6.3.
+
+A2 (the result writer) is done as well; it does not change ms/step, but it was
+worth doing because at the 50-step cadence it dominated the wall clock of the
+fp32 build.  `write_result` now formats with `std::to_chars` (same text as
+`%.6g`, verified byte for byte on both precisions) in up to 8 contiguous chunks
+on worker threads, written in order: 0.34 s -> **0.07 s per file**.  Wall clock
+for the 500-step case: fp64 6.95 s of which 6.20 s is stepping, fp32 **1.89 s**
+of which 1.21 s is stepping (before: fp32 needed ~4.8 s).
+
+---
+
+## 11. The review's A4 and A5
+
+### 11.0 What the three accelerations changed, numerically
+
+The three items are independent switches, so their effect can be measured
+directly: `SPH_DUMPSTEP=1 SPH_MAXSTEP=1` with everything on against
+`SPH_SOLDDYN=1 SPH_LITERALFLUID=1` (legacy solid kernels, literal fluid loop,
+A4 still on).  Step 1, fp64, over all 237 298 particles:
+
+| array | ndiff | maxAbs | maxRel |
+|---|---|---|---|
+| `F` (solid deformation gradient) | 60 318 | 1.1e-16 ... **8.9e-16** | 6.7e-16 |
+| `DFdt` | 45 425 | **2.1e-17** | 4.1e-15 |
+| `Pia` (solid stress) | 60 318 | **1.1e-8** | 1.9e-12 |
+| `PIJW` (solid momentum source) | 60 320 | **6.5e-10** | 1.5e-12 |
+| `drhodt` | 100 509 | 8.6e-12 | 6.2e-15 |
+| `dvxdt` | 101 163 | 3.1e-13 | 2.9e-14 |
+| `viscos` | 94 566 | 2.7e-15 | 7.3e-16 |
+| `SurF` | 60 224 | 2.7e-15 | 8.9e-16 |
+| `x` | 5 | 1.1e-16 | 1.9e-16 |
+| `SForce` | **0** | 0 | 0 |
+
+`SForce` is identical because this case has no fluid/solid pair until step 566;
+the 3000-step run (sec.5.4b) is what covers the coupling path.  Everything else
+agrees at the 1e-15/1e-12-relative level, i.e. the same size as the
+neighbour-order noise the kernel already had (sec.7.8) -- and 500 steps later the
+difference is still below the 6-digit output precision (sec.12.3).
+
+### 11.1 A5: factored `pass1_fluid` inner loop
+
+`k_pass1_fluid_fast` keeps the physics of `k_pass1_fluid` (which is retained
+verbatim, selected with `SPH_LITERALFLUID=1`) but uses four identities from the
+review:
+
+1. `(2-q)^4 - 2(1+2q)(2-q)^3 = -5 q (2-q)^3`, so the kernel value is four
+   multiplies instead of a ten-term polynomial;
+2. only `UL - UR` is ever needed: `-(dv.d)/dr` for fluid/fluid, `-2(vi.n)` for a
+   wall, so the two separate dot products disappear;
+3. `gradW.d = (dW/dr) * r2 / dr`, so `S` needs no per-component products;
+4. `1/dr`, `1/(dr^2+0.01h^2)` and `1/rhoSum` come from a single division
+   `R = 1/(dr*den*rhoSum)` followed by three multiplies -- two of the three
+   software division calls per neighbour are gone.
+
+Measured: fp64 11.18 -> **8.78 ms** (`pass1_fluid`), fp32 0.814 -> **0.763 ms**.
+That is -2.4 ms of the 12.42 step and matches the review's "about -3 to -4.5 ms
+of the 10.6 ms of arithmetic" in order of magnitude.
+
+Verification of the tolerance claim: `CompareResults` against the pristine
+package gives the *same* summary with and without A5 (`p` maxAbs 1e-3, `vx` 1e-9,
+`x/rho/mass` identical), and a 500-step A5-on vs A5-off comparison at 6
+significant digits shows no difference at all -- the deviation stays below the
+text output precision.
+
+### 11.2 A4: float pre-filter in front of the exact distance test
+
+`sph_neigh` / `sph_neigh2` now evaluate `r^2` in fp32 from a float copy of the
+positions (`xf`, kept current by `k_update_pos`, so it costs no extra launch) and
+skip the candidate when `r2f >= r2max * 1.0001f`.  Surviving candidates take
+today's exact `sph_add_rn`/`sph_mul_rn` test unchanged, so membership is still
+decided in `Real`.
+
+Why the accepted set cannot change: the float estimate differs from the exact
+`r2` by at most ~`3.5*ulp_float(|x|max)/(3*hsml)` relative to `r2max`, which for
+this domain (`|x| <= 1.2 m`, `ulp_float = 1.2e-7`) is 1.4e-5 -- seven times
+inside the 1e-4 margin.  Verified empirically: 500-step output with A4 is
+bit-identical to A4-off for both precisions, and the 3000-step post-contact
+comparison is unchanged.
+
+Measured: `pass1_fluid` 9.51 -> **8.78 ms**, `pass2_fluid` 0.33 -> 0.13,
+`pass2_solid` 1.23 -> 1.15, step 12.92 -> **12.42 ms**.  The pure-traversal probe
+(`count_pairs`) drops 4.17 -> **1.77 ms**, which is where the effect really shows:
+exact tests fall from 69.6 M to ~10.7 M per step, as the review measured.
+
+A detail worth keeping: **the pre-filter is compiled out for `Real = float`**
+(`if constexpr` in `sph_reject_far`).  In the fp32 build the exact test is
+already fp32, so the pre-filter adds three loads and six ops per candidate and
+saves nothing; measured, it cost 12 % of `pass1_fluid` (0.74 -> 0.83 ms) before
+the guard was added.
+
+---
+
+## 12. The review's A3: static solid pair list
+
+### 12.1 Why it works
+
+Both solid kernels evaluate the kernel gradient at the **reference** positions
+`X0`, and `A` is a constant, so the solid/solid pair set and every per-pair
+weight are constants.  The list is built once after `GraCorrec`
+(`build_solid_lists()`), in CSR form over the 60 320 solid particles.
+
+Per directed pair `(p, q)`, with `g0 = dwdr(|X0_p-X0_q|/h) * (X0_p-X0_q)/|X0_p-X0_q|`
+and `w0_q = m_q/rho0_q`:
+
+| stored | meaning | used by |
+|---|---|---|
+| `sG` (3) | `w0_q * g0` | `DFdt`, and `PIJW` via `vol_q*g0 = (rho0_q/rho_q) sG` |
+| `sB` (3) | `w0_q * (A_p g0)` | `F` |
+| `sD` (3) | `w0_q * (A_q (-g0))` | `PIJW` |
+| `sQ` (1 int) | partner index | - |
+
+so the loop bodies become
+
+```
+pass1:  F    += (x_q - x_p) (x) sB        DFdt += (v_q - v_p) (x) sG
+pass2:  u    += (rho0_q/rho_q) sG         t    += (rho0_q/rho_q) Pia_q sD
+        PIJW_p = (Pia_p (A_p u) - t) / rho_p
+```
+
+18 and 13 multiply-adds per pair, no square root, no division, no distance test,
+no cell walk.  The `q`-independent factors are taken out of the pass-2 sum, which
+is why 9 stored values are enough for both passes.
+
+Size: **5 371 593 pairs** (89.1 per solid particle, 389 MB in fp64, 210 MB in
+fp32).  The review's host-side count was 5 379 584; the difference is that the
+budget here keeps only pairs whose reference kernel gradient is non-zero.  The
+fp32 build builds 5 500 191 because `Dr*invh` rounds differently at the
+`r = 3*hsml` knife edge -- 128 598 extra pairs whose weight is ~1e-40, which cost
+0.02 ms and change nothing.
+
+### 12.2 Results
+
+| kernel | before | static list | factor |
+|---|---|---|---|
+| `pass1_solid` | 4.96 ms | **1.05 ms** | 4.7x |
+| `pass2_solid` | 5.91 ms | **1.14 ms** | 5.2x |
+
+(`before` measured in the same binary with `SPH_SOLDDYN=1`, which is why it is
+4.96/5.91 rather than the 6.3/7.4 of sec.6.1: A4 applies to the dynamic path
+too.)  Step: 15.77 -> 12.42 ms together with A4/A5.
+
+### 12.3 Correctness
+
+* 500 steps against the pristine package: unchanged (`x/rho/mass/itype/X0/rho0`
+  0 differences, `p` maxAbs 1e-3, `vx` 1e-9).
+* 3000 steps post-contact against the pristine CPU run: unchanged (sec.5.4b).
+* A3-on vs A3-off, step 1: `F` 8.9e-16, `DFdt` 2.1e-17 absolute, `Pia` 1.9e-12
+  relative, `PIJW` 1.5e-12 relative (sec.11.0).  500 steps later the printed
+  output is identical, i.e. the reference-distance formulation reproduces the
+  current-distance one below the output precision, as the review's host probes
+  predicted.
+* Reproducibility is kept: two identical runs are byte-identical in both
+  precisions (the list is built in a fixed order -- one thread per solid
+  particle, cells visited in the same order as `sph_neigh` -- so the summation
+  order is deterministic).
+
+### 12.4 Where the memory could be halved
+
+`sB` is only needed by pass 1, and `F_rc = sum_q w Dx_r (A_p g0)_c` can be
+rewritten as `F = M A_p^T` with a 9-element per-particle accumulator
+`M = sum_q Dx (x) sG`.  That removes `sB` (-130 MB in fp64) and 9 of the 18
+multiply-adds per pair, at the cost of one 3x3x3 product per particle -- about
+0.1 ms.  Not done here because it changes the fp32 displacement formulation that
+patch 02 depends on and would have to be re-validated.
