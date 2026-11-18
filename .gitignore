@@ -33,5 +33,6 @@ _legacy/
 
 # Local scratch: benchmark runs, build trees, source snapshots
 _aw_build/
+_runs/
 _local/*
 !_local/CUDA_REPORT_4090.md

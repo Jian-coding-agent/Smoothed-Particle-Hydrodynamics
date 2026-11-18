@@ -23,8 +23,8 @@ Everything below is measured on the machine used for the port:
 | Particles | 237 298 = 101 250 fluid (`itype=2`) + 60 320 solid (`itype=-20`) + 75 728 wall (`itype=-2`) |
 | Neighbour pairs | 11 102 707 at t=0 (~94 per particle), 3x3x3 cells of edge 0.03 m over a fixed box |
 | Reference (CPU, 32 threads) | 500 steps in 105.6 s -> **211 ms/step** |
-| Port, fp64 | **12.42 ms/step** -> 17.0x vs the 32-thread CPU |
-| Port, fp32 | **2.43 ms/step** -> 87x vs the 32-thread CPU |
+| Port, fp64 | **5.01 ms/step** -> 42x vs the 32-thread CPU |
+| Port, fp32 | **1.64 ms/step** -> 129x vs the 32-thread CPU |
 | Validation | intermediate arrays agree to 1e-15...1e-9 relative at step 1; 500- and 3000-step output within the CPU's own run-to-run noise |
 
 ---
@@ -190,17 +190,18 @@ entirely (`if constexpr`), because there the exact test is already fp32.
 | state (69 Reals/particle) | 131 MB | 65 MB |
 | `solidPack`  -  `{X0[3], A[9], rho0, mass}` per solid, built once | 6.8 MB | 3.4 MB |
 | `Pia`  -  12 Reals per solid (9 used + 3 pad), AoS, 16-B aligned | 5.8 MB | 2.9 MB |
-| A3 pair list: 5 371 593 pairs x (9 Reals + 1 int) | 389 MB | 210 MB |
+| A3 pair list: 4 844 544 pairs, ELL width 92 x (9 Reals + 1 int) | 402 MB | 212 MB |
 | `xf`  -  float copy of the positions (A4) | 2.8 MB | 2.8 MB |
 | cell list + sorted indices | 1.1 MB | 1.1 MB |
-| **total** | **~475 MB** (versus 2.03 GB of OpenMP buffers on the CPU) | **~233 MB** |
+| P1 fluid neighbour list (fp64 only): 192 slots x 101 250 | 78 MB | - |
+| **total** | **~630 MB** (versus 2.03 GB of OpenMP buffers on the CPU) | **~285 MB** |
 
 The CPU's 2 GB per-thread accumulation buffer disappears completely because
 each particle's accumulators are private to its own thread.
 
-The A3 list is the one allocation that grew; 389 MB of 15.9 GB is not a
-constraint here, and the fp32 build needs 210 MB of it.  The list can be halved
-by dropping `sB` (see sec.12).
+The A3 list is the one allocation that grew; 402 MB of 15.9 GB is not a
+constraint here, and the fp32 build needs 212 MB of it.  The list can be halved
+by dropping `sB` (see sec.12.4).
 
 ### 3.5 Output
 
@@ -334,6 +335,9 @@ made with A3+A4+A5 all enabled, i.e. the shipped configuration.
 
 ### 6.1 Per-kernel profile (`SPH_BENCH=1`, 20 iterations each, fp64)
 
+The table below is the state *before* P1/P2 (sec. 13); it is what identified
+`pass1_fluid` as the bottleneck.  For the current build see sec. 6.4 and 13.
+
 Shipped configuration (A3+A4+A5), RTX 5080:
 
 | kernel | ms/iter | share |
@@ -410,13 +414,14 @@ fp32 is latency limited, so ILP pays off there.
 
 ### 6.4 Current numbers
 
-After the external review, its two patches (sec. 7.4-7.7) and the review's three
-acceleration items A3/A4/A5 (sec. 11, 12).
+After the external review, its two patches (sec. 7.4-7.7), the review's three
+acceleration items A3/A4/A5 (sec. 11, 12) and the post-review work of sec. 13
+(fp64 fluid neighbour lists, slot-major solid lists, the C1-C3 fixes).
 
 | | ms/step | vs 32-thread CPU (211 ms/step) |
 |---|---|---|
-| fp64 | **12.42** | **17.0x** |
-| fp32 | **2.43** | **87x** |
+| fp64 | **5.01** | **42x** |
+| fp32 | **1.64** | **129x** |
 
 The same trajectory, per change, fp64 500 steps:
 
@@ -425,13 +430,14 @@ The same trajectory, per change, fp64 500 steps:
 | as reviewed (patches 01/02 + E7 + V2) | 25.19 |
 | + A3 static solid pair list | 15.77 |
 | + A5 factored `pass1_fluid` loop | 13.26 |
-| + A4 float neighbour pre-filter (shipped) | **12.42** |
+| + A4 float neighbour pre-filter (reviewed state) | 12.42 |
+| + P1 two-phase `pass1_fluid` (fp64 only) and P2 slot-major solid list | **5.01** |
 
-fp32 stayed near 2.43 ms/step throughout -- it is latency bound, not FP64-pipe
-bound, so removing FP64 operations buys little there.  Measured in the shipped
-binary against its own pre-optimisation paths: `pass1_fluid` 0.814 (literal) ->
-0.763 (A5), `pass1_solid` 0.699 -> 0.555 (A3), `pass2_solid` 0.752 -> 0.637 (A3),
-and A4 is compiled out (applying it there was measured as a 12 % *loss*).
+fp32 went 2.43 -> 1.64 with P2 alone; P1 is deliberately not used there (sec.
+13.2).  Measured in the shipped binary against its own pre-optimisation paths:
+fp32 `pass1_fluid` 0.818 (literal) -> 0.768 (A5), `pass1_solid` 0.698 -> 0.166
+(P2), `pass2_solid` 0.751 -> 0.296 (P2), and A4 is compiled out (applying it
+there was measured as a 12 % *loss*).
 
 fp32 accuracy, measured over 500 steps against the fp64 build at result9:
 
@@ -734,9 +740,18 @@ the guard was added.
 ### 12.1 Why it works
 
 Both solid kernels evaluate the kernel gradient at the **reference** positions
-`X0`, and `A` is a constant, so the solid/solid pair set and every per-pair
-weight are constants.  The list is built once after `GraCorrec`
-(`build_solid_lists()`), in CSR form over the 60 320 solid particles.
+`X0`, and `A` is a constant, so in this total-Lagrangian form the solid/solid
+pair set and every per-pair weight are constants of the run.  (The reference
+`1.cpp` is not exactly this: it accumulates `F`/`DFdt` over the *current*
+pair list while evaluating the weight at the reference distance, so a pair whose
+reference distance is below `3*hsml` but whose current distance is not is dropped
+there and kept here.  On this lattice the largest interior reference distance is
+`sqrt(8)*0.01 = 0.0283 m` against a cutoff of `0.03 m`, so the two formulations
+agree while no pair stretches by more than about 6 %; the plate moves 0.1 mm
+here.  A3 is arguably the more correct of the two -- see review finding R2.)
+The list is built once after `GraCorrec` (`build_solid_lists()`), slot-major
+(ELL) over the 60 320 solid particles: entry `j` of particle `k` lives at slot
+`e = j*SOLNUM + k`, `0 <= j < sCnt[k]`.
 
 Per directed pair `(p, q)`, with `g0 = dwdr(|X0_p-X0_q|/h) * (X0_p-X0_q)/|X0_p-X0_q|`
 and `w0_q = m_q/rho0_q`:
@@ -748,7 +763,9 @@ and `w0_q = m_q/rho0_q`:
 | `sD` (3) | `w0_q * (A_q (-g0))` | `PIJW` |
 | `sQ` (1 int) | partner index | - |
 
-so the loop bodies become
+The nine tensor components sit in nine separate arrays (component `c` at
+`c*sw + e`), so every warp load is contiguous 32 slots -- that is what P2
+changed (sec. 13.3).  The loop bodies become
 
 ```
 pass1:  F    += (x_q - x_p) (x) sB        DFdt += (v_q - v_p) (x) sG
@@ -760,44 +777,163 @@ pass2:  u    += (rho0_q/rho_q) sG         t    += (rho0_q/rho_q) Pia_q sD
 no cell walk.  The `q`-independent factors are taken out of the pass-2 sum, which
 is why 9 stored values are enough for both passes.
 
-Size: **5 371 593 pairs** (89.1 per solid particle, 389 MB in fp64, 210 MB in
-fp32).  The review's host-side count was 5 379 584; the difference is that the
-budget here keeps only pairs whose reference kernel gradient is non-zero.  The
-fp32 build builds 5 500 191 because `Dr*invh` rounds differently at the
-`r = 3*hsml` knife edge -- 128 598 extra pairs whose weight is ~1e-40, which cost
-0.02 ms and change nothing.
+Size: **4 844 544 pairs** (80.3 per solid particle), which is exactly the number
+of reference pairs with `|X0_p - X0_q| < 3*hsml` -- the same number the review's
+brute-force enumeration found.  ELL width 92 (padding 14.6 %), 402 MB in fp64 and
+212 MB in fp32.  Both precisions now store the same set: the review's C2 filter
+(`Dr < 3*hsml*(1 - eps)`) removes the knife-edge pairs whose weight is ~1e-40
+(fp64) or ~1e-20 (fp32) and which cannot change a bit of any accumulator.  `eps`
+has to be representable in `Real`, so it is 1e-9 in fp64 and 1e-6 in fp32 -- at
+1e-9 the fp32 expression is equal to `3*hsml` and the filter would do nothing.
 
 ### 12.2 Results
 
 | kernel | before | static list | factor |
 |---|---|---|---|
-| `pass1_solid` | 4.96 ms | **1.05 ms** | 4.7x |
-| `pass2_solid` | 5.91 ms | **1.14 ms** | 5.2x |
+| `pass1_solid` | 4.96 ms | **0.34 ms** | 15x |
+| `pass2_solid` | 5.91 ms | **0.62 ms** | 9.5x |
 
 (`before` measured in the same binary with `SPH_SOLDDYN=1`, which is why it is
 4.96/5.91 rather than the 6.3/7.4 of sec.6.1: A4 applies to the dynamic path
-too.)  Step: 15.77 -> 12.42 ms together with A4/A5.
+too.)  In fp32 the same change takes `pass1_solid` 0.698 -> 0.166 ms and
+`pass2_solid` 0.751 -> 0.296 ms.
 
 ### 12.3 Correctness
 
-* 500 steps against the pristine package: unchanged (`x/rho/mass/itype/X0/rho0`
-  0 differences, `p` maxAbs 1e-3, `vx` 1e-9).
-* 3000 steps post-contact against the pristine CPU run: unchanged (sec.5.4b).
-* A3-on vs A3-off, step 1: `F` 8.9e-16, `DFdt` 2.1e-17 absolute, `Pia` 1.9e-12
-  relative, `PIJW` 1.5e-12 relative (sec.11.0).  500 steps later the printed
-  output is identical, i.e. the reference-distance formulation reproduces the
-  current-distance one below the output precision, as the review's host probes
-  predicted.
+* 500 steps against the CPU reference: `x/rho/mass/itype/X0/rho0` identical at
+  the printed precision, `p` maxAbs 6.8e-8 Pa, `vx` 1e-9 m/s (fp64).
+* The pair set is invariant under a rigid translation of the solid, and the
+  stresses are too -- that is the C1 regression test,
+  `cuda/tools/check_rigid_translation.py` (sec. 12.5).
+* C3: the fill pass returns its per-particle count and the host aborts unless it
+  matches the count pass exactly.  A mismatch would silently shift every later
+  particle's slot range, so this is checked, not assumed.
 * Reproducibility is kept: two identical runs are byte-identical in both
   precisions (the list is built in a fixed order -- one thread per solid
   particle, cells visited in the same order as `sph_neigh` -- so the summation
   order is deterministic).
+* `compute-sanitizer` memcheck (fp64 and fp32) and racecheck: 0 errors.
 
 ### 12.4 Where the memory could be halved
 
 `sB` is only needed by pass 1, and `F_rc = sum_q w Dx_r (A_p g0)_c` can be
 rewritten as `F = M A_p^T` with a 9-element per-particle accumulator
-`M = sum_q Dx (x) sG`.  That removes `sB` (-130 MB in fp64) and 9 of the 18
+`M = sum_q Dx (x) sG`.  That removes `sB` (-134 MB in fp64) and 9 of the 18
 multiply-adds per pair, at the cost of one 3x3x3 product per particle -- about
 0.1 ms.  Not done here because it changes the fp32 displacement formulation that
 patch 02 depends on and would have to be re-validated.
+
+### 12.5 The review's C1-C3: what was actually wrong, and the regression test
+
+**C1 (real defect).** The list was searched in a cell list binned from the
+*current* positions, although it is derived from `X0`.  A partner `q` was found
+only if `cell(x_q)` lay within +-1 cell of `cell(X0_p)`, so once the solid had
+moved about one cell the search silently lost pairs -- and the list is built
+once, so a restart from a deformed state carried the error for the whole run.
+
+Measured here by shifting the solid rigidly (a translation changes no reference
+distance, so it must change nothing), 60 320 solids, one step, fp64:
+
+| offset | old list | trace(`Pia`) max error | now |
+|---|---|---|---|
+| 0 | 5 371 593 | - | 4 844 544 |
+| 2 mm | 5 372 031 | 4.8e-8 Pa | 4 844 544 |
+| 15 mm | 5 367 871 | 5.6e-8 Pa | 4 844 544 |
+| **20 mm** | 5 163 935 | **5.34e+6 Pa** | 4 844 544 |
+| 25 mm | 5 068 175 | 5.34e+6 Pa | 4 844 544 |
+| 25 mm, `SPH_SOLDDYN=1` (control) | - | 5.9e-8 Pa | 5.9e-8 Pa |
+
+It is a cliff, not a slow degradation: nothing at 15 mm, 5.3 MPa at 20 mm --
+four orders of magnitude above the p99 stress (4.6 kPa).  The fix is two lines:
+build the cell list from a copy of the solver state whose `x` points at `X0`,
+build the list, then rebuild the live cell list from `x`.
+
+`cuda/tools/check_rigid_translation.py` runs exactly this test (one step at
+0 offset and one at +25 mm, compares the list size and `trace(Pia)`) and exits
+non-zero on a regression.  Against the pre-fix binary it reports 5 371 593 vs
+5 068 175 pairs and 5.34e+6 Pa.
+
+**C2 (bandwidth).** The knife-edge pairs are now filtered geometrically, see
+12.1: width 115 -> 92 and fp64 list 503 -> 402 MB, with identical output.
+
+**C3 (silent corruption).** `k_solid_pair_fill` now writes its count back and the
+host aborts with the first offending particle if it differs from
+`k_solid_pair_count`'s.  Cost: one 240 KB copy at start-up.
+
+
+---
+
+## 13. Post-review work: P1, P2 and the small findings
+
+Everything in this section was measured on the RTX 5080 (sm_120, CUDA 13.3,
+Windows) with the 500-step case; the review's own numbers are from a 4090 and a
+different tree, so only the deltas are compared.
+
+### 13.1 fp64 `pass1_fluid` in two phases (P1)
+
+The fused kernel runs a ~60-instruction FP64 body whenever *any* lane of the warp
+has a hit, while only about 15 % of the candidates are hits.  P1 records each
+fluid particle's neighbours first, in exactly the order the fused traversal
+visits them, then runs the identical body over that list:
+
+| fp64 | ms |
+|---|---|
+| fused (`SPH_FLUIDLIST=0`) | 8.77 |
+| list build + body over list | 0.87 + 2.67 = **3.54** |
+| full step, with P2 | 11.44 -> **5.01** |
+
+The list is slot-major -- neighbour `j` of particle `p` at `fnbr[j*NTOTAL + p]`,
+so a warp walks 32 consecutive ids -- and 192 slots per particle (77.8 MB).
+Measured occupancy: mean 103.9, min 42, max 115 neighbours, so no particle
+overflows; if one did, `fcnt[p]` is set to -1 and that particle alone falls back
+to the fused traversal, which is why the width is a memory knob and never a
+correctness limit.
+
+fp32 does **not** use it: there the kernel is traversal bound (its fused body is
+0.77 ms, the traversal alone 0.56 ms) and the same split was measured as a loss.
+
+Both instantiations share one templated kernel (`k_pass1_fluid_body<Real,
+USE_LIST>`) so the arithmetic is literally the same source; `SPH_FLUIDLIST=0`
+selects the fused one at run time for A/B comparison.
+
+### 13.2 Slot-major static solid list (P2)
+
+CSR put entry `a` of particle `k` at `sStart[k]+...`, so a warp read 32 segments
+that were ~89 entries apart.  Storing entry `j` of particle `k` at `j*SOLNUM + k`
+-- and splitting the nine tensor components into nine arrays -- makes every warp
+load contiguous.  Per-particle order is unchanged, so nothing else moved:
+
+| kernel | fp64 CSR -> ELL | fp32 CSR -> ELL |
+|---|---|---|
+| `pass1_solid` | 1.05 -> **0.34** | 0.698 -> **0.166** |
+| `pass2_solid` | 1.14 -> **0.62** | 0.751 -> **0.296** |
+
+With C2 applied as well the width is 92 (padding 14.6 %) and fp64 memory 402 MB.
+
+### 13.3 The small findings
+
+| id | what was done |
+|---|---|
+| C4 | `load_input()` now validates the type ranges (`fluid > 0`, `solid < -10`, `wall in [-10,0]`), rejects positions outside the fixed grid, and warns about trailing records.  A permuted deck would break the `eta = f(SurFD[max(p,q)])` rule, so it is refused rather than run. |
+| C5 | `step()` ends with `CUDA_CHECK(cudaGetLastError())`; a launch-configuration failure no longer looks like a kernel that did nothing. |
+| C6 | the `--fmad=true` comment said the opposite of what the flag does; corrected. |
+| C7 | **not done.** `k_cell_sort` is still an insertion sort per cell.  It is O(n^2) only when the clamp collects many particles into one boundary cell (sec. 7.9); for this deck the worst cell holds a few hundred.  A stable radix sort on `(cell, index)` would give the same order in O(n), but it is a change to the deterministic-order guarantee, so it is left for a run that actually hits the cliff. |
+| C8 | `k_gra_invert` counts its `A = I` fallbacks; the host warns, and refuses fp32 (where the `F - I` displacement form needs `a*A = I`) if the count is not zero. |
+| R1 | GCC/Clang builds now pass `-O3 -ffp-contract=off` (MSVC already used `/fp:precise`), so the reference pair count no longer depends on the compiler's FMA policy. |
+| R2 | sec. 2.5 and this section state the condition under which A3 matches the reference's current-configuration pair list, instead of claiming the reference's pair set is constant. |
+| R3 | README: the printed `p` is the value used during the step, i.e. it lags `rho`, `x` and `vx` by one update, so `p != c0^2 (rho - 1000)` in `result*.dat`. |
+
+### 13.4 What is still on the table
+
+* **P3, overlap the result writer.**  After P1/P2 a result file costs about
+  55 ms, which at the 50-step cadence is ~22 % of the wall clock in fp64 and
+  ~40 % in fp32.  Fetching the four static columns once and copying the rest
+  asynchronously into pinned memory on a side stream is the next win.
+* **P4, launch overhead.**  One `cudaDeviceSynchronize()` per step remains (it
+  is what `[time]` measures), and the eight kernels are not captured in a graph.
+  On Windows/WDDM DESIGN measured ~1.1 ms/step of launch overhead, which is now
+  a visible fraction of 5 ms.
+* **P6, one evaluation per fluid pair.**  Halves the FP64 body of P1 but breaks
+  bit reproducibility through the scatter; a deterministic alternative (per-pair
+  buffer + reverse CSR) costs ~0.7 ms of traffic.
+* **C7**, above.

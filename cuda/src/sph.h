@@ -65,6 +65,12 @@
 #define SPH_NCELL (SPH_NX * SPH_NY * SPH_NZ)
 #define SPH_PIA_STRIDE 12
 
+// P1: slots per fluid particle in the neighbour list.  This deck's worst fluid
+// particle has 115 neighbours (mean 104); the build kernel counts what does not
+// fit and the body kernel falls back to the fused traversal for that particle,
+// so the value is a memory/speed trade-off and never a correctness limit.
+#define SPH_FLIST_SLOTS 192
+
 // ---------------------------------------------------------------------------
 // which instantiations exist (CMake usually defines both)
 // ---------------------------------------------------------------------------
@@ -118,16 +124,35 @@ struct SphPtrsT
     // A3: static solid pair list (see docs section 12).  The solid kernels
     // evaluate the kernel gradient at the *reference* positions, which never
     // change, so their neighbour set and per-pair weights are constants.  The
-    // list is built once after GraCorrec in CSR form:
-    //     solid particle k = p - NTOTAL owns entries sStart[k] .. sStart[k+1]
-    //     entry a: partner sQ[a], and 3 Reals each at 3*a in sG / sB / sD
+    // list is built once, from a cell list binned from X0 (review finding C1),
+    // and stored slot-major (ELL, finding P2) instead of CSR: entry j of solid
+    // particle k lives at
+    //     e = j*SOLNUM + k        with  0 <= j < sCnt[k] <= swidth
+    // so a warp walking step j touches 32 consecutive slots.  The nine tensor
+    // components are stored in separate arrays (component c at c*L + e), which
+    // makes each of those loads a contiguous 32-lane access.
     // ------------------------------------------------------------------
-    int   npair;
-    int*  sStart;   // [SOLNUM+1]
-    int*  sQ;       // [npair]     partner particle index
-    Real* sG;       // [3*npair]   w0 * gradW(X0_q - X0_p)   -> DFdt, PIJW
-    Real* sB;       // [3*npair]   w0 * (A_p gradW)          -> F
-    Real* sD;       // [3*npair]   w0 * (A_q (-gradW))       -> PIJW
+    int   npair;    // valid pairs stored (sum of sCnt), padding excluded
+    int   swidth;   // ELL width: max sCnt[k]
+    int   sw;       // swidth * SOLNUM (slot count = length of one component array)
+    int*  sCnt;     // [SOLNUM]  valid entries of each solid particle
+    int*  sQ;       // [sw]      partner particle index
+    Real* sG;       // [3*sw]    w0 * gradW(X0_q - X0_p)   -> DFdt, PIJW
+    Real* sB;       // [3*sw]    w0 * (A_p gradW)          -> F
+    Real* sD;       // [3*sw]    w0 * (A_q (-gradW))       -> PIJW
+
+    // ------------------------------------------------------------------
+    // P1: per-fluid-particle neighbour list (fp64 only; the fp32 path is
+    // traversal-bound and keeps the fused kernel).  Slot-major like A3:
+    // slot j of fluid particle p is fnbr[j*NTOTAL + p].  Rebuilt every step
+    // by k_fluid_nbr_build, in exactly the order the fused kernel would visit
+    // the neighbours, so the summation order (and the bits) are unchanged.
+    // fcnt[p] < 0 means "did not fit in fwidth" and the step falls back to the
+    // fused traversal for that particle.
+    // ------------------------------------------------------------------
+    int*  fnbr;     // [fwidth*NTOTAL]
+    int*  fcnt;     // [NTOTAL]
+    int   fwidth;   // slots per particle (0 = list disabled)
 
     int* cellStart; // [NCELL+1]
     int* cellCur;   // [NCELL]
@@ -274,6 +299,12 @@ extern int sph_use_static_solid;
 // A5 switch: 1 = factored inner loop of pass1_fluid (default), 0 = the literal
 // transcription of 1.cpp (kept for verification; SPH_LITERALFLUID=1).
 extern int sph_fast_fluid_loop;
+// P1 switch: 1 = two-phase fp64 pass1_fluid (default), 0 = fused traversal.
+// Ignored in fp32, where the fused kernel is faster (SPH_FLUIDLIST=0).
+extern int sph_use_fluid_list;
+// C8: particles whose gradient-correction matrix fell back to the identity.
+// Non-zero makes the fp32 displacement form (F - I) invalid; checked at start-up.
+int gra_fallback_count();
 
 template <class Real> void launch_cell_hist(SphPtrsT<Real> s, int* d_count, int* d_solid, int* d_fluid, cudaStream_t st);
 void launch_cell_scan(int* d_cellStart, int* d_count, cudaStream_t st);
@@ -289,7 +320,10 @@ template <class Real> void launch_build_solid_pack(SphPtrsT<Real> s, cudaStream_
 template <class Real> void launch_copy_xf(SphPtrsT<Real> s, cudaStream_t st);
 // A3: two passes over the reference configuration (count, then fill)
 template <class Real> void launch_solid_pair_count(SphPtrsT<Real> s, int* d_cnt, cudaStream_t st);
-template <class Real> void launch_solid_pair_fill(SphPtrsT<Real> s, const int* d_start, int* d_cur, cudaStream_t st);
+template <class Real> void launch_solid_pair_fill(SphPtrsT<Real> s, int* d_cur, cudaStream_t st);
+// P1: record the fluid neighbour lists, then run pass1_fluid over them
+template <class Real> void launch_fluid_nbr_build(SphPtrsT<Real> s, cudaStream_t st);
+template <class Real> void launch_pass1_fluid_over_list(SphPtrsT<Real> s, cudaStream_t st);
 template <class Real> void launch_prepare(SphPtrsT<Real> s, cudaStream_t st);
 template <class Real> void launch_pass1(SphPtrsT<Real> s, cudaStream_t st);
 // individual kernels (used by the benchmark mode)

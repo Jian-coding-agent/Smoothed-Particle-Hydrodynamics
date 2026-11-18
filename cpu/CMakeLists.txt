@@ -119,6 +119,16 @@ if(MSVC)
     set_target_properties(SPH PROPERTIES
         VS_DEBUGGER_COMMAND "$(TargetPath)"
         VS_DEBUGGER_WORKING_DIRECTORY "$(SolutionDir)..")
+else()
+    # R1 (review): the neighbour-membership test d0*d0+d1*d1+d2*d2 < R2 is
+    # knife-edge on this lattice -- more than a thousand pairs sit exactly at
+    # r = 3*hsml -- so FMA contraction changes the reference pair count
+    # (-O3 measured 11 102 707 pairs, -march=native 11 103 787).  GCC and Clang
+    # contract by default; /fp:precise already keeps MSVC from doing it.
+    # -O3 is worth about 1.5x over -O2 on this solver.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(SPH PRIVATE -O3 -ffp-contract=off)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

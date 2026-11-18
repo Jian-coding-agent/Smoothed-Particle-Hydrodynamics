@@ -71,7 +71,9 @@ add_executable(sph_cuda
 
 target_include_directories(sph_cuda PRIVATE src)
 
-# keep the fp64 maths in the same order as the reference build
+# FMA contraction is allowed (the nvcc default, kept explicit).  The fp64
+# neighbour-membership test opts out with __dadd_rn/__dmul_rn, so that one
+# comparison keeps the reference build's rounding; everything else contracts.
 target_compile_options(sph_cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=true>
     $<$<COMPILE_LANGUAGE:CXX>:/W3 /wd4819>

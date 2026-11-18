@@ -26,8 +26,8 @@ Measured on an NVIDIA RTX 5080 (`sm_120`), CUDA 13.3, 237,298 particles:
 | implementation | precision | ms/step | vs 32-thread CPU | accuracy |
 |---|---|---:|---:|---|
 | `cpu/` | fp64 | 211 | 1x | reference |
-| `cuda/` | fp64 | **12.42** | **17.0x** | matches the reference to the printed precision |
-| `cuda/` | fp32 | **2.43** | **87x** | solid `p` median 0.01 Pa, `x` within 1e-6 m |
+| `cuda/` | fp64 | **5.01** | **42x** | matches the reference to the printed precision |
+| `cuda/` | fp32 | **1.64** | **129x** | solid `p` median 0.01 Pa, `x` within 1e-6 m |
 
 The CPU baseline is a 16-core Ryzen 9 9950X with 32 OpenMP threads.  Two runs
 with identical settings produce **byte-identical** `result*.dat`, in both
@@ -45,7 +45,7 @@ The port keeps the reference scheme unchanged and reorganises it for the GPU:
   build, where the exact test is already float);
 * solid/solid pairs are **precomputed once** in reference configuration (the
   total-Lagrangian formulation makes them constant), turning the two solid
-  kernels into flat CSR loops;
+  kernels into flat slot-major (ELL) loops;
 * the result writer formats with `std::to_chars` on worker threads.
 
 See [`cuda/docs/DESIGN.md`](cuda/docs/DESIGN.md) for the full derivation,
@@ -64,6 +64,13 @@ Against a pristine CPU run to 3000 steps (past fluid/plate contact at step 566):
 size).  After one step, intermediate arrays agree to 2.2e-15 … 2.5e-8; the
 CUDA build is also clean under `compute-sanitizer` (`memcheck`, `initcheck`,
 `racecheck`, `synccheck`).
+
+The static solid pair list has its own regression test — a rigid translation of
+the solid must not change the list nor any stress:
+
+```bat
+python cuda\tools\check_rigid_translation.py --exe cuda\build\sph_cuda.exe --input input.dat
+```
 
 ## Quick start
 
@@ -128,6 +135,9 @@ docs/
 
 ## Notes
 
+* `result*.dat` column 4 (the pressure) is the value the step *used*, i.e. it is
+  one update older than `x`, `vx` and `rho` in the same row.  `p` is therefore
+  not `c0^2 (rho - 1000)`; this reproduces the reference solver exactly.
 * The 500-step reference results (`result0..9.dat`, ~200 MB) are **not** stored
   in the repository.  Regenerate them with the CPU solver and compare with
   `cpu\tools\CompareResults.exe <workdir> <reference-dir>`.

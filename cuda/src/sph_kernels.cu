@@ -18,6 +18,11 @@
 
 #define N SPH_NUM
 
+// C8: number of particles whose gradient-correction matrix is singular and fell
+// back to A = I (k_gra_invert).  Declared here so the kernel below can bump it;
+// the host reads it through gra_fallback_count().
+static __device__ int sph_gra_fallbacks = 0;
+
 // A4 pre-filter: is candidate q certainly outside 3*hsml?  Compiled only for
 // Real = double -- for Real = float the exact test below is already fp32, so a
 // float pre-filter would just add three loads and six operations per candidate
@@ -174,6 +179,17 @@ __device__ __forceinline__ bool solid_pair_geom(const SphPtrsT<Real>& s, int q,
     const Real gX1 = Xp1 - s.X0[N + q];
     const Real gX2 = Xp2 - s.X0[2 * N + q];
     const Real Dr = sqrt(gX0 * gX0 + gX1 * gX1 + gX2 * gX2);
+    // C2: the lattice puts a large part of the solid/solid pairs exactly on
+    // r = 3*hsml.  There qr rounds to 2 - 1ulp for some of them, so wq returns
+    // a denormal ~1e-40 instead of 0 and the pair is stored only to add a
+    // quantity that cannot change a single bit of the result (it is below the
+    // ulp of every accumulator).  Rejecting them geometrically shortens the ELL
+    // width and the per-step streaming by 15-20 %, with identical output.  A
+    // magnitude threshold does not work; in fp32 wq(~2) is ~1e-20, not 0.
+    // The margin has to be representable in Real: 1e-9 is below the fp32
+    // epsilon, so fp32 needs 1e-6 (still a 3e-8 m band, where wq ~ 1e-17).
+    const Real margin = (sizeof(Real) < sizeof(double)) ? Real(1e-6) : Real(1e-9);
+    if (!(Dr < Real(3.0) * Real(SPH_HSML) * (Real(1.0) - margin))) return false;
     const Real qr = Dr * sph_inv_h<Real>();
     const Real wc = sph_wq<Real>(qr);
     if (wc == Real(0.0)) return false;          // also catches q == p (Dr = 0)
@@ -202,12 +218,13 @@ __global__ void k_solid_pair_count(SphPtrsT<Real> s, int* __restrict__ cnt)
     cnt[p - SPH_NTOTAL] = n;
 }
 
-// pass 2 of 2: write the per-pair constants at sStart[k] + (0, 1, ...).
-// One thread owns one solid particle, so the cursor needs no atomics.
+// pass 2 of 2: write the per-pair constants at slot j*SOLNUM + k (ELL, P2).
+// One thread owns one solid particle, so the slot index needs no atomics.
 //   G = w0 * g0,  B = w0 * (A_p g0),  D = w0 * (A_q (-g0)),  w0 = m_q/rho0_q
+// cur[k] is written back so the host can assert (C3) that this pass stored
+// exactly as many entries as k_solid_pair_count counted.
 template <class Real>
-__global__ void k_solid_pair_fill(SphPtrsT<Real> s, const int* __restrict__ start,
-                                  int* __restrict__ cur)
+__global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
 {
     const int p = SPH_NTOTAL + blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= SPH_NALL) return;
@@ -218,7 +235,8 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, const int* __restrict__ star
     const Real Ap3 = s.A[3 * N + p], Ap4 = s.A[4 * N + p], Ap5 = s.A[5 * N + p];
     const Real Ap6 = s.A[6 * N + p], Ap7 = s.A[7 * N + p], Ap8 = s.A[8 * N + p];
 
-    int a = start[k];
+    const size_t L = (size_t)s.sw;              // length of one component array
+    int j = 0;
     sph_neigh_cells(s, sph_cell(Xp0, Xp1, Xp2), [&](int q)
     {
         if (q == p || s.itype[q] >= Real(-10.0)) return;
@@ -239,19 +257,14 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, const int* __restrict__ star
         const Real Dy = -(Aq3 * Gx + Aq4 * Gy + Aq5 * Gz);
         const Real Dz = -(Aq6 * Gx + Aq7 * Gy + Aq8 * Gz);
 
-        s.sQ[a] = q;
-        s.sG[3 * (size_t)a + 0] = Gx;
-        s.sG[3 * (size_t)a + 1] = Gy;
-        s.sG[3 * (size_t)a + 2] = Gz;
-        s.sB[3 * (size_t)a + 0] = Bx;
-        s.sB[3 * (size_t)a + 1] = By;
-        s.sB[3 * (size_t)a + 2] = Bz;
-        s.sD[3 * (size_t)a + 0] = Dx;
-        s.sD[3 * (size_t)a + 1] = Dy;
-        s.sD[3 * (size_t)a + 2] = Dz;
-        ++a;
+        const size_t e = (size_t)j * SPH_SOLNUM + k;
+        s.sQ[e]      = q;
+        s.sG[e]      = Gx; s.sG[L + e]      = Gy; s.sG[2 * L + e]      = Gz;
+        s.sB[e]      = Bx; s.sB[L + e]      = By; s.sB[2 * L + e]      = Bz;
+        s.sD[e]      = Dx; s.sD[L + e]      = Dy; s.sD[2 * L + e]      = Dz;
+        ++j;
     });
-    cur[k] = a;
+    cur[k] = j;
 }
 
 // exclusive scan over SPH_NCELL (single block, 1024 threads, 32 cells/thread),
@@ -582,8 +595,36 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid(SphPtrsT<Real> s)
 // version: 6.8e-15 on drhodt, 1.0e-14 on dvxdt, 2.5e-16 on viscos, 8.9e-16 on
 // SurF -- the same size as the neighbour-order noise (docs section 11).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// P1: the neighbour list of one fluid particle, in exactly the order the fused
+// kernel visits them (same sph_neigh2, so the same cell order and the same
+// within-cell order).  fcnt[p] = -1 marks a particle whose list did not fit in
+// fwidth slots; the body kernel then falls back to the traversal for it alone,
+// so the result is independent of the width.
+// ---------------------------------------------------------------------------
 template <class Real>
-__global__ void __launch_bounds__(256, 4) k_pass1_fluid_fast(SphPtrsT<Real> s)
+__global__ void k_fluid_nbr_build(SphPtrsT<Real> s)
+{
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= SPH_NTOTAL) return;
+    const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
+    const int W = s.fwidth;
+    int n = 0;
+    sph_neigh2(s, p, xp0, xp1, xp2, [&](int q, Real, Real, Real, Real)
+    {
+        if (n < W) s.fnbr[(size_t)n * SPH_NTOTAL + p] = q;
+        ++n;
+    });
+    s.fcnt[p] = (n <= W) ? n : -1;
+}
+
+// USE_LIST = false: fused traversal (what the port shipped with, and what fp32
+// keeps using -- there the body is cheap and the kernel is traversal bound).
+// USE_LIST = true : the same body over the recorded list.  The four kernels
+// that used to make the fp64 body run under a sparse lane mask are gone.
+// ---------------------------------------------------------------------------
+template <class Real, bool USE_LIST>
+__global__ void __launch_bounds__(256, 4) k_pass1_fluid_body(SphPtrsT<Real> s)
 {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= SPH_NTOTAL) return;
@@ -606,7 +647,7 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid_fast(SphPtrsT<Real> s)
     Real adrho = Real(0.0), ad0 = Real(0.0), ad1 = Real(0.0), ad2 = Real(0.0);
     Real av0 = Real(0.0), av1 = Real(0.0), av2 = Real(0.0), asurf = Real(0.0);
 
-    sph_neigh2(s, p, xp0, xp1, xp2, [&](int q, Real d0, Real d1, Real d2, Real r2)
+    auto pair = [&](int q, Real d0, Real d1, Real d2, Real r2)
     {
         const Real r2e = r2 + Real(0.0000000000001);        // 1e-13, as in 1.cpp
         const Real dr = sqrt(r2e);
@@ -662,7 +703,34 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid_fast(SphPtrsT<Real> s)
         av0 += f * dv0; av1 += f * dv1; av2 += f * dv2;
 
         asurf += S * volq;
-    });
+    };
+
+    if (USE_LIST)
+    {
+        const int n = s.fcnt[p];
+        if (n >= 0)
+        {
+            for (int j = 0; j < n; ++j)
+            {
+                const int q = s.fnbr[(size_t)j * SPH_NTOTAL + p];
+                const Real d0 = xp0 - s.x[q];
+                const Real d1 = xp1 - s.x[N + q];
+                const Real d2 = xp2 - s.x[2 * N + q];
+                // the same expression sph_neigh2 uses, so the same bits
+                const Real r2 = sph_add_rn(sph_add_rn(sph_mul_rn(d0, d0), sph_mul_rn(d1, d1)),
+                                           sph_mul_rn(d2, d2));
+                pair(q, d0, d1, d2, r2);
+            }
+        }
+        else
+        {
+            sph_neigh2(s, p, xp0, xp1, xp2, pair);          // did not fit: fused
+        }
+    }
+    else
+    {
+        sph_neigh2(s, p, xp0, xp1, xp2, pair);
+    }
 
     s.drhodt[p]   = adrho;
     s.dvxdt[p]    = ad0;
@@ -793,15 +861,14 @@ __global__ void k_pass1_solid_static(SphPtrsT<Real> s)
     Real D31 = Real(0.0), D32 = Real(0.0), D33 = Real(0.0);
 
     const int k = p - SPH_NTOTAL;
-    const int a0 = s.sStart[k];
-    const int a1 = s.sStart[k + 1];
-    for (int a = a0; a < a1; ++a)
+    const int n = s.sCnt[k];
+    const size_t L = (size_t)s.sw;
+    for (int j = 0; j < n; ++j)
     {
-        const int q = s.sQ[a];
-        const Real* Gp = s.sG + 3 * (size_t)a;
-        const Real* Bp = s.sB + 3 * (size_t)a;
-        const Real bx = Bp[0], by = Bp[1], bz = Bp[2];
-        const Real gx = Gp[0], gy = Gp[1], gz = Gp[2];
+        const size_t e = (size_t)j * SPH_SOLNUM + k;
+        const int q = s.sQ[e];
+        const Real bx = s.sB[e], by = s.sB[L + e], bz = s.sB[2 * L + e];
+        const Real gx = s.sG[e], gy = s.sG[L + e], gz = s.sG[2 * L + e];
 
         const Real Dx0 = lowp ? (s.u[q] - up0)         : (s.x[q] - xp0);
         const Real Dx1 = lowp ? (s.u[N + q] - up1)     : (s.x[N + q] - xp1);
@@ -1172,21 +1239,20 @@ __global__ void k_pass2_solid_static(SphPtrsT<Real> s)
     Real t0 = Real(0.0), t1 = Real(0.0), t2 = Real(0.0);      // sum vol_q Pia_q A_q(-g0)
 
     const int k = p - SPH_NTOTAL;
-    const int a0 = s.sStart[k];
-    const int a1 = s.sStart[k + 1];
-    for (int a = a0; a < a1; ++a)
+    const int n = s.sCnt[k];
+    const size_t L = (size_t)s.sw;
+    for (int j = 0; j < n; ++j)
     {
-        const int q = s.sQ[a];
+        const size_t e = (size_t)j * SPH_SOLNUM + k;
+        const int q = s.sQ[e];
         const Real kq3 = s.rho0[q] * s.irho[q];               // rho0_q / rho_q
-        const Real* Gp = s.sG + 3 * (size_t)a;
-        u10 += kq3 * Gp[0];
-        u11 += kq3 * Gp[1];
-        u12 += kq3 * Gp[2];
+        u10 += kq3 * s.sG[e];
+        u11 += kq3 * s.sG[L + e];
+        u12 += kq3 * s.sG[2 * L + e];
 
         const int kq = q - SPH_NTOTAL;
         if (kq < 0 || kq >= SPH_SOLNUM) continue;             // no Pia for those
-        const Real* Dp = s.sD + 3 * (size_t)a;
-        const Real f0 = kq3 * Dp[0], f1 = kq3 * Dp[1], f2 = kq3 * Dp[2];
+        const Real f0 = kq3 * s.sD[e], f1 = kq3 * s.sD[L + e], f2 = kq3 * s.sD[2 * L + e];
         const V2* vq = reinterpret_cast<const V2*>(s.Pia + (size_t)kq * SPH_PIA_STRIDE);
         const Real q00 = vq[0].x, q01 = vq[0].y;
         const Real q02 = vq[1].x, q10 = vq[1].y;
@@ -1484,6 +1550,9 @@ __global__ void k_gra_invert(SphPtrsT<Real> s, const Real* __restrict__ a, int b
         A11 = Real(1.0); A12 = Real(0.0); A13 = Real(0.0);
         A21 = Real(0.0); A22 = Real(1.0); A23 = Real(0.0);
         A31 = Real(0.0); A32 = Real(0.0); A33 = Real(1.0);
+        // C8: the fp32 displacement form (F - I) assumes a * = I, i.e. no
+        // fallback anywhere; counted so the host can refuse/warn.
+        atomicAdd(&sph_gra_fallbacks, 1);
     }
 
     s.A[i] = A11; s.A[N + i] = A12; s.A[2 * N + i] = A13;
@@ -1502,6 +1571,15 @@ static inline int nblocks(int n) { return (n + BLK - 1) / BLK; }
 int sph_use_static_solid = 1;
 // A5 switch: 1 = factored pass1_fluid loop, 0 = literal transcription
 int sph_fast_fluid_loop = 1;
+// P1 switch: 0 = fused fp64 pass1_fluid (A/B comparison)
+int sph_use_fluid_list = 1;
+
+int gra_fallback_count()
+{
+    int n = 0;
+    cudaMemcpyFromSymbol(&n, sph_gra_fallbacks, sizeof(int));
+    return n;
+}
 
 template <class Real>
 void launch_cell_hist(SphPtrsT<Real> s, int* d_count, int* d_solid, int* d_fluid, cudaStream_t st)
@@ -1528,9 +1606,21 @@ void launch_solid_pair_count(SphPtrsT<Real> s, int* d_cnt, cudaStream_t st)
 }
 
 template <class Real>
-void launch_solid_pair_fill(SphPtrsT<Real> s, const int* d_start, int* d_cur, cudaStream_t st)
+void launch_solid_pair_fill(SphPtrsT<Real> s, int* d_cur, cudaStream_t st)
 {
-    k_solid_pair_fill<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, d_start, d_cur);
+    k_solid_pair_fill<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, d_cur);
+}
+
+template <class Real>
+void launch_fluid_nbr_build(SphPtrsT<Real> s, cudaStream_t st)
+{
+    k_fluid_nbr_build<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+}
+
+template <class Real>
+void launch_pass1_fluid_over_list(SphPtrsT<Real> s, cudaStream_t st)
+{
+    k_pass1_fluid_body<Real, true><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
 }
 
 void launch_cell_sort(const int* d_cellStart, int* d_sorted, cudaStream_t st)
@@ -1590,10 +1680,27 @@ void launch_pass1(SphPtrsT<Real> s, cudaStream_t st)
 template <class Real>
 void launch_pass1_fluid(SphPtrsT<Real> s, cudaStream_t st)
 {
-    if (sph_fast_fluid_loop)
-        k_pass1_fluid_fast<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
-    else
+    if (!sph_fast_fluid_loop)
+    {
         k_pass1_fluid<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+        return;
+    }
+    // P1: the list pays off only in fp64; fp32 is traversal bound and the fused
+    // kernel won on both GPUs measured so far (see docs, P1/P7).
+    if constexpr (sizeof(Real) >= sizeof(double))
+    {
+        if (sph_use_fluid_list && s.fwidth > 0)
+        {
+            k_fluid_nbr_build<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+            k_pass1_fluid_body<Real, true><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+            return;
+        }
+        k_pass1_fluid_body<Real, false><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+    }
+    else
+    {
+        k_pass1_fluid_body<Real, false><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+    }
 }
 
 template <class Real>
@@ -1691,7 +1798,9 @@ void launch_gra_invert(SphPtrsT<Real> s, Real* d_a, cudaStream_t st)
     template void launch_build_solid_pack<Real>(SphPtrsT<Real>, cudaStream_t);            \
     template void launch_copy_xf<Real>(SphPtrsT<Real>, cudaStream_t);                    \
     template void launch_solid_pair_count<Real>(SphPtrsT<Real>, int*, cudaStream_t);     \
-    template void launch_solid_pair_fill<Real>(SphPtrsT<Real>, const int*, int*, cudaStream_t); \
+    template void launch_solid_pair_fill<Real>(SphPtrsT<Real>, int*, cudaStream_t);      \
+    template void launch_fluid_nbr_build<Real>(SphPtrsT<Real>, cudaStream_t);            \
+    template void launch_pass1_fluid_over_list<Real>(SphPtrsT<Real>, cudaStream_t);      \
     template void launch_cell_scatter<Real>(SphPtrsT<Real>, int*, cudaStream_t);        \
     template void launch_count_pairs<Real>(SphPtrsT<Real>, int*, cudaStream_t);         \
     template void launch_nbr_count<Real>(SphPtrsT<Real>, int*, cudaStream_t);           \

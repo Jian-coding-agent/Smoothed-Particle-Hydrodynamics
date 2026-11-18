@@ -112,11 +112,25 @@ struct Solver
         g.solidPack = dev_alloc_real((size_t)14 * SPH_SOLNUM);
 
         g.npair  = 0;                  // A3 list, built by build_solid_lists()
-        g.sStart = nullptr;
+        g.swidth = 0;
+        g.sw     = 0;
+        g.sCnt   = nullptr;
         g.sQ     = nullptr;
         g.sG     = nullptr;
         g.sB     = nullptr;
         g.sD     = nullptr;
+
+        // P1: the fp64 fluid neighbour list.  fp32 keeps the fused kernel, so
+        // the array is not even allocated there.
+        g.fnbr = nullptr;
+        g.fcnt = nullptr;
+        g.fwidth = 0;
+        if constexpr (sizeof(Real) >= sizeof(double))
+        {
+            g.fwidth = SPH_FLIST_SLOTS;
+            g.fnbr = (int*)dev_alloc_raw((size_t)g.fwidth * SPH_NTOTAL * sizeof(int));
+            g.fcnt = (int*)dev_alloc((size_t)SPH_NTOTAL * sizeof(int));
+        }
 
         g.cellStart = (int*)dev_alloc((SPH_NCELL + 1) * sizeof(int));
         g.cellCur   = (int*)dev_alloc(SPH_NCELL * sizeof(int));
@@ -174,6 +188,9 @@ struct Solver
             hr0[i] = v[13];
             if (hr[i] < 960.0) hr[i] = 960.0;
         }
+        while (*s && isspace((unsigned char)*s)) ++s;
+        if (*s)
+            fprintf(stderr, "[input] warning: data after the %d expected records ignored\n", SPH_NUM);
 
         auto up = [](Real* dst, const std::vector<double>& src)
         {
@@ -181,6 +198,43 @@ struct Solver
             for (size_t k = 0; k < src.size(); ++k) tmp[k] = (Real)src[k];
             CUDA_CHECK(cudaMemcpy(dst, tmp.data(), src.size() * sizeof(Real), cudaMemcpyHostToDevice));
         };
+        // C4: every kernel depends on this layout, and nothing else checks it.
+        //   [0, NTOTAL)      fluid   itype > 0
+        //   [NTOTAL, NALL)   solid   itype < -10
+        //   [NALL, NUM)      wall    -10 <= itype <= 0
+        // plus: all positions inside the fixed grid (outside, sph_cell() clamps
+        // them into a boundary cell and the neighbour search silently degrades),
+        // and no NaN.  The eta rule's max(p,q) also needs the original index
+        // order, so a permuted deck must be rejected rather than run.
+        int bad_type = 0, bad_pos = 0;
+        for (int i = 0; i < SPH_NUM; ++i)
+        {
+            const double t = hit[i];
+            const bool ok = (i < SPH_NTOTAL)
+                              ? (t > 0.0)
+                              : (i < SPH_NALL) ? (t < -10.0)
+                                               : (t >= -10.0 && t <= 0.0);
+            if (!ok && bad_type++ < 5)
+                fprintf(stderr, "[input] particle %d: itype %g not allowed in this index range\n", i, t);
+            for (int c = 0; c < 3; ++c)
+            {
+                const double v = hx[c * SPH_NUM + i];
+                const bool in = (c == 0) ? (v >= SPH_GX0 && v <= SPH_GX1)
+                              : (c == 1) ? (v >= SPH_GY0 && v <= SPH_GY1)
+                                         : (v >= SPH_GZ0 && v <= SPH_GZ1);
+                if (!in && bad_pos++ < 5)
+                    fprintf(stderr, "[input] particle %d: x[%d] = %g outside the grid [%g, %g]\n",
+                            i, c, v, (c == 0) ? SPH_GX0 : (c == 1) ? SPH_GY0 : SPH_GZ0,
+                            (c == 0) ? SPH_GX1 : (c == 1) ? SPH_GY1 : SPH_GZ1);
+            }
+        }
+        if (bad_type || bad_pos)
+        {
+            fprintf(stderr, "[input] %s: %d particle type(s) and %d position(s) rejected, "
+                            "refusing to run\n", path, bad_type, bad_pos);
+            return false;
+        }
+
         up(g.x,   hx);
         up(g.vx,  hvx);
         up(g.X0,  hX0);
@@ -203,57 +257,100 @@ struct Solver
     }
 
     // ---------------- grid ----------------
-    void build_cells()
+    // build_cells_for() bins whatever positions `s.x` points at; build_cells()
+    // is the live configuration.  build_solid_lists() calls it with x = X0.
+    void build_cells_for(const SphPtrsT<Real>& s)
     {
         CUDA_CHECK(cudaMemset(g.cellCur, 0, SPH_NCELL * sizeof(int)));
         CUDA_CHECK(cudaMemset(g.cellSolid, 0, SPH_NCELL * sizeof(int)));
         CUDA_CHECK(cudaMemset(g.cellFluid, 0, SPH_NCELL * sizeof(int)));
-        launch_cell_hist(g, g.cellCur, g.cellSolid, g.cellFluid, 0);
+        launch_cell_hist(s, g.cellCur, g.cellSolid, g.cellFluid, 0);
         launch_cell_scan(g.cellStart, g.cellCur, 0);
-        launch_cell_scatter(g, g.cellCur, 0);
+        launch_cell_scatter(s, g.cellCur, 0);
         launch_cell_sort(g.cellStart, g.sorted, 0);
     }
 
+    void build_cells() { build_cells_for(g); }
+
     // ---------------- A3: static solid pair list ----------------
-    // count -> host prefix sum -> allocate the CSR arrays -> fill.  Everything
-    // is derived from the reference configuration (X0, A), which never changes,
-    // so this runs exactly once per process.
+    // count -> host reduction (gives the ELL width) -> allocate -> fill.
+    // Everything is derived from the reference configuration (X0, A), which
+    // never changes, so this runs exactly once per process.
+    //
+    // C1: the search must run in a cell list binned from X0 as well.  Binning it
+    // from the *current* x -- what the port did until this fix -- loses pairs as
+    // soon as the solid has moved about one cell, silently and permanently: the
+    // list is built once, so a restart from a deformed state would carry wrong
+    // stresses for the whole run.  Measured on this deck: no error up to 15 mm
+    // of rigid offset, 5.3 MPa at 20 mm.
     void build_solid_lists()
     {
         const int n = SPH_SOLNUM;
         if (n <= 0) return;
 
+        {
+            SphPtrsT<Real> ref = g;
+            ref.x = g.X0;                       // reference configuration
+            build_cells_for(ref);
+        }
+
         int* d_cnt = (int*)dev_alloc_raw((size_t)n * sizeof(int));
         launch_solid_pair_count(g, d_cnt, 0);
-        std::vector<int> h(n), st((size_t)n + 1);
+        std::vector<int> h(n), cur(n);
         CUDA_CHECK(cudaMemcpy(h.data(), d_cnt, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaFree(d_cnt));
 
-        st[0] = 0;
-        for (int i = 0; i < n; ++i) st[i + 1] = st[i] + h[i];
-        const int npair = st[n];
-        g.npair = npair;
-        if (npair <= 0) return;
+        long long total = 0;
+        int width = 0;
+        for (int i = 0; i < n; ++i) { total += h[i]; if (h[i] > width) width = h[i]; }
+        if (total > 2147483647LL || (long long)width * n > 2147483647LL)
+        {
+            fprintf(stderr, "[A3] list too large for 32-bit slot indices "
+                            "(%lld pairs, width %d, %d solids)\n", total, width, n);
+            exit(3);
+        }
+        g.npair  = (int)total;
+        g.swidth = width;
+        g.sw     = width * n;                   // slots; one component array is this long
+        if (width <= 0) { build_cells(); return; }
 
-        g.sStart = (int*)dev_alloc_raw(((size_t)n + 1) * sizeof(int));
-        g.sQ     = (int*)dev_alloc_raw((size_t)npair * sizeof(int));
-        g.sG     = dev_alloc_real_raw((size_t)3 * npair);
-        g.sB     = dev_alloc_real_raw((size_t)3 * npair);
-        g.sD     = dev_alloc_real_raw((size_t)3 * npair);
+        g.sCnt = (int*)dev_alloc_raw((size_t)n * sizeof(int));
+        g.sQ   = (int*)dev_alloc_raw((size_t)g.sw * sizeof(int));
+        g.sG   = dev_alloc_real_raw((size_t)3 * g.sw);
+        g.sB   = dev_alloc_real_raw((size_t)3 * g.sw);
+        g.sD   = dev_alloc_real_raw((size_t)3 * g.sw);
+
         int* d_cur = (int*)dev_alloc_raw((size_t)n * sizeof(int));
-
-        CUDA_CHECK(cudaMemcpy(g.sStart, st.data(), ((size_t)n + 1) * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_cur, st.data(), (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
-        launch_solid_pair_fill(g, g.sStart, d_cur, 0);
+        CUDA_CHECK(cudaMemcpy(g.sCnt, h.data(), (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
+        launch_solid_pair_fill(g, d_cur, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaFree(d_cur));
         CUDA_CHECK(cudaGetLastError());
 
-        printf("[A3] solid pair list: %d pairs, %.1f per solid particle, %.1f MB\n",
-               npair, (double)npair / (double)n,
-               (double)((size_t)npair * (sizeof(Real) * 9 + sizeof(int))) / 1048576.0);
-        printf("[A3] sStart[0..3] = %d %d %d %d, sStart[%d] = %d\n",
-               st[0], st[1], st[2], st[3], n, st[n]);
+        // C3: the two passes are compiled separately and agree only if the
+        // knife-edge geometry test decides identically in both.  Verify that
+        // instead of hoping: a mismatch would silently shift the slot range of
+        // every following particle.
+        CUDA_CHECK(cudaMemcpy(cur.data(), d_cur, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(d_cur));
+        long long bad = 0;
+        int first = -1;
+        for (int i = 0; i < n; ++i)
+            if (cur[i] != h[i]) { ++bad; if (first < 0) first = i; }
+        if (bad != 0)
+        {
+            fprintf(stderr, "[A3] FATAL: fill/count mismatch on %lld of %d solids "
+                            "(first k=%d: counted %d, filled %d)\n",
+                    bad, n, first, h[first], cur[first]);
+            exit(3);
+        }
+
+        build_cells();                          // restore the live configuration
+
+        const double mb = (double)g.sw * (double)(sizeof(int) + 9 * sizeof(Real)) / 1048576.0;
+        printf("[A3] solid pair list: %d pairs, %.1f per solid particle, "
+               "ELL width %d (padding %.1f%%), %.1f MB\n",
+               g.npair, (double)g.npair / (double)n, g.swidth,
+               100.0 * ((double)g.sw / (double)(g.npair > 0 ? g.npair : 1) - 1.0), mb);
     }
 
     void init_reference_state()
@@ -415,6 +512,11 @@ struct Solver
             dump_real("vx0", g.vx); dump_real("vx1", g.vx + SPH_NUM); dump_real("vx2", g.vx + 2 * SPH_NUM);
             dump_real("rho_f", g.rho);
         }
+
+        // C5: cudaDeviceSynchronize() reports execution errors, but a launch
+        // configuration failure (too many registers, bad grid, ...) only shows
+        // up in cudaGetLastError(), and the kernel would silently not have run.
+        CUDA_CHECK(cudaGetLastError());
     }
 
     // ---------------- result<N>.dat ----------------
@@ -560,6 +662,23 @@ static int run_case(const char* input_path, int iMaxStep, int profile, const cha
     if (getenv("SPH_VERIFY")) S.verify_cells();
     S.init_reference_state();
     CUDA_CHECK(cudaDeviceSynchronize());
+    // C8: the fp32 solid kernels accumulate F - I, which is only the same tensor
+    // as F when every A is a true inverse (a * = I).  A particle whose A fell
+    // back to the identity breaks that, so refuse fp32 rather than run wrong.
+    {
+        int nfb = gra_fallback_count();
+        if (nfb != 0)
+        {
+            fprintf(stderr, "[A] warning: %d particle(s) have a singular gradient-correction "
+                            "matrix and fell back to A = I (as 1.cpp does)\n", nfb);
+            if constexpr (sizeof(Real) < sizeof(double))
+            {
+                fprintf(stderr, "[A] fp32: the F - I displacement form is invalid for this deck; "
+                                "re-run in fp64\n");
+                return 4;
+            }
+        }
+    }
     if (const char* pa = getenv("SPH_LOADA")) S.load_A_from_dump(pa);
     launch_build_solid_pack(S.g, 0);            // after SPH_LOADA: the pack holds a copy of A
     if (sph_use_static_solid) S.build_solid_lists();   // A3, must follow GraCorrec + LOADA
@@ -608,6 +727,30 @@ static int run_case(const char* input_path, int iMaxStep, int profile, const cha
             sph_fast_fluid_loop = 0;
             bench("pass1_fluid (literal)", [&] { launch_pass1_fluid(S.g, 0); });
             sph_fast_fluid_loop = 1;
+        }
+        if constexpr (sizeof(Real) >= sizeof(double))
+        {
+            if (S.g.fwidth > 0)
+            {
+                bench("fluid nbr build",       [&] { launch_fluid_nbr_build(S.g, 0); });
+                bench("pass1_fluid over list", [&] { launch_pass1_fluid_over_list(S.g, 0); });
+                launch_fluid_nbr_build(S.g, 0);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<int> fc(SPH_NTOTAL);
+                CUDA_CHECK(cudaMemcpy(fc.data(), S.g.fcnt, (size_t)SPH_NTOTAL * sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+                long long tot = 0; int mx = 0, mn = 1 << 30, ov = 0;
+                for (int v : fc)
+                {
+                    if (v < 0) { ++ov; continue; }
+                    tot += v; if (v > mx) mx = v; if (v < mn) mn = v;
+                }
+                printf("[bench] fluid neighbours: mean=%.1f min=%d max=%d overflow=%d (width %d)\n",
+                       (double)tot / (double)(SPH_NTOTAL - ov), mn, mx, ov, S.g.fwidth);
+                sph_use_fluid_list = 0;
+                bench("pass1_fluid (fused)",   [&] { launch_pass1_fluid(S.g, 0); });
+                sph_use_fluid_list = 1;
+            }
         }
         bench("pass1_solid",             [&] { launch_pass1_solid(S.g, 0); });
         bench("constitution",            [&] { launch_constitution(S.g, 0); });
@@ -770,6 +913,7 @@ int main(int argc, char** argv)
     const int profile = (getenv("SPH_PROFILE") != nullptr) ? 1 : 0;
     if (const char* e = getenv("SPH_SOLDDYN")) sph_use_static_solid = (atoi(e) == 0) ? 1 : 0;
     if (const char* e = getenv("SPH_LITERALFLUID")) sph_fast_fluid_loop = (atoi(e) == 0) ? 1 : 0;
+    if (const char* e = getenv("SPH_FLUIDLIST")) sph_use_fluid_list = (atoi(e) == 0) ? 0 : 1;
 
     CUDA_CHECK(cudaSetDevice(0));
     cudaDeviceProp prop;

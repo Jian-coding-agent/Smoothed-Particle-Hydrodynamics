@@ -52,8 +52,9 @@ Environment variables:
 | `SPH_PROFILE` | per-phase timing (prepare / cell / pass1 / constitution / pass2 / update) |
 | `SPH_SOLDDYN=1` | walk the grid in the solid kernels instead of the static pair list |
 | `SPH_LITERALFLUID=1` | literal `pass1_fluid` body instead of the factored one |
+| `SPH_FLUIDLIST=0` | fused fp64 `pass1_fluid` instead of the two-phase list version |
 
-The last two are diagnostics for A/B comparison; the optimised paths are the
+The last three are diagnostics for A/B comparison; the optimised paths are the
 default and are what was validated.
 
 ## Precision
@@ -70,8 +71,14 @@ Measured on an RTX 5080, 237 298 particles, 11.1 M neighbour pairs:
 
 | | ms/step | vs 32-thread CPU (211 ms/step) | accuracy vs fp64 |
 |---|---|---|---|
-| fp64 | **12.42** | **17.0x** | reference precision |
-| fp32 | **2.43** | **87x** | solid `p` median 0.01 Pa / worst 0.17 Pa, `x` within 1e-6 m, `vx` within 1e-5 m/s |
+| fp64 | **5.01** | **42x** | reference precision |
+| fp32 | **1.64** | **129x** | solid `p` median 0.01 Pa / worst 0.17 Pa, `x` within 1e-6 m, `vx` within 1e-5 m/s |
+
+Start-up builds the static solid pair list once: 4 844 544 pairs, ELL width 92,
+402 MB in fp64 (212 MB in fp32), 0.17 s.  A rigid translation of the solid does
+not change it — `tools/check_rigid_translation.py` asserts exactly that, after
+the list was found to be sensitive to the solid's current position (review
+finding C1; DESIGN sec. 12.5).
 
 fp32 needs compensated `x`/`rho` updates and a displacement form for the solid,
 otherwise the updates fall below float resolution and the plate does not move at
