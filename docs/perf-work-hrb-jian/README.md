@@ -13,6 +13,22 @@ with `SPH_BENCH=1` (20 iterations per kernel) and with 500-step runs for the
 end-to-end figure.  The full step time comes from the `[time]` line, which
 excludes result-file writing; the wall-clock figures below include it.
 
+Three different quantities appear in this document, and they are not
+interchangeable:
+
+| name | what it covers | how it is obtained |
+|---|---|---|
+| **kernel** | one kernel, 20 iterations, nothing else in flight | `SPH_BENCH=1` |
+| **step** | one time step: ~10 kernels + 3 memsets + 1 `cudaDeviceSynchronize()`, **no result file** | the `[time]` line (500 steps total / 500) |
+| **end-to-end** | the whole process: start-up (input, grid, GraCorrec, A3 list build) + N steps + every `result<N>.dat` written + exit | wall clock of the process / N |
+
+"Compute" in §1 is the step figure; "total wall" is end-to-end.  For 500 steps:
+fp64 2.500 s of compute vs 3.227 s end-to-end, fp32 0.818 s vs 1.474 s.  At the
+shipped 50-step output cadence the difference is larger per step than these
+averages suggest, because the start-up cost is amortised over 10 files:
+end-to-end works out to **6.29 ms/step in fp64 (1.26x its step time)** and
+**2.74 ms/step in fp32 (1.67x)** — see §6.
+
 ---
 
 ## 1. Headline
@@ -278,7 +294,7 @@ set SPH_BENCH=1
 cuda\build\sph_cuda.exe
 cuda\build\sph_cuda.exe --fp32
 
-:: end-to-end, 500 steps
+:: end-to-end (whole process, incl. result files)
 set SPH_MAXSTEP=500
 cuda\build\sph_cuda.exe
 cuda\build\sph_cuda.exe --fp32
