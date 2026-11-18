@@ -9,7 +9,9 @@
 | Scope | every correctness finding of the review except C7, plus P1 and P2 |
 
 This document is the record of the change; the design rationale lives in
-[`cuda/docs/DESIGN.md`](../../cuda/docs/DESIGN.md) (§6.4, §12, §13).
+[`cuda/docs/DESIGN.md`](../../cuda/docs/DESIGN.md) (§6.4, §12, §13), and the
+performance detail (profiles, per-kernel numbers, what is left) in
+[`docs/perf-work-hrb-jian`](../perf-work-hrb-jian/README.md).
 
 ---
 
