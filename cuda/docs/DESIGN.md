@@ -22,9 +22,9 @@ Everything below is measured on the machine used for the port:
 |---|---|
 | Particles | 237 298 = 101 250 fluid (`itype=2`) + 60 320 solid (`itype=-20`) + 75 728 wall (`itype=-2`) |
 | Neighbour pairs | 11 102 707 at t=0 (~94 per particle), 3x3x3 cells of edge 0.03 m over a fixed box |
-| Reference (CPU, 32 threads) | 500 steps in 105.6 s -> **211 ms/step** |
-| Port, fp64 | **5.01 ms/step** -> 42x vs the 32-thread CPU |
-| Port, fp32 | **1.64 ms/step** -> 129x vs the 32-thread CPU |
+| Reference (CPU, 32 threads) | 500 steps in 81.4 s -> **163 ms/step** (see sec. 6.4) |
+| Port, fp64 | **5.01 ms/step** -> 33x vs the 32-thread CPU |
+| Port, fp32 | **1.64 ms/step** -> 100x vs the 32-thread CPU |
 | Validation | intermediate arrays agree to 1e-15...1e-9 relative at step 1; 500- and 3000-step output within the CPU's own run-to-run noise |
 
 ---
@@ -418,10 +418,16 @@ After the external review, its two patches (sec. 7.4-7.7), the review's three
 acceleration items A3/A4/A5 (sec. 11, 12) and the post-review work of sec. 13
 (fp64 fluid neighbour lists, slot-major solid lists, the C1-C3 fixes).
 
-| | ms/step | vs 32-thread CPU (211 ms/step) |
+| | ms/step | vs 32-thread CPU (163 ms/step) |
 |---|---|---|
-| fp64 | **5.01** | **42x** |
-| fp32 | **1.64** | **129x** |
+| fp64 | **5.01** | **33x** |
+| fp32 | **1.64** | **100x** |
+
+(The CPU figure was quoted as 211 ms/step in earlier versions of this section.
+Re-measured twice: 81.4 s and 80.7 s for 500 steps, i.e. 163 ms/step, with the
+start-up and the writer separated out in `docs/perf-work-hrb-jian` sec. 10 —
+compute alone is 131 ms/step, so the like-for-like ratio to the GPU is 26x for
+fp64 and 80x for fp32.)
 
 The same trajectory, per change, fp64 500 steps:
 

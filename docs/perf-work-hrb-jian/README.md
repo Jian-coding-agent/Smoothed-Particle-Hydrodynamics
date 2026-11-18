@@ -39,12 +39,13 @@ end-to-end works out to **6.29 ms/step in fp64 (1.26x its step time)** and
 | fp64, total wall | — | — | — | **3.23 s** (incl. 0.17 s init + 0.56 s output) |
 | fp32, compute | 2.434 | **1.634** | **1.49x** | 0.82 s |
 | fp32, total wall | — | — | — | **1.47 s** (incl. 0.15 s init + 0.51 s output) |
-| fp64 vs 32-thread CPU (211 ms/step) | 17x | **42x** | | |
-| fp32 vs 32-thread CPU (211 ms/step) | 87x | **129x** | | |
+| fp64 vs 32-thread CPU (163 ms/step, §10) | 13x | **33x** | | |
+| fp32 vs 32-thread CPU (163 ms/step, §10) | 67x | **100x** | | |
 
 Each row is measured back to back on the same machine, same deck; the "before"
 column is the pre-change executable, preserved from the same session.  The
-vs-CPU column uses the 32-thread reference run at 211 ms/step.
+vs-CPU column uses the 32-thread reference run whose 500 steps take 81.4 s
+(§10 has the decomposition and the thread scaling).
 
 ---
 
@@ -319,3 +320,92 @@ them in one run.
 * The 500-step "before" run was made with the pre-change executable preserved
   from the same session, not with a rebuilt tree.
 * `[time]` excludes result writing; wall-clock figures include it.
+
+---
+
+## 10. The CPU reference (the baseline, and what it costs)
+
+The CPU solver is the correctness oracle, not a target: none of this change
+touches `cpu/1.cpp`.  But every "vs CPU" ratio needs a number, so here is what it
+actually does on this machine.
+
+### What a step runs
+
+`1.cpp`, one translation unit, OpenMP:
+
+```
+direct_find()      rebuild the cell list, enumerate all 11.1 M pairs
+continue_density() pass 1 over the pair list, reduce the thread-private buffers,
+                   solid constitution, pass 2 over pairs with a solid, reduce again
+integrate          fluid rho/v, solid v (boundary clamp), x += dt*v
+```
+
+The structural difference from the GPU is the accumulation: 35 arrays x
+237 298 particles x threads of doubles = **2.03 GB at 32 threads**, zeroed and
+reduced every step.  The GPU version has no such buffers (every pair term is
+symmetric, so each particle gathers its own half), which is where most of the
+speed-up comes from.
+
+### Measured
+
+`dist\SPH.exe`, same `input.dat`, wall clock of the process; `SPH_THREADS` sets
+the OpenMP teams, `SPH_MAXSTEP` the step count.
+
+| threads | steps | wall | ms/step (wall) |
+|---:|---:|---:|---:|
+| 32 | 500 | 81.4 s | 163 |
+| 16 | 500 | 81.8 s | 164 |
+| 8 | 500 | 114.0 s | 228 |
+| 1 | 50 | 49.3 s | 986 |
+
+Splitting the cost, with the start-up (`SPH_MAXSTEP=0`) at **1.10 s** and one
+result file at **1.47 s** (both measured; the writer is `ofstream <<` per
+column, which is why it is 26x slower per file than the GPU's `to_chars` path):
+
+| threads | compute, ms/step | speed-up vs 1 thread |
+|---:|---:|---:|
+| 1 | 934 | 1.0x |
+| 8 | 196 | 4.8x |
+| 16 | 132 | 7.1x |
+| 32 | **131** | 7.1x |
+
+So the reference stops scaling at 16 threads: 32 threads give the same wall
+clock as 16 (81.4 vs 81.8 s).  Parallel efficiency at 32 threads is ~22 %, and
+the review attributes about 22 % of the step to the reduction passes alone --
+the pair enumeration and the serial constitution phase bound the rest.
+
+Against the GPU (compute only, no output):
+
+| | ms/step | ratio |
+|---|---:|---:|
+| CPU, 32 threads | 131 | 1x |
+| GPU fp64 | 5.01 | **26x** |
+| GPU fp32 | 1.63 | **80x** |
+
+At the 50-step output cadence the ratio is essentially the same, because both
+sides pay their writer per 50 steps: CPU 131 + 29 = 160 ms/step against GPU
+5.0 + 1.1 = 6.1, i.e. 26x.
+
+### The old 211 ms/step figure
+
+`DESIGN.md` and the READMEs quoted 500 steps in 105.6 s (211 ms/step).  That is
+reproducible neither today (81.4 s) nor in the previous session's transfer run
+(80.7 s), and 8 threads gives 228 ms/step, so the old number looks like a
+lower-thread or partially loaded run.  The documents now use the measured value;
+the ratio changes from 42x/129x to 33x/100x, not because anything got slower,
+but because the baseline was overstated.
+
+### What would make it faster (not done, from the review)
+
+| change | expected |
+|---|---|
+| gather formulation instead of the 35 per-thread buffers | removes ~1 GB/step of zeroing + reduction traffic, and makes results independent of the thread count |
+| hoist `1/dr` and the kernel polynomial (`dwdx()` is called ~30x per fluid/fluid pair) | the same change took the GPU from 56 to 37 ms/step |
+| use the A3 static solid list on the CPU too | the solid pair set is constant there as well |
+| `-O3` instead of `-O2` | 1.47x, measured in an earlier report |
+
+Not done on purpose.  The CPU tree is the validation oracle, and R1 shows that
+even the *pair set* depends on the compiler's FMA policy, so changing its build
+flags or its algorithm invalidates the reference it exists to provide.  `-O3
+-ffp-contract=off` is now set in `cpu/CMakeLists.txt` so that a GCC/Clang build
+reproduces the MSVC pair count instead of silently differing.

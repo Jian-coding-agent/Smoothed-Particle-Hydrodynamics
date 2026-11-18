@@ -69,10 +69,10 @@ Both instantiations are compiled in by default; CMake can trim the build:
 
 Measured on an RTX 5080, 237 298 particles, 11.1 M neighbour pairs:
 
-| | ms/step | vs 32-thread CPU (211 ms/step) | accuracy vs fp64 |
+| | ms/step | vs 32-thread CPU (163 ms/step) | accuracy vs fp64 |
 |---|---|---|---|
-| fp64 | **5.01** | **42x** | reference precision |
-| fp32 | **1.64** | **129x** | solid `p` median 0.01 Pa / worst 0.17 Pa, `x` within 1e-6 m, `vx` within 1e-5 m/s |
+| fp64 | **5.01** | **33x** | reference precision |
+| fp32 | **1.64** | **100x** | solid `p` median 0.01 Pa / worst 0.17 Pa, `x` within 1e-6 m, `vx` within 1e-5 m/s |
 
 Start-up builds the static solid pair list once: 4 844 544 pairs, ELL width 92,
 402 MB in fp64 (212 MB in fp32), 0.17 s.  A rigid translation of the solid does

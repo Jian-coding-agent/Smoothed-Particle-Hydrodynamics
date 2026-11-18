@@ -195,10 +195,15 @@ not amplify the difference (3.3).
 
 500 steps, same binary, same deck, per precision:
 
-| | before | after | speed-up | vs 32-thread CPU (211 ms/step) |
+| | before | after | speed-up | vs 32-thread CPU (163 ms/step) |
 |---|---:|---:|---:|---:|
-| fp64 | 12.412 ms/step | **5.006** | **2.48x** | **42x** |
-| fp32 | 2.434 ms/step | **1.634** | **1.49x** | **129x** |
+| fp64 | 12.412 ms/step | **5.006** | **2.48x** | **33x** |
+| fp32 | 2.434 ms/step | **1.634** | **1.49x** | **100x** |
+
+(The CPU baseline is the wall clock of a 500-step CPU run, 81.4 s.  Earlier
+documents quoted 211 ms/step; that figure is not reproducible on this machine,
+and [`docs/perf-work-hrb-jian`](../perf-work-hrb-jian/README.md) §10 has the
+decomposition — the compute-only ratio is 26x / 80x.)
 
 Per kernel (fp64, `SPH_BENCH=1`):
 
