@@ -30,9 +30,12 @@ Measured on an NVIDIA RTX 5080 (`sm_120`), CUDA 13.3, 237,298 particles:
 | `cuda/` | fp32 | **1.64** | **100x** | solid `p` median 0.01 Pa, `x` within 1e-6 m |
 
 The CPU figure is the wall clock of a 500-step run (81.4 s incl. 10 result files)
-on the same machine: 16-core Ryzen 9 9950X, 32 OpenMP threads.  Two runs
-with identical settings produce **byte-identical** `result*.dat`, in both
-precisions.
+on the same machine: 16-core Ryzen 9 9950X, 32 OpenMP threads.  Two runs of the
+CUDA build with identical settings produce **byte-identical** `result*.dat`, in both
+precisions.  The CPU reference does not: its OpenMP dynamic schedule changes the
+summation order, so `p` varies by up to ~1e-3 Pa between runs -- that is the noise
+floor any GPU-vs-CPU comparison has to be read against
+([`docs/algorithm-cpu-vs-gpu.md`](docs/algorithm-cpu-vs-gpu.md) sec. 7.6).
 
 ## How it works
 

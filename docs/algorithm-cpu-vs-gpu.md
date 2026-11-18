@@ -343,7 +343,137 @@ clock on both sides:
 
 ---
 
-## 7. The CPU's bottlenecks, concretely
+## 7. Numerical agreement: GPU vs CPU
+
+The two programs solve the same equations, but they cannot produce the same bits:
+the CPU sums a pair's contributions into per-thread buffers and reduces them
+afterwards, the GPU sums into one lane's registers.  What matters is how far apart
+they end up, and whether that distance is inside what the reference itself varies.
+
+### 7.1 What "the same result" means here
+
+`result*.dat` is printed with `%.6g`, i.e. **6 significant digits**, so "identical"
+below means identical in the file.  Two columns need care:
+
+* column 4 is `p` for the fluid and `trace(Pia)` for the solid, in Pa;
+* column 4 is computed from the *previous* step's `rho` (the reference prints the
+  value the step consumed), so `p != c0^2(rho-1000)` in the same row.
+
+### 7.2 fp64, 500 steps (9950X, 32 threads)
+
+| column | rows differing (of 237 298) | max difference |
+|---|---:|---:|
+| `x0 x1 x2` | 0 | — |
+| `rho` | 0 | — |
+| fluid `p` | 0 | — |
+| `mass`, `itype`, `X0`, `rho0` | 0 | — |
+| solid `trace(Pia)` | 8 103 | **6.8e-8 Pa** |
+| `vx0 vx1 vx2` | 47 / 71 / 7 | **1e-9 m/s** |
+
+Split by the magnitude of the stress being compared:
+
+| stress magnitude, `trace(Pia)` | particles | max difference |
+|---|---:|---:|
+| >= 1000 Pa | 20 274 | 0 |
+| 100 - 1000 Pa | 29 762 | 0 |
+| 1 - 100 Pa | 1 468 | 0 |
+| < 1 Pa | 84 544 | 6.8e-8 Pa |
+
+Every particle carrying a meaningful stress agrees to the printed precision, and
+the largest difference anywhere is 4e-12 of the peak stress (1.82e4 Pa).  The
+8 103 that differ are particles whose stress is near zero, where a 1e-9 Pa residual
+is visible only because the value itself is tiny.
+
+### 7.3 fp32, 500 steps
+
+| quantity | max difference | floor |
+|---|---:|---|
+| `x` | 1e-6 m | ulp of a 0.5 m coordinate |
+| `vx` | 1e-5 m/s | ulp of `v` |
+| `rho` | 0.01 kg/m^3 | ulp of 1000 |
+| fluid `p` | 0.14 Pa | 1 ulp of `rho` = 0.14 Pa |
+| solid `trace(Pia)` | 0.17 Pa (8.2e-4 relative above 100 Pa) | `p = c0^2 (rho-1000)` is a difference of two large numbers |
+
+fp32 is at its quantisation floor: the pressure is `c0^2 (rho - 1000)` with
+`rho` near 1000, so one ulp of density is already 0.14 Pa of pressure.
+
+### 7.4 It does not grow
+
+| comparison | `p` max | `x` |
+|---|---:|---|
+| step 0 | 1e-5 Pa | identical |
+| 500 steps | 6.8e-8 Pa | identical |
+| 650 steps (past fluid/plate contact at 566), GPU build vs the previous build | identical | identical |
+| 2950 steps (on the 4090 machine, GPU vs GPU) | <= 1e-3 | identical |
+
+No divergence: the differences stay at the rounding scale, and where they appear
+they are amplified by the discontinuous switches, not by the physics.
+
+### 7.5 Why they differ at all
+
+1. **Summation order.**  The CPU accumulates each pair's two contributions into
+   thread-private buffers and reduces afterwards; the GPU accumulates a particle's
+   half in registers, in cell order then index order.  Different order, different
+   last bit.
+2. **FMA contraction.**  Both builds contract `a*b+c` into an FMA, but not on the
+   same expressions, and the neighbour test is exempted with `__dadd_rn` on the GPU
+   only.  This is measurable: an FMA-contracting CPU build reports 1 080 more pairs
+   at `t = 0`.
+3. **Discontinuous switches.**  `|SurF| < 2.5` changes `eta` by 50x; the solid
+   clamp sits exactly on lattice rows (`y <= 0.01 || y >= 0.49 || z <= 0.01`); the
+   density clamp is `rho < 960`.  A 1-ulp difference can flip one of these and move
+   a particle's pressure visibly.
+4. **Knife-edge pairs.**  Thousands of lattice pairs sit exactly at
+   `r = 3*hsml = 0.03 m`, where membership is decided by the last rounding step.
+
+### 7.6 The reference is not reproducible either — measured
+
+Two CPU runs, same binary, same deck, same machine, 32 threads each, started
+concurrently:
+
+| | `p` | `x` |
+|---|---|---|
+| run A vs run B, step 0 | 2 802 particles differ, max **2.4e-8 Pa** | identical |
+| run A vs run B, 500 steps | 2 838 particles differ, max **1e-3 Pa** | identical |
+
+That is `schedule(dynamic)` plus the per-thread buffers: which thread owns which
+chunk of the pair list changes the summation order, so the reference is a
+different double-precision result on every run.  The GPU, by construction
+(deterministic cell order and index order), is bit-identical run to run.
+
+Consequently the GPU-vs-CPU distance depends on *which* CPU run it is compared
+against:
+
+| | `p` max, 500 steps |
+|---|---:|
+| GPU vs CPU run A | 6.9e-8 Pa |
+| GPU vs CPU run B | **1e-3 Pa** |
+| CPU run A vs run B | **1e-3 Pa** |
+
+The third row is the yardstick: the port is not systematically off, the
+comparison has a noise floor set by the reference's own scheduling.  This is also
+why the same check reports 1e-3 on KMG-XI (32 threads on a hybrid CPU, E-cores
+included) and 6.8e-8 on the 9950X (16 identical cores) — both are inside the
+reference's own spread.
+
+### 7.7 What the validation actually asserts
+
+Every machine run so far passes the same criterion, at 500 steps:
+
+| quantity | criterion | 5080 | 4090 | 5090 |
+|---|---|---|---|---|
+| `x0 x1 x2`, `rho`, `mass`, `itype`, `X0`, `rho0` | identical at 6 digits | pass | pass | pass |
+| `p` (fluid) and `trace(Pia)` (solid) | <= 1e-3 Pa | 6.8e-8 | 6.9e-8 | 1e-3 |
+| `vx` | <= 1e-9 m/s | 1e-9 | 1e-9 | 1e-9 |
+| pair count at `t = 0` | 11 102 707 | exact | exact | exact |
+| run-to-run | byte-identical | pass | pass | pass |
+
+The pair count is the strongest statement: it means the two programs agree on
+*which pairs exist*, which is the part a transcription error would break first.
+
+---
+
+## 8. The CPU's bottlenecks, concretely
 
 | bottleneck | evidence | cost |
 |---|---|---|
@@ -359,7 +489,7 @@ clock on both sides:
 
 ---
 
-## 8. What to take from this
+## 9. What to take from this
 
 * The port is faster because it **reformulated the loop** (gather), **removed a
   constant-cost table's worth of work** (static solid pairs) and **stopped moving
