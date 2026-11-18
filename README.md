@@ -130,6 +130,7 @@ docs/
 |---|---|
 | [`cuda/docs/DESIGN.md`](cuda/docs/DESIGN.md) | algorithm mapping, precision template, validation, measured performance, remaining work |
 | [`docs/CUDA_PORT_ANALYSIS.md`](docs/CUDA_PORT_ANALYSIS.md) | analysis of `1.cpp` and the initial porting plan |
+| [`docs/algorithm-cpu-vs-gpu.md`](docs/algorithm-cpu-vs-gpu.md) | how each implementation computes a step, why the GPU is faster, performance across machines |
 | [`cuda/README.md`](cuda/README.md) | CUDA build, run options, diagnostics |
 | [`cpu/README.md`](cpu/README.md) | CPU project, build matrix, troubleshooting |
 | [`cpu/QUICKSTART.txt`](cpu/QUICKSTART.txt) | one-page CPU quick start |
