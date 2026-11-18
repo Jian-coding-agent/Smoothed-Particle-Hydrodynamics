@@ -171,8 +171,10 @@ hundred particles.
 * Two identical 500-step runs are byte-identical in both precisions
   (`SHA256` over `result0..9`).
 * `compute-sanitizer` memcheck (fp64 and fp32) and racecheck: 0 errors.
-* `load_input()` validation was exercised with a deck whose particle types are
-  permuted; the solver refuses to run and names the first offending particle.
+* `load_input()` validation was exercised with two bad decks: one with a
+  permuted particle type (`particle 5: itype -20 not allowed in this index
+  range`) and one with a position outside the grid (`particle 3: x[0] = 0.95
+  outside the grid [-0.1, 0.7]`).  Both are refused before anything runs.
 
 ### 3.5 One deliberate incompatibility
 
