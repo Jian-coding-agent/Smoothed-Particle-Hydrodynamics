@@ -30,3 +30,8 @@ Thumbs.db
 
 # Local archive: pre-restructure duplicates and build output
 _legacy/
+
+# Local scratch: benchmark runs, build trees, source snapshots
+_aw_build/
+_local/*
+!_local/CUDA_REPORT_4090.md

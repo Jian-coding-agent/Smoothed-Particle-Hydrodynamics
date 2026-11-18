@@ -1,14 +1,15 @@
 // ============================================================================
-//  CompareResults —— 逐点比较两套 SPH 的 result<N>.dat
+//  CompareResults -- compare two sets of SPH result<N>.dat files point by point
 //
-//  用法:  CompareResults.exe <dirA> <dirB> [--tol 1e-12] [--csv out.csv]
+//  Usage:  CompareResults.exe <dirA> <dirB> [--tol 1e-12] [--csv out.csv]
 //
-//  输出:
-//    1) 每个 result<N>.dat 一行: index lines nDiff maxAbs maxRel overTol
-//    2) 末尾按列汇总: 哪一列在多少处不同、最大绝对/相对差
-//       (列: x0 x1 x2 p vx0 vx1 vx2 rho mass itype X00 X01 X02 rho0)
+//  Output:
+//    1) one line per result<N>.dat: index lines nDiff maxAbs maxRel overTol
+//    2) a per-column summary at the end: how many values differ in each column,
+//       with the maximum absolute and relative difference
+//       (columns: x0 x1 x2 p vx0 vx1 vx2 rho mass itype X00 X01 X02 rho0)
 //
-//  编译:  csc /nologo /optimize+ /out:CompareResults.exe CompareResults.cs
+//  Build:  csc /nologo /optimize+ /out:CompareResults.exe CompareResults.cs
 // ============================================================================
 using System;
 using System.Globalization;
@@ -85,14 +86,14 @@ static class CompareResults
                     lb = rb.ReadLine();
                     lines++;
                     if (lb == null) break;
-                    if (la == lb) continue;                    // 整行相同：跳过
+                    if (la == lb) continue;                    // identical line: skip
 
                     string[] va = la.Split('\t');
                     string[] vb = lb.Split('\t');
                     int m = Math.Min(va.Length, vb.Length);
                     for (int c = 0; c < m; c++)
                     {
-                        if (va[c] == vb[c]) continue;          // 该值相同：跳过
+                        if (va[c] == vb[c]) continue;          // identical value: skip
                         double x = double.Parse(va[c], CultureInfo.InvariantCulture);
                         double y = double.Parse(vb[c], CultureInfo.InvariantCulture);
                         double d = Math.Abs(x - y);
@@ -123,7 +124,7 @@ static class CompareResults
         }
 
         Console.WriteLine();
-        Console.WriteLine("--- 按列汇总（全部 result 文件累计）---");
+        Console.WriteLine("--- per-column summary (all result files combined) ---");
         Console.WriteLine("col\tname\tdiffCount\tmaxAbs\tmaxRel");
         for (int c = 0; c < ncol; c++)
         {

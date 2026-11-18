@@ -12,7 +12,7 @@
 
 using namespace std;
 
-const int num=237298;   //水流粒子+墙粒子的总和  total1+nvirt
+const int num=237298;   // fluid + wall particle count  total1+nvirt
 //definition of all variables
 double hsml,r,pi;//kernel function variables
 double driac;
@@ -50,7 +50,7 @@ void GraCorrec();
 void GLStrain();
 
 
-//数值耗散变量
+// numerical dissipation variables
 double DFdt11[num],DFdt12[num],DFdt13[num],DFdt21[num],DFdt22[num],DFdt23[num],DFdt31[num],DFdt32[num],DFdt33[num];
 double DFdtB11[num],DFdtB12[num],DFdtB13[num],DFdtB21[num],DFdtB22[num],DFdtB23[num],DFdtB31[num],DFdtB32[num],DFdtB33[num];
 double SD11[num],SD12[num],SD13[num],SD21[num],SD22[num],SD23[num],SD31[num],SD32[num],SD33[num];
@@ -90,11 +90,11 @@ struct stMesh {
 };
 void NorVector();
 
-//	所有的网格
+//	all grid cells
 std::vector<stMesh*> meshes;
 int meshCount = 0;
 
-//	每个点对应的网格
+//	grid cell of each particle
 //	std::vector<stMesh*> ptMeshs;
 
 stMesh* createMeshes();
@@ -184,7 +184,7 @@ int main()
 				vx[2][i] = MaxV*vx[2][i]/absv;
 			}
 		}
-		for(i=ntotal;i<ntotal+SolNum;i++)//速度
+		for(i=ntotal;i<ntotal+SolNum;i++)//velocity
 		{
 			vx[0][i] = vx[0][i]+dt*PIJW[0][i]+dt*SForce[0][i];
 			vx[1][i] = vx[1][i]+dt*PIJW[1][i]+dt*SForce[1][i];
@@ -205,7 +205,7 @@ int main()
 
 		if(itime%50 == 0)
 		{
-			cout<<"T= "<<itime/50<<"	"<<"粒子对="<<niac<<endl; 
+			cout<<"T= "<<itime/50<<"\t"<<"pairs="<<niac<<endl;
 			sprintf(sResult, "result%d.dat", itime/50);
 			outfile1.open(sResult, ios::out);
 
@@ -223,7 +223,7 @@ int main()
 	return 0;
 }
 
-//核函数(已校验)
+// kernel function (verified)
 double kernel(double dr)
 {
     double h = 1.5*hsml;
@@ -292,9 +292,9 @@ stMesh* createMesh()
 	return mesh;
 }
 
-//	创建根节点网格
-//	x, y 为根节点的中心
-//	radio 为网格边长的一半
+//	create the root grid
+//	x, y are the centre of the root node
+//	radio is half the cell edge
 stMesh* createRootMesh( double x, double y, double z, double radio )
 {
 	stMesh* mesh = createMesh();
@@ -309,7 +309,7 @@ stMesh* createRootMesh( double x, double y, double z, double radio )
 	return mesh;
 }
 
-//	创建子节点
+//	create child nodes
 void createChildrenMesh( stMesh* parent )
 {
 	if( parent )
@@ -420,8 +420,8 @@ bool addPtToMesh( int idx, stMesh* parent )
 
 }
 
-//	创建网格
-//	返回根节点
+//	create the grid
+//	return the root node
 stMesh* createMeshes()
 {
 	meshCount = 0;
@@ -471,17 +471,17 @@ void find_pair( stMesh* mesh, int index, double ix, double iy, double iz, double
 	}
 }
 
-//寻找粒子对(已校验)
+// find particle pairs (verified)
 // ==================== [OPT-R1] uniform cell list ====================
-// 原来的八叉树每步重建 20 万节点并递归下探, 实测 1.16 s/步; 这里换成固定域均匀网格.
-// 网格边长 = 搜索半径 3*hsml, 每点只扫 14 个半邻居格(含自身), 每对只出现一次.
+// The old octree rebuilt 200k nodes every step and recursed; measured 1.16 s/step. Replaced by a fixed-domain uniform grid.
+// Cell edge = search radius 3*hsml; each particle scans 14 half-neighbour cells (including its own), so every pair appears once.
 static int  g_nxg = 0, g_nyg = 0, g_nzg = 0, g_ncell = 0;
-static int* g_cellStart = 0;   // CSR 偏移, 长度 ncell+1
-static int* g_cellCur   = 0;   // 填充游标, 长度 ncell
-static int* g_sorted    = 0;   // 按 cell 排序后的粒子号, 长度 num
-// [OPT-PF] 并行枚举邻对用的两阶段辅助数组
-static int* g_cellPairCnt   = 0;   // 每个 cell 的邻对数, 长度 ncell
-static int* g_cellPairStart = 0;   // 每个 cell 在 pair 数组里的起点, 长度 ncell+1
+static int* g_cellStart = 0;   // CSR offsets, length ncell+1
+static int* g_cellCur   = 0;   // fill cursor, length ncell
+static int* g_sorted    = 0;   // particle ids sorted by cell, length num
+// [OPT-PF] two-phase helper arrays for parallel pair enumeration
+static int* g_cellPairCnt   = 0;   // number of pairs per cell, length ncell
+static int* g_cellPairStart = 0;   // start of each cell in the pair array, length ncell+1
 static const double g_gridx0 = -0.10, g_gridy0 = -0.10, g_gridz0 = -0.10;
 static const double g_gridx1 =  0.70, g_gridy1 =  0.70, g_gridz1 =  1.20;
 
@@ -501,9 +501,9 @@ void init_grid()
 	pair_j.reserve(14000000);
 }
 
-// [OPT-PF] 枚举某个 cell 的邻对; WRITE=false 时只计数.
-// 遍历顺序与串行版完全一致(cell 升序 -> offs 升序 -> (a,b) 升序),
-// 因此"先计数、再按预留区间填充"两阶段得到的 pair 顺序与串行逐位相同.
+// [OPT-PF] enumerate the pairs of one cell; with WRITE=false this only counts.
+// Traversal order is identical to the serial version (cell asc -> offs asc -> (a,b) asc),
+// so "count first, then fill reserved ranges" yields exactly the same pair order.
 template<bool WRITE>
 static int enum_cell(int c, const int (*offs)[3], double R2, int* pi_, int* pj_)
 {
@@ -530,7 +530,7 @@ static int enum_cell(int c, const int (*offs)[3], double R2, int* pi_, int* pj_)
 				if(d0*d0+d1*d1+d2*d2<R2)
 				{
 					int u=pi, v=pj;
-					if(u>v){ u=pj; v=pi; }   // 必须保持 i<j: 后面各分支依赖 itype 的粒子编号顺序
+					if(u>v){ u=pj; v=pi; }   // must keep i<j: later branches depend on the itype ordering of particle ids
 					if(WRITE){ pi_[n]=u; pj_[n]=v; }
 					++n;
 				}
@@ -552,7 +552,7 @@ void direct_find()
 		{-1,-1,1},{0,-1,1},{1,-1,1},{-1,0,1},{0,0,1},{1,0,1},{-1,1,1},{0,1,1},{1,1,1}
 	};
 
-	// 1) 计数
+	// 1) count
 	memset(g_cellCur, 0, sizeof(int)*g_ncell);
 	for(p=0; p<num; ++p)
 	{
@@ -561,7 +561,7 @@ void direct_find()
 		iz=(int)floor((x[2][p]-g_gridz0)*inv); if(iz<0) iz=0; if(iz>=g_nzg) iz=g_nzg-1;
 		g_cellCur[(iz*g_nyg+iy)*g_nxg+ix]++;
 	}
-	// 2) 前缀和 + 装桶
+	// 2) prefix sum + bucket fill
 	acc = 0;
 	for(c=0; c<g_ncell; ++c){ g_cellStart[c]=acc; acc+=g_cellCur[c]; g_cellCur[c]=g_cellStart[c]; }
 	g_cellStart[g_ncell]=acc;
@@ -572,9 +572,9 @@ void direct_find()
 		iz=(int)floor((x[2][p]-g_gridz0)*inv); if(iz<0) iz=0; if(iz>=g_nzg) iz=g_nzg-1;
 		g_sorted[g_cellCur[(iz*g_nyg+iy)*g_nxg+ix]++] = p;
 	}
-	// 3) 并行枚举 14 个半邻居格: 先每个 cell 计数, 前缀和定起点, 再并行填充.
-	//    pair_i/pair_j 用 capacity 当长度(init_grid 已 reserve 1400 万),
-	//    不走 resize, 否则每个时间步都要 memset 掉 89 MB 的 pair 缓冲.
+	// 3) enumerate the 14 half-neighbour cells in parallel: per-cell count, prefix sum for starts, then parallel fill.
+	//    pair_i/pair_j use capacity as their length (init_grid reserves 14M entries),
+	//    avoiding resize, which would memset the 89 MB pair buffer every time step.
 	int total;
 	#pragma omp parallel for schedule(dynamic, 32) num_threads(g_omp_nth)
 	for(c=0; c<g_ncell; ++c)
@@ -606,7 +606,7 @@ void direct_find()
 }
 
 
-//寻找粒子对(已校验)
+// find particle pairs (verified)
 void direct_find1()
 {
 	/*for(i=0;i<num;i++)
@@ -624,7 +624,7 @@ void direct_find1()
 			{
 				pair_i.push_back(i);
 				pair_j.push_back(j);
-				//kernel(dr);   //该函数在这里起到何作用了？
+				//kernel(dr);   // what role did this call play here?
 				//countiac[i]=countiac[i]+1;
 				//countiac[j]=countiac[j]+1;
 			}
@@ -632,7 +632,7 @@ void direct_find1()
 	}
 	niac=(int)pair_i.size();
 }
-//连续性函数，密度对时间的导数，等于速度的散度(已校验)
+// continuity: the time derivative of density equals the divergence of velocity (verified)
 void continue_density()
 {
 	// [OPT-OMP] accumulated quantities are rebuilt by the reduction passes below;
@@ -766,7 +766,7 @@ void continue_density()
 			double PLi = p[i];
 			double PRi = p[i]-rho[i]*9.8*(x[2][j]-x[2][i]);
 			double rhoLi = rho[i];
-			double rhoRi = 1000.0 + PRi/(c0*c0);//1000*pow(1.0+(7.0*PRi)/(1000*c0*c0),0.14286);  //该式由状态方程反算得出
+			double rhoRi = 1000.0 + PRi/(c0*c0);//1000*pow(1.0+(7.0*PRi)/(1000*c0*c0),0.14286);  // derived by inverting the equation of state
 			double ULi = -vx[0][i]*vecn[0][j]-vx[1][i]*vecn[1][j]-vx[2][i]*vecn[2][j];
 			double URi = -ULi;
 
@@ -837,7 +837,7 @@ void continue_density()
 			F32[j]=F32[j]+(mass[i]/rho0[i])*Dxj2*vec1j;
 			F33[j]=F33[j]+(mass[i]/rho0[i])*Dxj2*vec2j;
 
-			//摩阻项求解
+			// friction term
 			DFdt11[i] = DFdt11[i] + (mass[j]/rho0[j])*(vx[0][j]-vx[0][i])*g0x;
 			DFdt12[i] = DFdt12[i] + (mass[j]/rho0[j])*(vx[0][j]-vx[0][i])*g0y;
 			DFdt13[i] = DFdt13[i] + (mass[j]/rho0[j])*(vx[0][j]-vx[0][i])*g0z;
@@ -943,9 +943,9 @@ void continue_density()
 	}
 
 	// ---------- solid constitution (needs the reduced F / DFdt) ----------
-	for(i=ntotal;i<ntotal+SolNum;i++)//变形梯度张量的修正
+	for(i=ntotal;i<ntotal+SolNum;i++)// correction of the deformation-gradient tensor
 	{
-		//摩阻项
+		// friction term
 		DFdtB11[i]=DFdt11[i]*A11[i]+DFdt12[i]*A21[i]+DFdt13[i]*A31[i];
 		DFdtB12[i]=DFdt11[i]*A12[i]+DFdt12[i]*A22[i]+DFdt13[i]*A32[i];
 		DFdtB13[i]=DFdt11[i]*A13[i]+DFdt12[i]*A23[i]+DFdt13[i]*A33[i];
@@ -960,7 +960,7 @@ void continue_density()
 			         -F31[i]*F22[i]*F13[i] - F11[i]*F32[i]*F23[i] - F12[i]*F21[i]*F33[i]+0.0;
 		rho[i] = rho0[i]/Jacb; 
 		if(fabs(Jacb)<0.000001){rho[i]=1000.0;}
-		//摩阻项
+		// friction term
 		double paii=0.25*rho0[i]*1000*hsml;
 		SD11[i]=paii*(DFdtB11[i]*F11[i]+DFdtB21[i]*F21[i]+DFdtB31[i]*F31[i] + F11[i]*DFdtB11[i]+F21[i]*DFdtB21[i]+F31[i]*DFdtB31[i]);
 		SD12[i]=paii*(DFdtB11[i]*F12[i]+DFdtB21[i]*F22[i]+DFdtB31[i]*F32[i] + F11[i]*DFdtB12[i]+F21[i]*DFdtB22[i]+F31[i]*DFdtB32[i]);
@@ -974,10 +974,10 @@ void continue_density()
 		SD32[i]=paii*(DFdtB13[i]*F12[i]+DFdtB23[i]*F22[i]+DFdtB33[i]*F32[i] + F13[i]*DFdtB12[i]+F23[i]*DFdtB22[i]+F33[i]*DFdtB32[i]);
 		SD33[i]=paii*(DFdtB13[i]*F13[i]+DFdtB23[i]*F23[i]+DFdtB33[i]*F33[i] + F13[i]*DFdtB13[i]+F23[i]*DFdtB23[i]+F33[i]*DFdtB33[i]);
 
-		//求F的逆
+		// invert F
 		//double Da=F11[i]*F22[i]*F33[i] + F31[i]*F12[i]*F23[i] + F21[i]*F32[i]*F13[i]
 		//	     -F31[i]*F22[i]*F13[i] - F11[i]*F32[i]*F23[i] - F12[i]*F21[i]*F33[i]+0.0;
-		//下面使用代数余子式求逆
+		// invert via the adjugate (cofactor) matrix below
 		Fni11[i]=  (F22[i]*F33[i]-F32[i]*F23[i])/Jacb;
 		Fni12[i]= -(F12[i]*F33[i]-F32[i]*F13[i])/Jacb;
 		Fni13[i]=  (F12[i]*F23[i]-F22[i]*F13[i])/Jacb;
@@ -990,7 +990,7 @@ void continue_density()
 		Fni32[i]= -(F11[i]*F32[i]-F31[i]*F12[i])/Jacb;
 		Fni33[i]=  (F11[i]*F22[i]-F21[i]*F12[i])/Jacb;
 
-		//摩阻项
+		// friction term
 		PD11[i]=F11[i]*SD11[i]+F12[i]*SD21[i]+F13[i]*SD31[i];
 		PD12[i]=F11[i]*SD12[i]+F12[i]*SD22[i]+F13[i]*SD32[i];
 		PD13[i]=F11[i]*SD13[i]+F12[i]*SD23[i]+F13[i]*SD33[i];
@@ -1003,7 +1003,7 @@ void continue_density()
 		PD32[i]=F31[i]*SD12[i]+F32[i]*SD22[i]+F33[i]*SD32[i];
 		PD33[i]=F31[i]*SD13[i]+F32[i]*SD23[i]+F33[i]*SD33[i];
 
-		//求F的逆的转置
+		// transpose of the inverse of F
 		FniT11[i]= Fni11[i];
 		FniT12[i]= Fni21[i];
 		FniT13[i]= Fni31[i];
@@ -1177,7 +1177,7 @@ void GraCorrec()
 	{
 		double Da=a11[i]*a22[i]*a33[i] + a31[i]*a12[i]*a23[i] + a21[i]*a32[i]*a13[i]
 			     -a31[i]*a22[i]*a13[i] - a11[i]*a32[i]*a23[i] - a12[i]*a21[i]*a33[i]+0.0;
-		//下面使用代数余子式求逆
+		// invert via the adjugate (cofactor) matrix below
 		A11[i]=  (a22[i]*a33[i]-a32[i]*a23[i])/Da;
 		A12[i]= -(a12[i]*a33[i]-a32[i]*a13[i])/Da;
 		A13[i]=  (a12[i]*a23[i]-a22[i]*a13[i])/Da;
@@ -1209,12 +1209,12 @@ void GLStrain()
 		SForce[1][i]=0.0;
 		SForce[2][i]=0.0;
 
-		//摩阻项求解
+		// friction term
 		DFdt11[i]=0.0; DFdt12[i] = 0.0; DFdt13[i] = 0.0;
 		DFdt21[i]=0.0; DFdt22[i] = 0.0; DFdt23[i] = 0.0;
 		DFdt31[i]=0.0; DFdt32[i] = 0.0; DFdt33[i] = 0.0;
 	}
-	for(k=0;k<niac;k++)//变形梯度张量
+	for(k=0;k<niac;k++)// deformation-gradient tensor
 	{
 		i=pair_i.data()[k];
 		j=pair_j.data()[k];
@@ -1263,7 +1263,7 @@ void GLStrain()
 			F32[j]=F32[j]+(mass[i]/rho0[i])*Dxj2*vec1j;
 			F33[j]=F33[j]+(mass[i]/rho0[i])*Dxj2*vec2j;
 
-			//摩阻项求解
+			// friction term
 			DFdt11[i] = DFdt11[i] + (mass[j]/rho0[j])*(vx[0][j]-vx[0][i])*dwdx(X0[0][i]-X0[0][j],Dr);
 			DFdt12[i] = DFdt12[i] + (mass[j]/rho0[j])*(vx[0][j]-vx[0][i])*dwdx(X0[1][i]-X0[1][j],Dr);
 			DFdt13[i] = DFdt13[i] + (mass[j]/rho0[j])*(vx[0][j]-vx[0][i])*dwdx(X0[2][i]-X0[2][j],Dr);
@@ -1285,9 +1285,9 @@ void GLStrain()
 			DFdt33[j] = DFdt33[j] + (mass[i]/rho0[i])*(vx[2][i]-vx[2][j])*dwdx(X0[2][j]-X0[2][i],Dr);
 		}
 	}
-	for(i=ntotal;i<ntotal+SolNum;i++)//变形梯度张量的修正
+	for(i=ntotal;i<ntotal+SolNum;i++)// correction of the deformation-gradient tensor
 	{
-		//摩阻项
+		// friction term
 		DFdtB11[i]=DFdt11[i]*A11[i]+DFdt12[i]*A21[i]+DFdt13[i]*A31[i];
 		DFdtB12[i]=DFdt11[i]*A12[i]+DFdt12[i]*A22[i]+DFdt13[i]*A32[i];
 		DFdtB13[i]=DFdt11[i]*A13[i]+DFdt12[i]*A23[i]+DFdt13[i]*A33[i];
@@ -1302,7 +1302,7 @@ void GLStrain()
 			         -F31[i]*F22[i]*F13[i] - F11[i]*F32[i]*F23[i] - F12[i]*F21[i]*F33[i]+0.0;
 		rho[i] = rho0[i]/Jacb; 
 		if(fabs(Jacb)<0.000001){rho[i]=1000.0;}
-		//摩阻项
+		// friction term
 		double paii=0.25*rho0[i]*1000*hsml;
 		SD11[i]=paii*(DFdtB11[i]*F11[i]+DFdtB21[i]*F21[i]+DFdtB31[i]*F31[i] + F11[i]*DFdtB11[i]+F21[i]*DFdtB21[i]+F31[i]*DFdtB31[i]);
 		SD12[i]=paii*(DFdtB11[i]*F12[i]+DFdtB21[i]*F22[i]+DFdtB31[i]*F32[i] + F11[i]*DFdtB12[i]+F21[i]*DFdtB22[i]+F31[i]*DFdtB32[i]);
@@ -1316,10 +1316,10 @@ void GLStrain()
 		SD32[i]=paii*(DFdtB13[i]*F12[i]+DFdtB23[i]*F22[i]+DFdtB33[i]*F32[i] + F13[i]*DFdtB12[i]+F23[i]*DFdtB22[i]+F33[i]*DFdtB32[i]);
 		SD33[i]=paii*(DFdtB13[i]*F13[i]+DFdtB23[i]*F23[i]+DFdtB33[i]*F33[i] + F13[i]*DFdtB13[i]+F23[i]*DFdtB23[i]+F33[i]*DFdtB33[i]);
 
-		//求F的逆
+		// invert F
 		//double Da=F11[i]*F22[i]*F33[i] + F31[i]*F12[i]*F23[i] + F21[i]*F32[i]*F13[i]
 		//	     -F31[i]*F22[i]*F13[i] - F11[i]*F32[i]*F23[i] - F12[i]*F21[i]*F33[i]+0.0;
-		//下面使用代数余子式求逆
+		// invert via the adjugate (cofactor) matrix below
 		Fni11[i]=  (F22[i]*F33[i]-F32[i]*F23[i])/Jacb;
 		Fni12[i]= -(F12[i]*F33[i]-F32[i]*F13[i])/Jacb;
 		Fni13[i]=  (F12[i]*F23[i]-F22[i]*F13[i])/Jacb;
@@ -1332,7 +1332,7 @@ void GLStrain()
 		Fni32[i]= -(F11[i]*F32[i]-F31[i]*F12[i])/Jacb;
 		Fni33[i]=  (F11[i]*F22[i]-F21[i]*F12[i])/Jacb;
 
-		//摩阻项
+		// friction term
 		PD11[i]=F11[i]*SD11[i]+F12[i]*SD21[i]+F13[i]*SD31[i];
 		PD12[i]=F11[i]*SD12[i]+F12[i]*SD22[i]+F13[i]*SD32[i];
 		PD13[i]=F11[i]*SD13[i]+F12[i]*SD23[i]+F13[i]*SD33[i];
@@ -1345,7 +1345,7 @@ void GLStrain()
 		PD32[i]=F31[i]*SD12[i]+F32[i]*SD22[i]+F33[i]*SD32[i];
 		PD33[i]=F31[i]*SD13[i]+F32[i]*SD23[i]+F33[i]*SD33[i];
 
-		//求F的逆的转置
+		// transpose of the inverse of F
 		FniT11[i]= Fni11[i];
 		FniT12[i]= Fni21[i];
 		FniT13[i]= Fni31[i];
@@ -1366,7 +1366,7 @@ void GLStrain()
 		Pia32[i] = muyou*(F32[i]-FniT32[i])+lamd*log10(Jacb)*FniT32[i]+PD32[i];
 		Pia33[i] = muyou*(F33[i]-FniT33[i])+lamd*log10(Jacb)*FniT33[i]+PD33[i];
 	}
-	for(k=0;k<niac;k++)//变形梯度张量
+	for(k=0;k<niac;k++)// deformation-gradient tensor
 	{
 		i=pair_i.data()[k];
 		j=pair_j.data()[k];
@@ -1411,7 +1411,7 @@ void GLStrain()
 			SForce[2][j] = SForce[2][j] - 2.0*(mass[i]/(rho[i]*rho[j]))*dwdx(x[2][j]-x[2][i],dr)*((p[i]*rho[j]+PRii*rho[i])/(rho[i]+rho[j]));
 		}
 	}
-	for(i=ntotal;i<ntotal+SolNum;i++)//速度
+	for(i=ntotal;i<ntotal+SolNum;i++)// velocity
 	{
 		vx[0][i] = vx[0][i]+dt*PIJW[0][i]+dt*SForce[0][i];
 		vx[1][i] = vx[1][i]+dt*PIJW[1][i]+dt*SForce[1][i];

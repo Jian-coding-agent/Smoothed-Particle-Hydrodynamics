@@ -1,24 +1,27 @@
-# SPH（三维 SPH 流固耦合求解器）— CMake 工程
+# SPH (3D SPH fluid-structure interaction solver) — CMake project
 
-把原来的单文件手工工程 [`1.cpp`](1.cpp) + [`Project1.vcxproj`](Project1.vcxproj) 整理为 CMake 工程，
-生成 **Visual Studio 2019（v142 工具集、C++17）** 可直接打开的 `build/SPH.sln`。
+This wraps the original hand-written single-file project [`1.cpp`](1.cpp)
+in a CMake project that generates a `build/SPH.sln` ready to open in
+**Visual Studio 2019 (v142 toolset, C++17)**.
 
-**本工程约定：配置与脚本里不出现任何绝对路径，全部相对工程目录 / 构建目录。**
+**Project convention: no absolute paths in the configuration or scripts;
+everything is relative to the project directory / build directory.**
 
-## 1. 环境要求
+## 1. Requirements
 
-| 项目 | 版本 |
+| Item | Version |
 |---|---|
-| Visual Studio | 2019（16.x，需「使用 C++ 的桌面开发」与 v142 工具集） |
-| CMake | ≥ 3.20（VS2019 16.10+ 自带的 CMake 已满足） |
-| OpenMP | MSVC 自带 `/openmp`，无需额外安装 |
+| Visual Studio | 2019 (16.x, with "Desktop development with C++" and the v142 toolset) |
+| CMake | >= 3.20 (the CMake bundled with VS2019 16.10+ is sufficient) |
+| OpenMP | provided by MSVC's `/openmp`; no separate installation |
 
-> 本机已验证：VS2019 Community 16.11（v142）+ CMake 3.24；
-> 且 `cmake ..`（不带 `-G`）在这台机器上默认就选中 **Visual Studio 16 2019 / x64 / v142**。
+> Verified locally: VS2019 Community 16.11 (v142) + CMake 3.24;
+> and `cmake ..` (without `-G`) selects **Visual Studio 16 2019 / x64 / v142**
+> by default on that machine.
 
-## 2. 快速开始
+## 2. Quick start
 
-### 方式 A：标准 CMake 流程（推荐）
+### Option A: standard CMake flow (recommended)
 
 ```bat
 mkdir build
@@ -27,181 +30,211 @@ cmake ..
 cmake --build . --config Release
 ```
 
-产物：`build\Release\SPH.exe`。
+Output: `build\Release\SPH.exe`.
 
-> 注意：CMake 的 VS 生成器会附带一个 `ALL_BUILD` 辅助工程。想让它从
-> 解决方案里消失、并把工程文件里的绝对路径改成相对路径，跑一次：
+> Note: the CMake VS generator adds an `ALL_BUILD` helper project. To remove it
+> from the solution and rewrite the absolute paths in the project files as
+> relative paths, run:
 
 ```bat
 powershell -ExecutionPolicy Bypass -File ..\tools\finalize-generated.ps1 -Sln SPH.sln
 cmake --build . --config Release --target SPH
 ```
 
-（`build.bat` 会自动完成这一步，见方式 B。）
+(`build.bat` does this automatically; see Option B.)
 
-### 方式 B：一键脚本
+### Option B: one-click script
 
 ```bat
-build.bat                       :: 默认同时编译 Release + Debug
-build.bat -Configuration Debug  :: 只编译 Debug
-build.bat -Cxx20                :: 改用 C++20（需 VS2019 16.11+）
+build.bat                       :: build Release + Debug by default
+build.bat -Configuration Debug  :: build Debug only
+build.bat -Cxx20                :: use C++20 (requires VS2019 16.11+)
 ```
 
-`build.bat` → `build.ps1`，内部等价于
+`build.bat` -> `build.ps1`, which is equivalent to
 `cmake -S . -B build -G "Visual Studio 16 2019" -A x64 -T v142`
-→ `tools\finalize-generated.ps1` → `cmake --build build --config <Cfg> --target SPH`。
+-> `tools\finalize-generated.ps1` -> `cmake --build build --config <Cfg> --target SPH`.
 
-> 默认两个配置都编译，是为了在 VS 里随便切 `Debug`/`Release` 都有 exe 可启动。
+> Both configurations are built by default so that switching between
+> `Debug` and `Release` in VS always finds an exe to launch.
 
-> 有些机器禁止运行未签名的 `.ps1`（报 "not digitally signed"），所以用 `build.bat`
-> 作为入口，它以 `-ExecutionPolicy Bypass` 调用，不需要改系统执行策略。
+> Some machines refuse to run unsigned `.ps1` files ("not digitally signed"),
+> so `build.bat` is the entry point; it calls PowerShell with
+> `-ExecutionPolicy Bypass` and does not require changing the system policy.
 
-### 方式 C：CMake 预设
+### Option C: CMake presets
 
 ```powershell
 cmake --preset vs2019-x64
 cmake --build --preset release
 ```
 
-### 方式 D：Visual Studio 界面
+### Option D: Visual Studio UI
 
-用 VS2019 打开 `build\SPH.sln`，选 `x64 | Release` → **直接 F5 就能跑**（工程里已写好
-`LocalDebuggerCommand = $(TargetPath)`，工作目录 = 工程根目录）。
+Open `build\SPH.sln` in VS2019, select `x64 | Release`, then press **F5** (the
+project already sets `LocalDebuggerCommand = $(TargetPath)` and the working
+directory to the project root).
 
-## 3. 关于“全相对路径”
+## 3. About "all relative paths"
 
-| 位置 | 是否含绝对路径 | 说明 |
+| Location | Contains absolute paths? | Notes |
 |---|---|---|
-| `CMakeLists.txt` | 否 | 只用 `1.cpp`、`CMAKE_*` 这类相对/内置变量 |
-| `build.bat` / `build.ps1` / `tools/*.ps1` | 否 | 一律相对工程根目录，可整目录搬到任意路径 |
-| 生成的 `SPH.sln` | 否 | 只含工程名与相对路径 `SPH.vcxproj` |
-| 生成的 `SPH.vcxproj` / `.filters` | 经 `finalize-generated.ps1` 后为否 | `OutDir=$(ProjectDir)Release\`、`ClCompile Include="..\1.cpp"`、`$(SolutionDir)..`、`$(TargetPath)` |
-| `build/CMakeCache.txt`、`build/CMakeFiles/*` | **是** | CMake 自身的构建状态，必然写绝对路径；**构建目录不可跨机器/跨路径搬运**（见 §3.1），换机器直接删掉 `build/` 重新 `build.bat` |
+| `CMakeLists.txt` | No | Uses only relative/built-in variables such as `1.cpp` and `CMAKE_*` |
+| `build.bat` / `build.ps1` / `tools/*.ps1` | No | Always relative to the project root; the whole directory can be moved anywhere |
+| Generated `SPH.sln` | No | Contains only the project name and the relative path `SPH.vcxproj` |
+| Generated `SPH.vcxproj` / `.filters` | No after `finalize-generated.ps1` | `OutDir=$(ProjectDir)Release\`, `ClCompile Include="..\1.cpp"`, `$(SolutionDir)..`, `$(TargetPath)` |
+| `build/CMakeCache.txt`, `build/CMakeFiles/*` | **Yes** | CMake's own build state necessarily contains absolute paths; **the build directory cannot be moved across machines or paths** (see §3.1). On a new machine, delete `build/` and run `build.bat` again |
 
-### 3.1 构建目录 `build\` 不能跨机器拷贝 ⚠
+### 3.1 The `build\` directory cannot be copied between machines ⚠
 
-`build\` 里记录的是**生成它的那台机器**的信息：源码/构建目录的绝对路径、`cl.exe` 的确切路径
-（含工具集补丁号，如 `14.29.30133`）、`WindowsTargetPlatformVersion`（具体 SDK 版本号）。
-把它拷到另一台机器（或另一个路径）再编译，编译器就会按那台机器的路径去找头文件 →
-典型报错就是 `C1083: 无法打开包括文件: 'ctype.h'`。
+`build\` records information about **the machine that generated it**: the
+absolute paths of the source and build directories, the exact path of `cl.exe`
+(including the toolset patch number, e.g. `14.29.30133`), and
+`WindowsTargetPlatformVersion` (a specific SDK version).
+If it is copied to another machine (or another path) and built there, the
+compiler looks for headers under the old machine's paths — the typical error is
+`C1083: cannot open include file: 'ctype.h'`.
 
-- **正确做法**：只复制源码（`1.cpp`、`CMakeLists.txt`、`build.bat`、`build.ps1`、`tools\*`、`input.dat`），
-  到目标机重新跑 `build.bat`。
-- **已经拷了**：直接删掉 `build\` 再 `build.bat`。
-- **新版 `build.bat` 会自动处理**：它比对 `CMakeCache.txt` 里的源码目录、构建目录、`cl.exe` 路径、
-  SDK 版本，发现和本机不符就打印原因、删掉 `build\` 并重新配置（若被 VS 占用会提示先关 VS）。
+- **Correct approach:** copy only the sources (`1.cpp`, `CMakeLists.txt`,
+  `build.bat`, `build.ps1`, `tools\*`, `input.dat`) and run `build.bat` on the
+  target machine.
+- **Already copied it:** delete `build\` and run `build.bat` again.
+- **The new `build.bat` handles this automatically:** it compares the source
+  directory, build directory, `cl.exe` path and SDK version in `CMakeCache.txt`
+  with the local machine; on a mismatch it prints the reason, deletes `build\`
+  and reconfigures (if VS has the directory open, it asks you to close VS first).
 
-**也能手工在 VS 里救急**（不想删 `build\` 时）：
+**You can also rescue it manually in VS** (without deleting `build\`):
 
-1. 右键项目 `SPH` → 属性 → 配置属性 → 常规 → **Windows SDK 版本** → 选本机已装的（或"最新安装的"）；
-2. 若提示的是工具集问题，再把 **平台工具集** 选成本机有的（如 `Visual Studio 2019 (v142)`）；
-3. 或者直接 右键解决方案 → **重定目标解决方案（Retarget Solution）**，勾选本机 SDK 后确定。
+1. Right-click the `SPH` project -> Properties -> Configuration Properties ->
+   General -> **Windows SDK Version** -> choose one installed locally (or
+   "latest installed").
+2. If the error mentions the toolset, set **Platform Toolset** to one installed
+   locally (e.g. `Visual Studio 2019 (v142)`).
+3. Or right-click the solution -> **Retarget Solution**, select the local SDK
+   and confirm.
 
-改完 `重新生成` 即可。但这只是临时补丁：这些值写在 CMake 生成的 `SPH.vcxproj` 里，
-下次跑 `cmake ..` / `build.bat` 会被重新写回。**根上解决**：本工程已把 SDK 版本改成 `10.0`
-（= 用本机最新安装的 SDK，见下面 `finalize-generated.ps1` 的第 3 步），跨机器不再因为 SDK 版本号报 `ctype.h`。
+Then rebuild. This is only a temporary patch: these values live in the
+CMake-generated `SPH.vcxproj` and are overwritten the next time `cmake ..` /
+`build.bat` runs. **The real fix:** this project sets the SDK version to `10.0`
+(= use the latest SDK installed locally, see step 3 of `finalize-generated.ps1`
+below), so moving between machines no longer produces a `ctype.h` error because
+of a version mismatch.
 
-`finalize-generated.ps1` 做四件事（幂等）：
+`finalize-generated.ps1` does four things (idempotently):
 
-1. 从 `.sln` 摘除 `ALL_BUILD` / `ZERO_CHECK` 工程，并删除其 `.vcxproj` 与中间目录；
-2. 把 `SPH.vcxproj` / `.filters` / `.user` 里的绝对路径改写成：
-   - 项路径（`Include="..\1.cpp"`）→ 相对路径；
-   - 属性值（`OutDir` / `ImportLibrary` / `ProgramDataBaseFile`）→ `$(ProjectDir)…`，
-     **不能写成裸 `Debug\`**，否则 `$(TargetPath)` 会停留在相对形式，VS 调试器就会
-     报“找不到 exe / 系统找不到指定的文件”；
-3. 把 `<WindowsTargetPlatformVersion>` 从具体版本号（如 `10.0.26100.0`）改成 **`10.0`**
-   （= 本机最新安装的 SDK），换机器不再因 SDK 版本号不匹配而报 `ctype.h`；
-4. 清掉 `build\.vs`、`*.suo` 等 VS 用户状态，避免它缓存旧的启动项目（例如 ALL_BUILD）。
+1. Removes the `ALL_BUILD` / `ZERO_CHECK` projects from the `.sln` and deletes
+   their `.vcxproj` files and intermediate directories.
+2. Rewrites absolute paths in `SPH.vcxproj` / `.filters` / `.user`:
+   - item paths (`Include="..\1.cpp"`) -> relative paths;
+   - property values (`OutDir` / `ImportLibrary` / `ProgramDataBaseFile`) ->
+     `$(ProjectDir)…`. They **must not** be bare `Debug\`, otherwise
+     `$(TargetPath)` stays relative and the VS debugger reports
+     "cannot find the exe / the system cannot find the file specified".
+3. Changes `<WindowsTargetPlatformVersion>` from a specific version (e.g.
+   `10.0.26100.0`) to **`10.0`** (= the latest SDK installed locally), so a
+   different machine no longer fails with `ctype.h` due to an SDK mismatch.
+4. Clears `build\.vs`, `*.suo` and other VS user state so it does not cache the
+   old startup project (for example `ALL_BUILD`).
 
-> 注意：**每次重新 `cmake ..` 都会把生成文件写回绝对路径、写回具体 SDK 版本、并带回 ALL_BUILD**，
-> 需要再跑一次 `finalize-generated.ps1`（`build.bat` 已自动做）。
+> Note: **every re-run of `cmake ..` writes absolute paths, a specific SDK
+> version and `ALL_BUILD` back into the generated files**, so
+> `finalize-generated.ps1` must run again (`build.bat` does this for you).
 
-## 4. 关于 ALL_BUILD / ZERO_CHECK
+## 4. About ALL_BUILD / ZERO_CHECK
 
-| 辅助工程 | 作用 | 处理方式 |
+| Helper project | Purpose | Handling |
 |---|---|---|
-| `ZERO_CHECK` | `CMakeLists.txt` 变动后自动重新配置 | `SPH_SUPPRESS_REGENERATION=ON`（默认）彻底不生成 |
-| `ALL_BUILD` | “生成解决方案”的聚合工程 | CMake 的 VS 生成器**强制**生成、无官方开关；只能由 `finalize-generated.ps1` 生成后摘除 |
+| `ZERO_CHECK` | Reconfigures automatically when `CMakeLists.txt` changes | `SPH_SUPPRESS_REGENERATION=ON` (default) prevents it from being generated at all |
+| `ALL_BUILD` | Aggregate project for "Build Solution" | The CMake VS generator **always** creates it and has no official switch; it can only be removed after generation by `finalize-generated.ps1` |
 
-**这就是“F5 报找不到 exe”的根源**：只要 `.sln` 里还有 `ALL_BUILD`（就是裸 `cmake ..`
-刚生成完的状态），VS 打开后默认启动项目会是它——它是个 Utility 工程、没有 exe，
-F5 立刻报“找不到 exe”。摘除后解决方案只剩 `SPH`，F5 直接用 `SPH` 启动。
+**This is the root cause of "F5 cannot find the exe":** as long as `ALL_BUILD`
+is still in the `.sln` (which is the state right after a bare `cmake ..`), VS
+makes it the default startup project. It is a Utility project with no exe, so
+F5 immediately reports that it cannot find the exe. Once it is removed, `SPH`
+is the only project left and F5 launches `SPH` directly.
 
-所以请用一条命令生成：
+So generate with one command:
 
 ```bat
 build.bat
 ```
 
-（等价于 `cmake ..` + `finalize-generated.ps1` + 编译）。如果你坚持只跑 `cmake ..`，
-那么之后必须补一条：
+(equivalent to `cmake ..` + `finalize-generated.ps1` + build). If you insist on
+running only `cmake ..`, you must follow it with:
 
 ```bat
 cd build
 powershell -ExecutionPolicy Bypass -File ..\tools\finalize-generated.ps1 -Sln SPH.sln
 ```
 
-代价：
+Costs:
 
-1. 关掉 `ZERO_CHECK` 后，改 `CMakeLists.txt` **不会自动生效**，需重跑 `cmake ..`（或 `build.bat`）。
-2. 删掉 `ALL_BUILD` 后，命令行构建要写 `--target SPH`（`cmake --build build --config Release --target SPH`）；
-   VS 里 F7 / F5 不受影响。
+1. With `ZERO_CHECK` disabled, changes to `CMakeLists.txt` **do not take effect
+   automatically**; re-run `cmake ..` (or `build.bat`).
+2. With `ALL_BUILD` removed, command-line builds must pass `--target SPH`
+   (`cmake --build build --config Release --target SPH`); F7 / F5 in VS are
+   unaffected.
 
-## 5. 生成物
+## 5. Outputs
 
-| 路径 | 说明 |
+| Path | Description |
 |---|---|
-| `build\SPH.sln` | VS2019 解决方案（清理后只含 `SPH` 一个工程） |
-| `build\Release\SPH.exe` | Release 可执行文件 |
-| `build\Debug\SPH.exe` | Debug 可执行文件（与 Release 分目录，互不覆盖） |
-| `build\<Config>\SPH.pdb` | 调试符号 |
+| `build\SPH.sln` | VS2019 solution (after cleanup it contains only the `SPH` project) |
+| `build\Release\SPH.exe` | Release executable |
+| `build\Debug\SPH.exe` | Debug executable (separate directory, does not overwrite Release) |
+| `build\<Config>\SPH.pdb` | Debug symbols |
 
-## 6. 关键配置项
+## 6. Key configuration options
 
-| CMake 选项 | 默认 | 说明 |
+| CMake option | Default | Description |
 |---|---|---|
-| `SPH_USE_CXX20` | `OFF` | 打开后 `/std:c++20`。默认 `C++17`：代码不依赖 C++20，v142 对 C++17 支持最完整 |
-| `SPH_GBK_SOURCE` | `OFF` | `1.cpp` 注释是 **GBK(cp936)**。中文系统默认代码页即可；非中文区域出现 `C4819` 时打开，强制 `/source-charset:.936` |
-| `SPH_ENABLE_FAST_MATH` | `OFF` | `/fp:fast` 会改变浮点结果，与历史算例对比时**不要**开 |
-| `SPH_SUPPRESS_REGENERATION` | `ON` | 不生成 `ZERO_CHECK`；代价是改 `CMakeLists.txt` 后要手工重跑 `cmake` |
+| `SPH_USE_CXX20` | `OFF` | Enables `/std:c++20`. The default is `C++17`: the code does not require C++20, and v142 has the most complete C++17 support |
+| `SPH_GBK_SOURCE` | `OFF` | The source is now ASCII; this option is only needed for old GBK checkouts. It forces `/source-charset:.936` when `C4819` appears in a non-Chinese locale |
+| `SPH_ENABLE_FAST_MATH` | `OFF` | `/fp:fast` changes floating-point results; **do not** enable it when comparing against historical cases |
+| `SPH_SUPPRESS_REGENERATION` | `ON` | Does not generate `ZERO_CHECK`; the price is that `CMakeLists.txt` changes require a manual `cmake` re-run |
 
-### 与原 vcxproj 的对应关系
+### Mapping from the original vcxproj
 
-| 原工程（VS2026） | 本 CMake 工程（VS2019） |
+| Original project (VS2026) | This CMake project (VS2019) |
 |---|---|
 | `PlatformToolset = v145` | `-T v142` |
-| `LanguageStandard = stdcpp20` | `CXX_STANDARD 17`（可切 20） |
+| `LanguageStandard = stdcpp20` | `CXX_STANDARD 17` (can switch to 20) |
 | `OpenMPSupport = true` | `find_package(OpenMP)` + `OpenMP::OpenMP_CXX` |
-| `_CRT_SECURE_NO_WARNINGS` | 同名宏 |
-| `ConformanceMode = true` | CMake 对 MSVC 默认加 `/permissive-`，等价 |
-| `WholeProgramOptimization`（Release） | 默认不加 `/GL`（保证数值可复现） |
-| runtime 库 | 保持 MSVC 默认：Release `/MD`、Debug `/MDd` |
+| `_CRT_SECURE_NO_WARNINGS` | same macro |
+| `ConformanceMode = true` | CMake adds `/permissive-` for MSVC by default; equivalent |
+| `WholeProgramOptimization` (Release) | `/GL` is not added, so numerical results stay reproducible |
+| runtime library | MSVC defaults: Release `/MD`, Debug `/MDd` |
 
-## 7. 运行时注意事项
+## 7. Runtime notes
 
-1. **工作目录**：程序用相对路径读 `input.dat`、写 `result<N>.dat`。
-   VS 调试工作目录已设为 `$(SolutionDir)..`（相对宏，无绝对路径），**F5 直接可跑**；
-   命令行请从工程根目录启动：
+1. **Working directory:** the program reads `input.dat` and writes
+   `result<N>.dat` through relative paths. The VS debug working directory is set
+   to `$(SolutionDir)..` (a relative macro, no absolute path), so **F5 just
+   works**. From the command line, start it from the project root:
    ```powershell
    .\build\Release\SPH.exe
    ```
-2. **输出文件**：每 50 步写一个约 20 MB 的 `result<N>.dat`（编号 `itime/50`），
-   写在工作目录里。多次运行会**互相覆盖**，建议每次运行换独立目录。
-3. **环境变量**：
-   | 变量 | 作用 | 默认 |
+2. **Output files:** every 50 steps it writes a ~20 MB `result<N>.dat` (numbered
+   `itime/50`) in the working directory. Repeated runs **overwrite each other**;
+   use a separate directory per run.
+3. **Environment variables:**
+   | Variable | Effect | Default |
    |---|---|---|
-   | `SPH_THREADS` | OpenMP 线程数（上限 32） | 自动 |
-   | `SPH_MAXSTEP` | 时间步上限 | `10000001` |
+   | `SPH_THREADS` | number of OpenMP threads (max 32) | automatic |
+   | `SPH_MAXSTEP` | time-step limit | `10000001` |
 
    ```powershell
    $env:SPH_THREADS = 8
    $env:SPH_MAXSTEP = 1000
    ```
-4. **内存**：每线程累加缓冲约 66 MB，8 线程约 530 MB，16 线程约 1.06 GB。
+4. **Memory:** each thread's accumulation buffer is about 66 MB; 8 threads
+   about 530 MB, 16 threads about 1.06 GB.
 
-## 8. 常见错误排查（换机器时最常踩）
+## 8. Troubleshooting (most common when changing machines)
 
-`build.bat` 第一步 `[0/3] environment` 会打印本机实际环境，先看它：
+The first step of `build.bat`, `[0/3] environment`, prints the actual local
+environment; look at that first:
 
 ```
 [0/3] environment
@@ -210,50 +243,54 @@ powershell -ExecutionPolicy Bypass -File ..\tools\finalize-generated.ps1 -Sln SP
       Windows SDK (ucrt) : 10.0.19041.0, 10.0.26100.0
 ```
 
-| 现象 | 原因 | 处理 |
+| Symptom | Cause | Fix |
 |---|---|---|
-| `C1083: 无法打开包括文件: 'ctype.h'` | ① 本机真缺 Windows SDK（见 §10 前的环境自检）；② **把别处生成的 `build\` 目录一起拷过来了**（见 §3.1） | ① 装 Windows 10/11 SDK；② 删掉 `build\` 重跑 `build.bat`（新版会自动识别并清理外来缓存） |
-| `MSB8020: 找不到 v142 生成工具` | 没装 v142 工具集 | VS Installer → 单个组件 → 装 `MSVC v142 - VS 2019 C++ x64/x86 生成工具`；或 `build.bat -Generator "Visual Studio 17 2022" -Toolset v143` |
-| CMake 提示找不到 Visual Studio 实例 | 没装 VS 或没装 C++ 工作负载 | 安装 VS（含 C++ 桌面开发），或显式 `-Generator` |
-| 解决方案里又出现 `ALL_BUILD`，F5 报找不到 exe | 用裸 `cmake ..` 生成，CMake 把辅助工程加回来了 | 重跑 `build.bat`，或补：`powershell -ExecutionPolicy Bypass -File tools\finalize-generated.ps1 -Sln build\SPH.sln` |
-| **Debug 一启动就退出（退出码 3）**、或弹 `Debug Assertion Failed` | 原 `1.cpp` 里两个只在 Debug 下暴露的缺陷（见 §10） | **已修**，用本包即可；`build.bat` 现在默认同时编译 Release + Debug，切配置总有 exe |
-| **Release 状态栏一直"正在加载符号…"** | VS 在给没有符号的 exe/DLL 找符号，离线/内网访问符号服务器会长时间卡住 | Release 现已生成 PDB；仍卡就在 工具→选项→调试→符号 里全部取消符号服务器，或直接用 `Ctrl+F5`／双击 `build\Release\SPH.exe`（长时间仿真本来就不需要调试器） |
+| `C1083: cannot open include file: 'ctype.h'` | (1) Windows SDK genuinely missing locally (see the environment check before §10); (2) **a `build\` directory generated elsewhere was copied in** (see §3.1) | (1) install the Windows 10/11 SDK; (2) delete `build\` and re-run `build.bat` (the new version detects and cleans foreign caches) |
+| `MSB8020: cannot find the v142 build tools` | the v142 toolset is not installed | VS Installer -> Individual components -> install `MSVC v142 - VS 2019 C++ x64/x86 build tools`; or `build.bat -Generator "Visual Studio 17 2022" -Toolset v143` |
+| CMake cannot find a Visual Studio instance | VS is not installed, or the C++ workload is missing | install VS (with Desktop development with C++), or pass `-Generator` explicitly |
+| `ALL_BUILD` is back in the solution and F5 cannot find the exe | it was generated with a bare `cmake ..`, which adds the helper projects back | re-run `build.bat`, or run `powershell -ExecutionPolicy Bypass -File tools\finalize-generated.ps1 -Sln build\SPH.sln` |
+| **Debug exits immediately (exit code 3)**, or a `Debug Assertion Failed` dialog appears | two defects in the original `1.cpp` that only surface in Debug (see §10) | **already fixed** in this package; `build.bat` now builds Release + Debug by default, so every configuration has an exe |
+| **Release stays at "Loading symbols..."** | VS is looking for symbols for an exe/DLL that has none; offline/intranet symbol-server access can hang for a long time | Release now generates a PDB; if it still hangs, clear all symbol servers under Tools -> Options -> Debugging -> Symbols, or use `Ctrl+F5` / double-click `build\Release\SPH.exe` (long simulations do not need a debugger anyway) |
 
-> `build.bat` 在新建构建目录时会依次尝试 **VS2019/v142 → VS2022/v143 → 两者的默认工具集**，
-> 所以目标机只有 VS2022 也能编译（前提是装了 C++ 工作负载 + Windows SDK）。
+> When creating a new build directory, `build.bat` tries
+> **VS2019/v142 -> VS2022/v143 -> the default toolset of either**, so a target
+> machine that only has VS2022 can still build (provided the C++ workload and
+> the Windows SDK are installed).
 
-## 10. 相对原始 1.cpp 的修复（本次改动）
+## 10. Fixes relative to the original 1.cpp (this change)
 
-原 `1.cpp` 在 Release 下"看起来正常"，但有两处未定义行为，在 Debug 下必然暴露：
+The original `1.cpp` "looked fine" in Release but had two undefined behaviours
+that are guaranteed to surface in Debug:
 
-| # | 位置 | 问题 | 修复 |
+| # | Location | Problem | Fix |
 |---|---|---|---|
-| 1 | `pair_i[k]` / `pair_j[k]`（6 处：`continue_density` 两个 pass、`GraCorrec`、`GLStrain`、`NorVector`） | `direct_find()` 是**直接往 `vector` 的预留空间里写**（`data()` + 容量当长度用），`size()` 始终是 0。Release 的 `operator[]` 不检查所以"能用"；Debug 的 STL 会断言越界 → `abort()`（退出码 3） | 改成 `pair_i.data()[k]` / `pair_j.data()[k]`（返回裸指针，不检查、行为与 Release 一致） |
-| 2 | 4 个归约循环的 `#pragma omp parallel for schedule(static) num_threads(nth)` | 循环体里 `i = ii;` 写的是**全局变量 `i`**（多线程共享），随后用 `i` 去读/写 `F11[i]` 等 —— 典型数据竞争。Debug 下常常把形变梯度归约成 0 → `Jacb=0` → `log10(0)`、`0/0` → 输出出现 `-nan(ind)`（实测 47943 行） | pragma 加 `firstprivate(i)`，让每个线程用自己的 `i` |
+| 1 | `pair_i[k]` / `pair_j[k]` (6 places: the two passes of `continue_density`, `GraCorrec`, `GLStrain`, `NorVector`) | `direct_find()` writes **directly into a vector's reserved storage** (uses `data()` and treats capacity as length), so `size()` is always 0. Release's `operator[]` does not check and therefore "works"; the Debug STL asserts an out-of-range access -> `abort()` (exit code 3) | changed to `pair_i.data()[k]` / `pair_j.data()[k]` (returns a raw pointer, no check, same behaviour as Release) |
+| 2 | `#pragma omp parallel for schedule(static) num_threads(nth)` on the four reduction loops | the loop body assigns `i = ii;` to the **global `i`** (shared by all threads) and then uses `i` to read/write `F11[i]` etc. — a classic data race. In Debug the deformation gradient is often reduced to 0 -> `Jacb=0` -> `log10(0)`, `0/0` -> `-nan(ind)` in the output (47943 lines measured) | added `firstprivate(i)` to the pragma so each thread has its own `i` |
 
-修复前后对比（本机实测，1 步）：
+Before/after comparison (measured locally, 1 step):
 
-| | 修复前 | 修复后 |
+| | Before the fix | After the fix |
 |---|---|---|
-| Debug 运行 | 退出码 3，无任何输出 | exit 0，27 s，正常输出 |
-| Debug 结果里的 `nan` | **47943 行** | **0 行** |
-| Debug vs Release | 不可比（Debug 是垃圾值） | 差异仅 4142/3,322,172 个值（0.13%），且全是打印精度末位（p 最大差 2.5e-08，vx 1e-13） |
+| Debug run | exit code 3, no output at all | exit 0, 27 s, normal output |
+| `nan` in Debug results | **47943 lines** | **0 lines** |
+| Debug vs Release | not comparable (Debug is garbage) | only 4142 / 3,322,172 values differ (0.13%), all in the last printed digit (p max 2.5e-08, vx 1e-13) |
 
-> 建议用本包重跑一次正式算例，与历史结果比对一遍（预期：输出精度内一致）。备份文件：`_backup_1.cpp.before_debugfix`。
+> It is worth re-running a production case with this package and comparing it
+> with the historical results (expected: identical to printed precision).
 
-## 11. 文件说明
+## 11. File overview
 
-| 文件 | 作用 |
+| File | Purpose |
 |---|---|
-| `1.cpp` | 全部求解器源码（单一翻译单元，未改动） |
-| `CMakeLists.txt` | 构建脚本（无绝对路径；禁止源内构建） |
-| `CMakePresets.json` | VS2019 预设 |
-| `build.bat` | 一键入口（绕过脚本执行策略）→ `build.ps1` |
-| `build.ps1` | 配置 + 清理/相对化 + 编译，并打印相对路径 |
-| `tools\finalize-generated.ps1` | 摘除 `ALL_BUILD`/`ZERO_CHECK`，把工程文件路径改相对 |
-| `tools\CompareResults.cs/.exe` | 逐点比较两套 `result*.dat` 的小工具 |
-| `input.dat` | 输入（237298 个粒子 × 14 列） |
-| `Project1.vcxproj*` | 旧的手工工程，保留备查，不参与 CMake 构建 |
+| `1.cpp` | the complete solver source (single translation unit; comments are English, code unchanged) |
+| `CMakeLists.txt` | build script (no absolute paths; in-source builds forbidden) |
+| `CMakePresets.json` | VS2019 presets |
+| `build.bat` | one-click entry point (bypasses the script execution policy) -> `build.ps1` |
+| `build.ps1` | configure + cleanup/relativise + build, printing relative paths |
+| `tools\finalize-generated.ps1` | removes `ALL_BUILD`/`ZERO_CHECK` and makes project paths relative |
+| `tools\CompareResults.cs/.exe` | small utility that compares two sets of `result*.dat` point by point |
+| `input.dat` | input (237298 particles x 14 columns) |
 
-> `build.ps1` 与 `tools\*.ps1` 刻意保持 **纯 ASCII + CRLF**：Windows PowerShell 5.1
-> 对没有 BOM 的 UTF-8 脚本按 ANSI 解析，带中文会直接语法报错；`.bat` 也必须 CRLF。
+> `build.ps1` and `tools\*.ps1` are deliberately **pure ASCII + CRLF**: Windows
+> PowerShell 5.1 parses UTF-8 scripts without a BOM as ANSI, and non-ASCII
+> characters cause syntax errors; `.bat` files must also be CRLF.

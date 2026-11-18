@@ -1,17 +1,19 @@
 # ============================================================================
-#  SPH —— 三维 SPH 流固耦合求解器（单文件 1.cpp）
+#  SPH -- 3D SPH fluid-structure interaction solver (single file 1.cpp)
 #
-#  约定：配置里不出现任何绝对路径，全部相对于工程目录 / 构建目录。
+#  Conventions: no absolute paths anywhere in the configuration; everything is
+#  relative to the project directory / build directory.
 #
-#  标准用法（构建目录固定为 build）：
+#  Standard usage (build directory fixed to build):
 #      mkdir build
 #      cd build
-#      cmake ..                     # 默认生成 Visual Studio 2019 (v142/C++17) 解决方案
+#      cmake ..                     # generates a Visual Studio 2019 (v142/C++17) solution by default
 #      cmake --build . --config Release
 #
-#  说明：CMake 的 VS 生成器会强制附带 ALL_BUILD 辅助工程，无法在脚本里关掉。
-#        需要“解决方案里只剩 SPH”的干净版本时，用工程根目录的 build.bat
-#        （它会在生成后调用 tools\strip-helper-projects.ps1 清理）。
+#  Note: the CMake VS generator always adds the ALL_BUILD helper project and
+#        cannot be told not to.  For a clean solution containing only SPH, use
+#        build.bat in the project root (it calls tools\strip-helper-projects.ps1
+#        after generation).
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
@@ -21,16 +23,17 @@ project(SPH
         LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
-# 只允许 out-of-source 构建：保证源码目录干净，且构建目录可随时整目录删除
+# Only out-of-source builds are allowed: the source tree stays clean and the
+# build directory can be deleted at any time
 # ---------------------------------------------------------------------------
 if(CMAKE_BINARY_DIR STREQUAL CMAKE_SOURCE_DIR)
     message(FATAL_ERROR
-        "不允许在源码目录内构建。请这样用：\n"
+        "In-source builds are not allowed.  Use:\n"
         "  mkdir build && cd build && cmake ..")
 endif()
 
 # ---------------------------------------------------------------------------
-# 构建类型（单配置生成器用；VS 多配置由 --config 决定）
+# Build type (single-config generators; with VS, --config decides)
 # ---------------------------------------------------------------------------
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -38,26 +41,26 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ---------------------------------------------------------------------------
-# 选项
+# Options
 # ---------------------------------------------------------------------------
-option(SPH_USE_CXX20      "使用 C++20（需 VS2019 16.11+ 或 VS2022+）" OFF)
-option(SPH_GBK_SOURCE     "强制按 GBK(cp936) 解析源码；仅当区域语言环境不是中文时使用" OFF)
-option(SPH_ENABLE_FAST_MATH "启用 /fp:fast（会改变数值结果，一般不要开）" OFF)
-option(SPH_SUPPRESS_REGENERATION "不生成 ZERO_CHECK 工程；代价是改了 CMakeLists 需手工重跑 cmake" ON)
+option(SPH_USE_CXX20      "Use C++20 (requires VS2019 16.11+ or VS2022+)" OFF)
+option(SPH_GBK_SOURCE     "Force the source to be parsed as GBK (cp936); only needed when the system locale is not Chinese" OFF)
+option(SPH_ENABLE_FAST_MATH "Enable /fp:fast (changes numerical results; normally leave off)" OFF)
+option(SPH_SUPPRESS_REGENERATION "Do not generate the ZERO_CHECK project; the price is that CMakeLists changes require a manual re-run of cmake" ON)
 
 if(SPH_SUPPRESS_REGENERATION)
     set(CMAKE_SUPPRESS_REGENERATION ON)
 endif()
 
 # ---------------------------------------------------------------------------
-# 源文件：相对路径（相对本 CMakeLists.txt 所在目录）
+# Source files: relative paths (relative to this CMakeLists.txt)
 # ---------------------------------------------------------------------------
 add_executable(SPH 1.cpp)
 
 # ---------------------------------------------------------------------------
-# C++ 标准
-#   原 VS2026 工程：v145 + stdcpp20；VS2019 适配为 C++17（v142 全面支持）
-#   需要 C++20：cmake -DSPH_USE_CXX20=ON ..
+# C++ standard
+#   Original VS2026 project: v145 + stdcpp20; the VS2019 adaptation uses C++17
+#   (fully supported by v142).  For C++20: cmake -DSPH_USE_CXX20=ON ..
 # ---------------------------------------------------------------------------
 if(SPH_USE_CXX20)
     set_target_properties(SPH PROPERTIES
@@ -78,13 +81,14 @@ find_package(OpenMP REQUIRED)
 target_link_libraries(SPH PRIVATE OpenMP::OpenMP_CXX)
 
 # ---------------------------------------------------------------------------
-# MSVC 适配
+# MSVC adjustments
 # ---------------------------------------------------------------------------
 if(MSVC)
     target_compile_definitions(SPH PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(SPH PRIVATE /W3 /MP)
 
-    # 1.cpp 的中文注释是 GBK：默认跟随系统代码页即可，不要加 /utf-8
+    # The source is now ASCII (the comments were translated from GBK), so the
+    # default code page is fine.  The option remains for old GBK checkouts.
     if(SPH_GBK_SOURCE)
         target_compile_options(SPH PRIVATE /source-charset:.936)
     endif()
@@ -95,32 +99,35 @@ if(MSVC)
         target_compile_options(SPH PRIVATE /fp:precise)
     endif()
 
-    # Release / MinSizeRel 也生成 PDB（/Zi + 链接器 /DEBUG）：
-    #   VS 调试一个完全没有调试信息的 exe 时，会去符号服务器（含 Microsoft
-    #   符号服务器）查找符号；在离线/内网机器上就会长时间停在状态栏
-    #   “正在加载符号…”。Release 自带 PDB 后这一步立刻完成，顺便还能在
-    #   Release 配置下打断点。不影响数值结果。
+    # Also generate a PDB in Release / MinSizeRel (/Zi + linker /DEBUG):
+    #   when VS debugs an exe with no debug information it goes looking for
+    #   symbols on the symbol servers (including Microsoft's); on an offline or
+    #   intranet machine it then sits at "Loading symbols..." for a long time.
+    #   A Release PDB makes that step instant and allows breakpoints in Release.
+    #   It does not affect numerical results.
     foreach(_cfg RELEASE MINSIZEREL)
         target_compile_options(SPH PRIVATE $<$<CONFIG:${_cfg}>:/Zi>)
         target_link_options(SPH PRIVATE $<$<CONFIG:${_cfg}>:/DEBUG>)
     endforeach()
 
-    # 调试设置全部用 MSBuild 宏，不写死绝对路径：
-    #   VS_DEBUGGER_COMMAND        = $(TargetPath)，即“生成出来的那个 exe”，
-    #                                保证 VS 里 F5 直接能启动（即使 OutDir 被改写成相对形式）
-    #   VS_DEBUGGER_WORKING_DIRECTORY = 解决方案目录的上一级 = 工程根目录，
-    #                                程序用相对路径读 input.dat，必须在这里跑
+    # Debug settings all use MSBuild macros, never absolute paths:
+    #   VS_DEBUGGER_COMMAND        = $(TargetPath), i.e. the exe that was built,
+    #                                so F5 works in VS even if OutDir is relative
+    #   VS_DEBUGGER_WORKING_DIRECTORY = the directory above the solution = project
+    #                                root, because the program reads input.dat
+    #                                through a relative path and must run there
     set_target_properties(SPH PROPERTIES
         VS_DEBUGGER_COMMAND "$(TargetPath)"
         VS_DEBUGGER_WORKING_DIRECTORY "$(SolutionDir)..")
 endif()
 
 # ---------------------------------------------------------------------------
-# 输出目录保持 CMake 默认（<构建目录>/<Config>），不写绝对路径
+# Output directories keep the CMake defaults (<build dir>/<Config>); no
+# absolute paths
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 配置摘要：一律用相对路径显示
+# Configuration summary: always shown with relative paths
 # ---------------------------------------------------------------------------
 file(RELATIVE_PATH SPH_REL_BUILD "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
 if(SPH_REL_BUILD STREQUAL "")
@@ -129,24 +136,24 @@ endif()
 file(TO_CMAKE_PATH "${SPH_REL_BUILD}" SPH_REL_BUILD)
 
 message(STATUS "")
-message(STATUS "====================== 工程路径（相对）======================")
-message(STATUS " 工程根目录 : .")
-message(STATUS " 构建脚本   : CMakeLists.txt")
-message(STATUS " 源码       : 1.cpp")
-message(STATUS " 构建目录   : ${SPH_REL_BUILD}")
+message(STATUS "====================== project paths (relative) ======================")
+message(STATUS " project root : .")
+message(STATUS " build script : CMakeLists.txt")
+message(STATUS " source       : 1.cpp")
+message(STATUS " build dir    : ${SPH_REL_BUILD}")
 if(CMAKE_GENERATOR MATCHES "Visual Studio")
-    message(STATUS " 解决方案   : ${SPH_REL_BUILD}/${PROJECT_NAME}.sln")
+    message(STATUS " solution     : ${SPH_REL_BUILD}/${PROJECT_NAME}.sln")
 endif()
-message(STATUS " 可执行文件 : ${SPH_REL_BUILD}/<Config>/${PROJECT_NAME}.exe")
-message(STATUS " 运行数据   : input.dat / result<N>.dat  （工作目录 = 工程根目录）")
-message(STATUS "============================================================")
-message(STATUS " 生成器 : ${CMAKE_GENERATOR} 平台=${CMAKE_VS_PLATFORM_NAME} 工具集=${CMAKE_VS_PLATFORM_TOOLSET}")
+message(STATUS " executable   : ${SPH_REL_BUILD}/<Config>/${PROJECT_NAME}.exe")
+message(STATUS " input data   : input.dat / result<N>.dat  (working directory = project root)")
+message(STATUS "======================================================================")
+message(STATUS " generator : ${CMAKE_GENERATOR} platform=${CMAKE_VS_PLATFORM_NAME} toolset=${CMAKE_VS_PLATFORM_TOOLSET}")
 if(SPH_USE_CXX20)
-    message(STATUS " C++ 标准: C++20")
+    message(STATUS " C++ standard: C++20")
 else()
-    message(STATUS " C++ 标准: C++17")
+    message(STATUS " C++ standard: C++17")
 endif()
 if(SPH_SUPPRESS_REGENERATION)
-    message(STATUS " ZERO_CHECK: 已关闭（改 CMakeLists 后需重跑 cmake）")
+    message(STATUS " ZERO_CHECK: disabled (re-run cmake after changing CMakeLists)")
 endif()
-message(STATUS "============================================================")
+message(STATUS "======================================================================")

@@ -1,658 +1,667 @@
-# SPH → CUDA 重构：源码分析与移植方案
+# SPH → CUDA Refactor: Source Analysis and Porting Plan
 
-> 分析对象：`SPH-src-20261112-r5-sln.zip` → `SPH-src/`（`1.cpp` 1488 行、`input.dat`、`result0..9.dat`、`tools/`）
-> 分析机器：RTX 5080（sm_120, 16 GB）/ CUDA 13.3 / MSVC 14.51 (VS2026) / CMake 4.2.1 / Ryzen 9 9950X (16C32T) / 253 GB
-> 本文所有耗时均为本机实测，不是估算。
+> Analysed package: `SPH-src-20261112-r5-sln.zip` → `SPH-src/` (`1.cpp`, 1488 lines, `input.dat`, `result0..9.dat`, `tools/`)
+> Analysis machine: RTX 5080 (sm_120, 16 GB) / CUDA 13.3 / MSVC 14.51 (VS2026) / CMake 4.2.1 / Ryzen 9 9950X (16C32T) / 253 GB
+> Every timing in this document was measured on that machine, not estimated.
+>
+> Note: the original `1.cpp` carried Chinese (GBK) comments. They have since
+> been translated to English, so the source is now ASCII; references below to
+> the GBK code page describe the state at the time of the analysis.
 
 ---
 
-## 0. 结论摘要
+## 0. Executive summary
 
-| 项目 | 事实 |
+| Item | Fact |
 |---|---|
-| 源码 | 单文件 `1.cpp`，1488 行，显式时间积分 SPH，**全 double**，全局 SoA（`double x[3][num]` 这种） |
-| 规模 | `num = 237298` 粒子 = 101250 流体 + 60320 固体 + 75728 壁面；每步 **1110 万**粒子对（约 94 邻居/粒子） |
-| CPU 基线 | 32 线程 **500 步 105.6 s（0.211 s/步）**；8 线程 171.4 s（0.343 s/步） |
-| 每步热点 | pass1 流体/固体受力 **55%**、两次"线程私有缓冲归约" **22%**、pass2 **10%**、邻居搜索 **7%**、固体本构 **5%**、积分 1% |
-| 额外发现 | 写 `result<N>.dat` 每个文件 **1.9 s**（20 MB 文本），500 步里占 19 s（**18%**） |
-| 关键结论 1 | 原始"每对粒子同时更新 i 和 j"的 scatter 模式在 GPU 上要么需要 500 M 次/步原子加，要么需要 32 份私有缓冲；**但代码里所有成对公式在数学上都可改写成"每粒子 gather 自己那一侧"**，从而无原子、无归约、无竞争（推导见 §3.2） |
-| 关键结论 2 | 归约（22%）在 gather 架构下**整体消失**，输出（18%）可重写为批量写；这是两个不要钱的加速点 |
-| GPU 精度能力 | 本机实测 FP64 **0.81 TFLOPS**（= FP32 的 1/67）、FP32 54.3 TFLOPS、Stream 带宽 848 GB/s |
-| 数值验收基线 | 同一 exe 重跑，p 最多差 0.01（相对 2e-6）、vx ≤ 1e-9、x/rho 打印位完全一致 → 移植验收用这条"噪声底"，见 §4.2 |
+| Source | single file `1.cpp`, 1488 lines, explicit time integration SPH, **all double**, global SoA (`double x[3][num]` style) |
+| Size | `num = 237298` particles = 101250 fluid + 60320 solid + 75728 wall; **11.1 million** particle pairs per step (~94 neighbours/particle) |
+| CPU baseline | 32 threads **500 steps in 105.6 s (0.211 s/step)**; 8 threads 171.4 s (0.343 s/step) |
+| Per-step hotspots | pass1 fluid/solid forces **55%**, two "thread-private buffer reductions" **22%**, pass2 **10%**, neighbour search **7%**, solid constitution **5%**, integration 1% |
+| Additional finding | writing `result<N>.dat` takes **1.9 s per file** (20 MB of text), 19 s of the 500 steps (**18%**) |
+| Key conclusion 1 | the original scatter pattern ("update i and j for every pair") would need either 500 M atomics/step on the GPU or 32 private buffers; **but every pairwise formula in the code can be rewritten mathematically as "each particle gathers its own side"**, giving no atomics, no reductions and no races (derivation in §3.2) |
+| Key conclusion 2 | the reductions (22%) **disappear entirely** under the gather architecture, and the output (18%) can be rewritten as bulk writes; these are two free speedups |
+| GPU precision capability | measured on this machine: FP64 **0.81 TFLOPS** (= 1/67 of FP32), FP32 54.3 TFLOPS, Stream bandwidth 848 GB/s |
+| Numerical acceptance baseline | rerunning the same exe, p differs by at most 0.01 (relative 2e-6), vx ≤ 1e-9, and x/rho are identical at printed precision → use this "noise floor" for port acceptance, see §4.2 |
 
 ---
 
-## 1. 源码结构
+## 1. Source structure
 
-### 1.1 物理模型（弱可压缩 SPH + 流固耦合）
+### 1.1 Physical model (weakly compressible SPH + fluid-structure coupling)
 
-- **核函数**：三次样条以外的一种核，`kernel(dr)`、`dwdr(dr)`、`dwdx(dx,dr)`；`h = 1.5*hsml`，`hsml = 0.01 m`，支撑域 `q ≤ 2` 即 `dr ≤ 3*hsml = 0.03 m`。
-- **流体**：状态方程 `p = c0²(ρ-1000)`（`c0 = 48`），Riemann 近似 `U*`/`P*` 处理粒子对，人工粘度 `eta`（0.001 或 2e-5 两档）。
-- **流体-固体/壁面**：用 `vecn[j]`（固体/壁面法向）构造镜面速度，双侧施力 `SForce`。
-- **固体**：变形梯度 `F = ∂x/∂X0` 的 SPH 离散 + 梯度修正矩阵 `A`（`GraCorrec` 一次算出）、`J = det F`、`ρ = ρ0/J`、`Pia = μ(F - F⁻ᵀ) + λ·log10(J)·F⁻ᵀ + PD（摩阻项）`，PIJW 为固体内部应力散度。
-- **时间推进**：显式 Euler，`dt = 1e-5`；流体速度上限 `MaxV = 30`；固体底部/侧面边界强制 `v = 0`。
+- **Kernel**: a kernel other than the cubic spline, `kernel(dr)`, `dwdr(dr)`, `dwdx(dx,dr)`; `h = 1.5*hsml`, `hsml = 0.01 m`, support domain `q ≤ 2`, i.e. `dr ≤ 3*hsml = 0.03 m`.
+- **Fluid**: equation of state `p = c0²(ρ-1000)` (`c0 = 48`), Riemann approximation `U*`/`P*` for particle pairs, artificial viscosity `eta` (two levels, 0.001 or 2e-5).
+- **Fluid-solid/wall**: uses `vecn[j]` (solid/wall normal) to construct the mirror velocity and applies `SForce` on both sides.
+- **Solid**: SPH discretisation of the deformation gradient `F = ∂x/∂X0` plus a gradient-correction matrix `A` (computed once by `GraCorrec`), `J = det F`, `ρ = ρ0/J`, `Pia = μ(F - F⁻ᵀ) + λ·log10(J)·F⁻ᵀ + PD (friction term)`, with PIJW the solid internal stress divergence.
+- **Time integration**: explicit Euler, `dt = 1e-5`; fluid velocity cap `MaxV = 30`; solid bottom/side boundaries force `v = 0`.
 
-### 1.2 全局状态
+### 1.2 Global state
 
-- 单粒子状态 **146 个 double**（12 个 3×3 张量 + 若干 3 向量 + 标量），`237298 × 146 × 8 ≈ 277 MB`。
-- 另有 OpenMP 私有累加缓冲 `g_omp_buf`：`nth × 35 × num` doubles，32 线程 **2.03 GB**；这正是当前实现的主要内存带宽负担。
-- 粒子对数组 `pair_i/pair_j`：1110 万对 → 89 MB（`reserve(14000000)`，用 `data()` 当长度用，`size()` 恒 0）。
+- Per-particle state: **146 doubles** (12 3×3 tensors + several 3-vectors + scalars), `237298 × 146 × 8 ≈ 277 MB`.
+- Plus the OpenMP private accumulation buffer `g_omp_buf`: `nth × 35 × num` doubles, **2.03 GB** with 32 threads; this is the main memory-bandwidth burden of the current implementation.
+- Particle-pair arrays `pair_i/pair_j`: 11.1 M pairs → 89 MB (`reserve(14000000)`, `data()` used as the length, `size()` always 0).
 
-### 1.3 单个时间步的执行顺序（`main`）
+### 1.3 Execution order of one time step (`main`)
 
 ```
 for itime:
-  1. direct_find()            # 均匀网格 cell list: 计数→前缀和→装桶→14 半邻居格枚举成 pair 表
+  1. direct_find()            # uniform-grid cell list: count -> prefix sum -> bucket -> enumerate 14 half-neighbour cells into the pair table
   2. continue_density()
-       2.0 串行: SurFD = SurF;  p = c0²(ρ-1000)（<1000 归 0）
-       2.1 pass1 (并行 over pairs): 流体-流体 → drhodt/dvxdt/viscos/SurF/AveV；
-                                    流体-(固体|壁面) → 只更新流体侧；
-                                    (固体-固体) → F、DFdt
-       2.2 归约 1: 把 nth 份私有缓冲按粒子求和回全局（两段：流体 / 固体）
-       2.3 固体本构 (串行 [ntotal, ntotal+SolNum)): DFdtB、J、ρ=ρ0/J、SD、PD、F⁻¹、F⁻ᵀ、Pia
-       2.4 pass2 (并行 over pairs, 只含固体的对): 固体-固体 → PIJW；流体-固体 → SForce 双侧
-       2.5 归约 2: SForce 全域 + PIJW 固体段
-  3. 积分: 流体 ρ、v、限速; 固体 v（+PIJW+SForce-重力）+ 边界; 全部 x += dt·v
-  4. 每 50 步写 result<N>.dat（237298 行 × 14 列，6 位有效数字，制表符分隔）
+       2.0 serial: SurFD = SurF;  p = c0²(ρ-1000) (<1000 -> 0)
+       2.1 pass1 (parallel over pairs): fluid-fluid -> drhodt/dvxdt/viscos/SurF/AveV;
+                                    fluid-(solid|wall) -> update the fluid side only;
+                                    (solid-solid) -> F, DFdt
+       2.2 reduction 1: sum the nth private buffers back into the globals (two ranges: fluid / solid)
+       2.3 solid constitution (serial over [ntotal, ntotal+SolNum)): DFdtB, J, ρ=ρ0/J, SD, PD, F⁻¹, F⁻ᵀ, Pia
+       2.4 pass2 (parallel over pairs, solid-containing pairs only): solid-solid -> PIJW; fluid-solid -> SForce on both sides
+       2.5 reduction 2: SForce over everything + PIJW over the solid range
+  3. integration: fluid ρ, v, speed cap; solid v (+PIJW+SForce-gravity) + boundary; all x += dt·v
+  4. every 50 steps write result<N>.dat (237298 rows × 14 columns, 6 significant digits, tab-separated)
 ```
 
-### 1.4 初始化（只做一次）
+### 1.4 Initialisation (once)
 
-- `init_grid()`：固定域 `[-0.10,0.70]×[-0.10,0.70]×[-0.10,1.20]`，格子边长 `3*hsml = 0.03` → **27×27×44 = 32076 格**（平均 7.4 粒子/格）。
-- `NorVector()`：用一次邻居搜索求 `sumvecn` → `vecn`（固体/壁面法向，流体置 0）。
-- `GraCorrec()`：用一次邻居搜索+串行遍历 1110 万对，算梯度修正矩阵 `a` 并求逆得 `A`（固体段）。
+- `init_grid()`: fixed domain `[-0.10,0.70]×[-0.10,0.70]×[-0.10,1.20]`, cell edge `3*hsml = 0.03` → **27×27×44 = 32076 cells** (7.4 particles per cell on average).
+- `NorVector()`: one neighbour search to compute `sumvecn` → `vecn` (solid/wall normals, zero for fluid).
+- `GraCorrec()`: one neighbour search plus a serial pass over 11.1 M pairs to compute the gradient-correction matrix `a` and invert it into `A` (solid range).
 
-### 1.5 必须原样复刻的"怪癖"（照抄才不会漂）
+### 1.5 "Quirks" that must be reproduced exactly (otherwise results drift)
 
-| # | 位置 | 行为 |
+| # | Location | Behaviour |
 |---|---|---|
-| 1 | `continue_density` pass1 | `eta` 连写两次，**最终只由 `SurFD[j]`（邻居）决定**；gather 化后要用"邻居的 SurFD" |
-| 2 | `SurF` | **从不清零**（只在 `NorVector` 清过一次），每步在旧值上累加 → 无界增长；通过 `SurFD` 影响 `eta` |
-| 3 | pass2 `PRii` | 含 `PIJW[i]`，而流体粒子的 `PIJW` 永远不写 → 恒 0；保留公式即可（等价于 `PRii = p[i]`） |
-| 4 | `AveV`/`DisGrad*`/`GLStrain*` | 累加了但**从不使用**（`GLStrain()` 在 main 里被注释掉）→ 可直接删 |
-| 5 | 3 处 `dr` 的 epsilon | pass1 加 `1e-13`、pass2 不加、`NorVector` 加 `1e-12` |
-| 6 | 粒子编号顺序 | `pair` 强制 `i<j`，但所有成对项对 i/j **对称**（见 §3.2），因此顺序不影响物理，只影响浮点求和次序 |
-| 7 | 类型判据 | 流体 `itype>0`（=2）、固体 `itype<-10`（=-20）、壁面 `itype=-2` **不算固体** |
-| 8 | 输出 `p` 列 | 流体印 `p[i]`，其它印 `Pia11+Pia22+Pia33`（壁面恒 0） |
-| 9 | `paii = 0.25*rho0*1000*hsml` | 常数 1000 是字面量，不是 `rho0` |
-| 10 | 固体密度 | 每步被 `ρ0/J` 覆盖；`abs(J)<1e-6` 时置 1000，但 `log10(J)` 仍照算 |
+| 1 | `continue_density` pass1 | `eta` is assigned twice, so **only `SurFD[j]` (the neighbour) decides it in the end**; after gather-isation it must use "the neighbour's SurFD" |
+| 2 | `SurF` | **never cleared** (only once in `NorVector`), accumulates on top of the old value every step → unbounded growth; affects `eta` through `SurFD` |
+| 3 | pass2 `PRii` | contains `PIJW[i]`, but a fluid particle's `PIJW` is never written → always 0; keeping the formula is equivalent to `PRii = p[i]` |
+| 4 | `AveV`/`DisGrad*`/`GLStrain*` | accumulated but **never used** (`GLStrain()` is commented out in main) → can be deleted |
+| 5 | 3 places with an epsilon in `dr` | pass1 adds `1e-13`, pass2 adds none, `NorVector` adds `1e-12` |
+| 6 | Particle index order | `pair` forces `i<j`, but every pairwise term is **symmetric** in i/j (see §3.2), so the order does not affect the physics, only the floating-point summation order |
+| 7 | Type test | fluid `itype>0` (=2), solid `itype<-10` (=-20), wall `itype=-2` **is not a solid** |
+| 8 | Output `p` column | fluid prints `p[i]`, everything else prints `Pia11+Pia22+Pia33` (always 0 for walls) |
+| 9 | `paii = 0.25*rho0*1000*hsml` | the constant 1000 is a literal, not `rho0` |
+| 10 | Solid density | overwritten by `ρ0/J` every step; when `abs(J)<1e-6` it is set to 1000, but `log10(J)` is still evaluated |
 
 ---
 
-## 2. 实测基线
+## 2. Measured baseline
 
-### 2.1 CPU 整机
+### 2.1 CPU, full machine
 
-| 配置 | 500 步耗时 | 每步 | 说明 |
+| Configuration | 500-step time | Per step | Notes |
 |---|---|---|---|
-| 32 线程 | **105.6 s** | 0.211 s | 含 10 次输出（19 s） |
-| 8 线程 | 171.4 s | 0.343 s | 8→32 线程仅 1.62×，受 2 GB 缓冲带宽限制 |
-| 启动 | 1.0 s | — | 读 input.dat + 2 GB calloc + NorVector + GraCorrec |
+| 32 threads | **105.6 s** | 0.211 s | includes 10 outputs (19 s) |
+| 8 threads | 171.4 s | 0.343 s | 8→32 threads is only 1.62×, limited by the 2 GB buffer bandwidth |
+| Startup | 1.0 s | — | read input.dat + 2 GB calloc + NorVector + GraCorrec |
 
-### 2.2 每步分阶段（32 线程，`QPC` 插桩，102 步平均）
+### 2.2 Per-step breakdown (32 threads, `QPC` instrumentation, average of 102 steps)
 
-| 阶段 | s/步 | 占比 |
+| Phase | s/step | Share |
 |---|---|---|
-| 邻居搜索 `direct_find` | 0.0098 | 7.0% |
-| pass1（流体/固体受力） | 0.0763 | **54.5%** |
-| 归约 1 | 0.0236 | 16.9% |
-| 固体本构 | 0.0073 | 5.2% |
-| pass2（应力/耦合） | 0.0137 | 9.8% |
-| 归约 2 | 0.0072 | 5.1% |
-| 积分 | 0.0014 | 1.0% |
-| **合计（不含输出）** | **0.140** | 100% |
-| 输出（每 50 步） | 1.91 s/文件 | ≈0.038 s/步摊销 |
+| Neighbour search `direct_find` | 0.0098 | 7.0% |
+| pass1 (fluid/solid forces) | 0.0763 | **54.5%** |
+| Reduction 1 | 0.0236 | 16.9% |
+| Solid constitution | 0.0073 | 5.2% |
+| pass2 (stress/coupling) | 0.0137 | 9.8% |
+| Reduction 2 | 0.0072 | 5.1% |
+| Integration | 0.0014 | 1.0% |
+| **Total (excluding output)** | **0.140** | 100% |
+| Output (every 50 steps) | 1.91 s/file | ≈0.038 s/step amortised |
 
-### 2.3 GPU 能力（本机实测）
+### 2.3 GPU capability (measured on this machine)
 
-| 项 | 值 |
+| Item | Value |
 |---|---|
-| 卡 | RTX 5080，sm_120，84 SM，16 GB |
+| Card | RTX 5080, sm_120, 84 SM, 16 GB |
 | FP64 FMA | **0.81 TFLOPS** |
 | FP32 FMA | 54.3 TFLOPS |
 | Stream (2R+1W) | 848 GB/s |
-| 工具链 | nvcc 13.3 + cl 14.51 + CMake 4.2.1 已实测可编可跑（仅 C4819 代码页告警，需 `/utf-8` 或 `/wd4819`） |
+| Toolchain | nvcc 13.3 + cl 14.51 + CMake 4.2.1 verified to build and run (only the C4819 code-page warning, needs `/utf-8` or `/wd4819`) |
 
 ---
 
-## 3. CUDA 移植设计
+## 3. CUDA port design
 
-### 3.1 总体：每步 5 个 kernel，全部"每粒子一线程"
+### 3.1 Overall: five kernels per step, all "one thread per particle"
 
-| kernel | 线程范围 | 做什么 | 对应原代码 |
+| Kernel | Thread range | What it does | Original code |
 |---|---|---|---|
-| `k_prepare` | 0..num | `SurFD=SurF`；`p=c0²(ρ-1000)`（<1000→0） | 2.0 |
-| `k_cellcount` / `k_cellscan` / `k_cellscatter` | 0..num / 1 个 block / 0..num | 均匀网格 CSR：直方图→前缀和→按 cell 排序 | `direct_find` 1)2) |
-| `k_pass1` | 0..ntotal+SolNum | 遍历 27 邻格内的邻居，**只累加自己这一侧** | 2.1 |
-| `k_constitution` | ntotal..ntotal+SolNum | 3×3 本构（J、F⁻¹、SD、PD、Pia…），局部变量即可 | 2.3 |
-| `k_pass2` | 0..ntotal+SolNum | 邻居遍历：固体-固体→PIJW；流体-固体→SForce | 2.4 |
-| `k_update` | 0..num | ρ/v 更新、限速、固体边界、`x+=dt·v`（按编号分段） | 3 |
-| 每 50 步 | — | `cudaMemcpy` 回主机 → 同一段 `ofstream` 代码输出 | 4 |
+| `k_prepare` | 0..num | `SurFD=SurF`; `p=c0²(ρ-1000)` (<1000→0) | 2.0 |
+| `k_cellcount` / `k_cellscan` / `k_cellscatter` | 0..num / 1 block / 0..num | uniform-grid CSR: histogram → prefix sum → sort by cell | `direct_find` 1)2) |
+| `k_pass1` | 0..ntotal+SolNum | traverse the neighbours in the 27 cells, **accumulate only its own side** | 2.1 |
+| `k_constitution` | ntotal..ntotal+SolNum | 3×3 constitution (J, F⁻¹, SD, PD, Pia…), local variables suffice | 2.3 |
+| `k_pass2` | 0..ntotal+SolNum | neighbour traversal: solid-solid→PIJW; fluid-solid→SForce | 2.4 |
+| `k_update` | 0..num | ρ/v update, speed cap, solid boundary, `x+=dt·v` (split by index range) | 3 |
+| Every 50 steps | — | `cudaMemcpy` back to the host → the same `ofstream` output code | 4 |
 
-归约（2.2、2.5）**完全不需要**：每个粒子的累加量只由它自己的线程写，天然私有。
+The reductions (2.2, 2.5) are **not needed at all**: each particle's accumulation is written only by its own thread, so it is private by construction.
 
-### 3.2 关键推导：成对项都能 gather 化（这是整个移植的地基）
+### 3.2 Key derivation: every pairwise term can be gather-ised (the foundation of the whole port)
 
-原代码对每个粒子对 (i<j) 同时更新 i、j 两侧。若改成"每个粒子 p 遍历邻居 q、只算 p 自己的贡献"，必须保证 p 作为 i 或作为 j 时公式一致。逐个验证（`e_i = (x_j-x_i)/dr = -e_j`，`dwdx` 对 `dx` 是奇函数）：
+The original code updates both i and j for every pair (i<j). To change it to "each particle p traverses its neighbours q and computes only p's own contribution", the formula must be identical whether p is the i or the j side. Verified term by term (`e_i = (x_j-x_i)/dr = -e_j`, and `dwdx` is odd in `dx`):
 
-| 量 | i 侧（原式） | j 侧（原式） | gather 形式（p↔i 或 p↔j 同一式） |
+| Quantity | i side (original) | j side (original) | Gather form (p↔i or p↔j, same expression) |
 |---|---|---|---|
-| `drhodt` | `-2ρ_i(m_j/ρ_j)(UL_i-UM_i)dwdr` | 同结构 | `-2ρ_p(m_q/ρ_q)(UL_p-UM_p)dwdr(dr)` ✔ |
-| `dvxdt` | `-2m_j(PM_i/ρ_iρ_j)∇W(x_i-x_j)` | 同结构 | `-2m_q(PM_p/ρ_pρ_q)∇W(x_p-x_q)` ✔ |
-| `viscos` | `+2m_j·η·S·(v_i-v_j)/(ρ_j(dr²+0.01h²))`，`S=Σ∇W·(x_i-x_j)` | 同结构（`S` 由反向差算出但相等） | 同式，`S=Σ∇W(x_p-x_q)·(x_p-x_q)` ✔ |
+| `drhodt` | `-2ρ_i(m_j/ρ_j)(UL_i-UM_i)dwdr` | same structure | `-2ρ_p(m_q/ρ_q)(UL_p-UM_p)dwdr(dr)` ✔ |
+| `dvxdt` | `-2m_j(PM_i/ρ_iρ_j)∇W(x_i-x_j)` | same structure | `-2m_q(PM_p/ρ_pρ_q)∇W(x_p-x_q)` ✔ |
+| `viscos` | `+2m_j·η·S·(v_i-v_j)/(ρ_j(dr²+0.01h²))`, `S=Σ∇W·(x_i-x_j)` | same structure (`S` computed from the reversed difference but equal) | same expression, `S=Σ∇W(x_p-x_q)·(x_p-x_q)` ✔ |
 | `SurF` | `+S·m_j/ρ_j` | `+S·m_i/ρ_i` | `+S·m_q/ρ_q` ✔ |
-| `AveV`（无用，删） | `(m_j/ρ̄)(v_j-v_i)W` | 同结构 | `(m_q/ρ̄)(v_q-v_p)W` ✔ |
-| `F`（固-固） | `(m_j/ρ0_j)(x_j-x_i)⊗(A_i g0)` | `(m_i/ρ0_i)(x_i-x_j)⊗(-A_j g0)` | 两式都等于 `(m_q/ρ0_q)(x_q-x_p)⊗(A_p g0_pq)`，`g0_pq=dwdx(X0_p-X0_q)` ✔ |
-| `DFdt`（固-固） | `(m_j/ρ0_j)(v_j-v_i)⊗g0` | 同结构 | `(m_q/ρ0_q)(v_q-v_p)⊗g0_pq` ✔ |
-| `PIJW`（固-固） | `(m_j/ρ_iρ_j)(Pi_i-Pi_j)` | `(m_i/ρ_iρ_j)(Pi_j-Pi_i)` | `(m_q/ρ_pρ_q)[Pia_p·(A_p g0_pq) - Pia_q·(A_q g0_qp)]` ✔ |
-| `SForce`（流-固） | `-2(m_j/ρ_iρ_j)∇W(x_i-x_j)·C_i` | `-2(m_i/ρ_iρ_j)∇W(x_j-x_i)·C_i` | 各自算自己一侧，`C` 用对方的 `vecn` 与 `p` ✔ |
+| `AveV` (unused, delete) | `(m_j/ρ̄)(v_j-v_i)W` | same structure | `(m_q/ρ̄)(v_q-v_p)W` ✔ |
+| `F` (solid-solid) | `(m_j/ρ0_j)(x_j-x_i)⊗(A_i g0)` | `(m_i/ρ0_i)(x_i-x_j)⊗(-A_j g0)` | both equal `(m_q/ρ0_q)(x_q-x_p)⊗(A_p g0_pq)`, `g0_pq=dwdx(X0_p-X0_q)` ✔ |
+| `DFdt` (solid-solid) | `(m_j/ρ0_j)(v_j-v_i)⊗g0` | same structure | `(m_q/ρ0_q)(v_q-v_p)⊗g0_pq` ✔ |
+| `PIJW` (solid-solid) | `(m_j/ρ_iρ_j)(Pi_i-Pi_j)` | `(m_i/ρ_iρ_j)(Pi_j-Pi_i)` | `(m_q/ρ_pρ_q)[Pia_p·(A_p g0_pq) - Pia_q·(A_q g0_qp)]` ✔ |
+| `SForce` (fluid-solid) | `-2(m_j/ρ_iρ_j)∇W(x_i-x_j)·C_i` | `-2(m_i/ρ_iρ_j)∇W(x_j-x_i)·C_i` | each side computes its own, with `C` using the other side's `vecn` and `p` ✔ |
 
-因此：**每个粒子独立 gather 即可，不需要原子加、不需要私有缓冲、不需要归约**。这同时消掉 CPU 版 22% 的归约开销。
+Therefore: **each particle can gather independently; no atomics, no private buffers, no reductions**. This also removes the CPU version's 22% reduction overhead.
 
-### 3.3 邻居搜索
+### 3.3 Neighbour search
 
-- 保留原固定网格 `[-0.1,0.7]²×[-0.1,1.2]`、格长 0.03、**含 clamp 规则**（域外粒子并入边界格），保证粒子对集合与 CPU 逐对一致。
-- GPU 侧：`atomicAdd` 直方图（237k 次，~10 µs）→ 前缀和 → `atomicAdd` 游标装桶。
-- **gather 时直接扫 27 邻格**，不建 pair 表、不建 CSR：237k × 27 × 7.4 ≈ 4700 万次距离测试，约 0.3–0.5 ms，比建表再读表更省。
-  （若后续要 build 一个 CSR 邻接表给 pass1/pass2 复用，可得 89 MB 换 2× 距离测试，M3 再评估。）
-- 装桶用原子加 → 每步求和次序不稳定（不影响正确性，只影响末位）；若需要**逐位可复现**，改用 `cub::DeviceRadixSort` 按 `(cell, 粒子号)` 排序（+0.2–0.4 ms）。
+- Keep the original fixed grid `[-0.1,0.7]²×[-0.1,1.2]`, cell edge 0.03, and **the clamp rule** (particles outside the domain go into the boundary cell), so the particle-pair set matches the CPU pair by pair.
+- GPU side: `atomicAdd` histogram (237k increments, ~10 µs) → prefix sum → `atomicAdd` cursor bucket fill.
+- **During gather, scan the 27 neighbouring cells directly**, without building a pair table or CSR: 237k × 27 × 7.4 ≈ 47 million distance tests, about 0.3–0.5 ms, cheaper than building and re-reading a table.
+  (If a CSR adjacency list is later built once and reused by pass1/pass2, 89 MB buys 2× distance tests; evaluate in M3.)
+- Bucket filling uses atomics, so the summation order per step is unstable (does not affect correctness, only the last digits); if **bitwise reproducibility** is needed, use `cub::DeviceRadixSort` by `(cell, particle id)` (+0.2–0.4 ms).
 
-### 3.4 内存与裁剪
+### 3.4 Memory and trimming
 
-- 保留：`x[3] vx[3] X0[3] rho rho0 mass p itype SurF SurFD vecn[3] drhodt dvxdt[3] viscos[3] A[9] F[9] DFdt[9] Pia[9] PIJW[3] SForce[3]`
-- 裁剪（只在单个循环内用 → 局部变量）：`a[9] Fni[9] FniT[9] SD[9] PD[9] DFdtB[9] DisGrad[9] GLStrain[9] AveV[3] sumvecn[3] countiac`
-- 结果：**146 → 约 77 double/粒子（≈146 MB）**，无 2 GB 缓冲；16 GB 显存毫无压力。
+- Kept: `x[3] vx[3] X0[3] rho rho0 mass p itype SurF SurFD vecn[3] drhodt dvxdt[3] viscos[3] A[9] F[9] DFdt[9] Pia[9] PIJW[3] SForce[3]`
+- Trimmed (used only inside a single loop → local variables): `a[9] Fni[9] FniT[9] SD[9] PD[9] DFdtB[9] DisGrad[9] GLStrain[9] AveV[3] sumvecn[3] countiac`
+- Result: **146 → about 77 doubles/particle (≈146 MB)**, with no 2 GB buffer; 16 GB of GPU memory is no constraint.
 
-### 3.5 输出
+### 3.5 Output
 
-- CPU 版 1.9 s/文件的原因：`ofstream << double` 逐个格式化 + 逐 `endl` flush 语义。
-- GPU 版：`cudaMemcpy` 14 个数组回主机（26 MB，~5 ms），用同一段 `ofstream`/`snprintf` 代码输出；或设备端格式化成字符缓冲后 `fwrite`。
-- 500 步的 10 个文件应从 19 s 降到 < 1 s（**这本身相当于 18% 的加速**）。输出文本需与原来一致（6 位有效数字、制表符），`tools/CompareResults.exe` 按列解析数值，格式一致即可逐值比对。
+- The CPU version's 1.9 s/file comes from formatting each `ofstream << double` individually and the flush semantics of every `endl`.
+- GPU version: `cudaMemcpy` 14 arrays back to the host (26 MB, ~5 ms) and use the same `ofstream`/`snprintf` output code; or format into a character buffer on the device and `fwrite` it.
+- The 10 files of a 500-step run should drop from 19 s to < 1 s (**that alone is an 18% speedup**). The output text must stay identical (6 significant digits, tabs); `tools/CompareResults.exe` parses the numeric columns, so an identical format is enough for value-by-value comparison.
 
-### 3.6 精度路线
+### 3.6 Precision routes
 
-| 方案 | 每步预估 | 相对 CPU | 风险 |
+| Route | Estimated per step | Relative to CPU | Risk |
 |---|---|---|---|
-| **A. 全 FP64（推荐先做）** | 5–15 ms | 14–40× | 无（与参考同精度域） |
-| B. FP64 状态 + FP32 粒子对运算 | 2–5 ms | 40–100× | 需实测 500 步漂移 |
-| C. 全 FP32 | 1.5–3 ms | 70–140× | `log10(J)`、`ρ0/J`、`p=c0²(ρ-1000)` 对小量敏感，很可能通过不了验收 |
+| **A. All FP64 (do this first)** | 5–15 ms | 14–40× | none (same precision domain as the reference) |
+| B. FP64 state + FP32 pair arithmetic | 2–5 ms | 40–100× | drift over 500 steps must be measured |
+| C. All FP32 | 1.5–3 ms | 70–140× | `log10(J)`, `ρ0/J`, `p=c0²(ρ-1000)` are sensitive to small quantities; likely fails acceptance |
 
-建议按 A → （如需）B 推进；用 `using real = double` 抽象，B/C 只是换类型 + 定点验证。
+Recommend A → (if needed) B; abstract with `using real = double`, so B/C only change the type plus targeted verification.
 
 ---
 
-## 4. 验证方案
+## 4. Validation plan
 
-### 4.1 基准数据
+### 4.1 Reference data
 
-`SPH-src/result0..9.dat` = 500 步参考输出（237298 行 × 14 列）。已核实：它就是本包 Release exe、32 线程跑出来的（新跑一份 32 线程结果与其只差末位）。
+`SPH-src/result0..9.dat` = 500-step reference output (237298 rows × 14 columns). Verified: it is the output of this package's Release exe with 32 threads (a fresh 32-thread run differs only in the last printed digits).
 
-### 4.2 容差（实测"噪声底"，不是拍脑袋）
+### 4.2 Tolerances (the measured "noise floor", not a guess)
 
-同一 exe、同一 32 线程，**重跑两遍**的差异；以及 8 线程 vs 32 线程的差异：
+Differences from **rerunning the same exe** with the same 32 threads, and between 8 and 32 threads:
 
-| 列 | 重跑 32↔32 | 8↔32 | 说明 |
+| Column | Rerun 32↔32 | 8↔32 | Notes |
 |---|---|---|---|
-| x0/x1/x2 | **完全相同** | 完全相同 | 6 位有效数字下不可见 |
-| p | maxAbs **0.01**（相对 2e-6），2.7 万/10 文件处不同 | 0.01 | `p=2304(ρ-1000)` 把小差放大 2304 倍 |
-| vx0/vx1/vx2 | maxAbs ≤1e-9（1e-10 量级为主） | 同 | |
-| rho | 完全相同（打印精度内） | 同 | 实际差 ~4e-6 |
-| mass/itype/X0/rho0 | 完全相同 | 同 | 常量 |
-| 不同行数 | 2500–3700 / 237298 / 文件（≈1.2%） | 同 | |
+| x0/x1/x2 | **identical** | identical | invisible at 6 significant digits |
+| p | maxAbs **0.01** (relative 2e-6), 27k values out of 10 files differ | 0.01 | `p=2304(ρ-1000)` amplifies small differences by 2304× |
+| vx0/vx1/vx2 | maxAbs ≤1e-9 (mostly 1e-10) | same | |
+| rho | identical (to printed precision) | same | actual difference ~4e-6 |
+| mass/itype/X0/rho0 | identical | same | constants |
+| Rows differing | 2500–3700 / 237298 / file (≈1.2%) | same | |
 
-> 这条噪声底就是 §9.7 L2 的判据；CUDA 版实测全部列都在它以内（`p` 为 1e-3，比它还小一个数量级）。
+> This noise floor is the criterion of §9.7 L2; the CUDA version's measured differences are all within it (`p` at 1e-3, an order of magnitude smaller).
 
-> 注：`CompareResults.exe` 的 `maxRel=2` 是近零值（如 vx1≈-1e-13 反号）造成的假象，看 `maxAbs` 和按列汇总即可。
+> Note: `CompareResults.exe`'s `maxRel=2` is an artefact of near-zero values (e.g. vx1≈-1e-13 changing sign); look at `maxAbs` and the per-column summary.
 
-### 4.3 比对流程
+### 4.3 Comparison workflow
 
 ```
-.work/gpu-run/            # 放 input.dat + SPH-cuda.exe
-  SPH_MAXSTEP=500 .\SPH-cuda.exe        # 产出 result0..9.dat
+.work/gpu-run/            # contains input.dat + SPH-cuda.exe
+  SPH_MAXSTEP=500 .\SPH-cuda.exe        # produces result0..9.dat
 tools\CompareResults.exe .work\gpu-run SPH-src
 ```
 
 ---
 
-## 5. 工程结构（拟建）
+## 5. Project structure (proposed)
 
 ```
 SPH/
-├─ SPH-src/                     # 原始 CPU 参考（保持不动）
-├─ docs/CUDA_PORT_ANALYSIS.md   # 本文
+├─ SPH-src/                     # original CPU reference (left untouched)
+├─ docs/CUDA_PORT_ANALYSIS.md   # this document
 ├─ cuda/
 │  ├─ CMakeLists.txt            # LANGUAGES CXX CUDA, CMAKE_CUDA_ARCHITECTURES=native
-│  ├─ build.bat / build.ps1     # 与现有工程同样的"一键、零绝对路径"风格
+│  ├─ build.bat / build.ps1     # same "one click, zero absolute paths" style as the existing project
 │  ├─ src/
-│  │  ├─ sph_common.h           # 常量(§1)、网格参数、设备数组声明
-│  │  ├─ sph_kernels.cu         # 上述 6 个 kernel
-│  │  ├─ sph_solver.cu          # 初始化/单步/输出/计时
-│  │  └─ main.cpp               # 入口、SPH_MAXSTEP/SPH_THREADS 等价物、-o 目录
+│  │  ├─ sph_common.h           # constants (§1), grid parameters, device array declarations
+│  │  ├─ sph_kernels.cu         # the six kernels above
+│  │  ├─ sph_solver.cu          # initialisation / single step / output / timing
+│  │  └─ main.cpp               # entry point, SPH_MAXSTEP/SPH_THREADS equivalents, -o directory
 │  └─ tools/compare.ps1
-└─ .work/                       # 临时基线运行与插桩构建（可随时删）
+└─ .work/                       # temporary baseline runs and instrumented builds (safe to delete)
 ```
 
 ---
 
-## 6. 分阶段计划
+## 6. Phased plan
 
-| 阶段 | 内容 | 完成判据 |
+| Phase | Content | Completion criterion |
 |---|---|---|
-| **M1 骨架+正确性（首版）** | CMake/CUDA 工程、读 input、cell list、pass1、本构、pass2、积分、输出；FP64 | 1 步 `result0.dat` 通过 §4.2；打印每步耗时 |
-| **M2 全流程验证** | 500 步跑通，与 `result0..9` 全量比对 | 10 个文件全部通过 §4.2；产出耗时表 |
-| **M3 性能** | 邻格 tile/共享内存、寄存器压力、每步 pair-pass 合并、快速输出、确定性排序 | 稳定 < 5 ms/步（FP64），或 FP32 路径 < 2 ms/步 |
-| **M4 工程化** | build.bat/build.ps1、README、比对脚本、与 CPU 版并存的运行说明 | 一条命令即得 exe 并复现验证 |
+| **M1 skeleton + correctness (first version)** | CMake/CUDA project, read input, cell list, pass1, constitution, pass2, integration, output; FP64 | 1-step `result0.dat` passes §4.2; per-step timing printed |
+| **M2 full-pipeline validation** | run 500 steps and compare all of `result0..9` | all 10 files pass §4.2; timing table produced |
+| **M3 performance** | neighbour-cell tiling/shared memory, register pressure, per-step pair-pass fusion, fast output, deterministic sorting | stable < 5 ms/step (FP64), or FP32 path < 2 ms/step |
+| **M4 engineering** | build.bat/build.ps1, README, comparison script, instructions for coexisting with the CPU version | one command produces the exe and reproduces the validation |
 
-**预估**：M1 是主要工作量（公式多且必须逐项对齐），M2 主要是等待与比对，M3 是调优。
-
----
-
-## 7. 风险
-
-1. **不追求逐位一致**：实测 500 步后 p 最大差 1e-3、vx 1e-9、x/rho/mass/itype/X0/rho0 打印位完全一致，已落在 CPU 自身重跑的噪声底以内；用 §9.7 的两级口径判定。
-2. **固体本构的病态**：`1/J`、`log10(J)` 对 J→0 敏感；一旦某步 J 跨 0，GPU 版与 CPU 版可能在不同时刻出现 NaN。首版应加"首个 NaN 粒子/步号"的诊断输出。
-3. **寄存器压力**：本构 kernel 里 9×9 个临时量容易 spill；必要时把 `DFdtB/SD/PD` 留在全局内存（与原代码一致）。
-4. **FP32 路线**：需先用 FP64 版建好基准，再单独评估漂移。
-5. **MSVC+CUDA 细节**：需 `/utf-8`（或 `/wd4819`）避开代码页告警；`-arch=native` 在 CMake 4.2 可用。
+**Estimate:** M1 is the main effort (many formulas that must be aligned one by one), M2 is mostly waiting and comparing, M3 is tuning.
 
 ---
 
-## 8. 待确认
+## 7. Risks
 
-1. 精度路线：**A（FP64 先做，推荐）** / B（FP64 状态 + FP32 对运算） / C（全 FP32）？
-2. 验收：按 §4.2 的"噪声底"容差（推荐），还是另有要求（如必须与某个特定版本逐位一致）？
-3. 范围：只做求解器，还是也要把 `input.dat` 预处理/后处理（如 ParaView 导出）纳进来？
+1. **Bitwise identity is not the goal**: after 500 steps the measured maximum differences are p 1e-3, vx 1e-9, and x/rho/mass/itype/X0/rho0 identical at printed precision; this is inside the CPU's own rerun noise floor. Judge with the two-level criteria of §9.7.
+2. **Ill-conditioning of the solid constitution**: `1/J` and `log10(J)` are sensitive as J→0; if J crosses zero on some step, the GPU and CPU versions may produce NaN at different times. The first version should report the first NaN particle/step.
+3. **Register pressure**: 9×9 temporaries in the constitution kernel easily spill; if necessary keep `DFdtB/SD/PD` in global memory as in the original.
+4. **FP32 route**: build the FP64 baseline first, then evaluate drift separately.
+5. **MSVC+CUDA details**: `/utf-8` (or `/wd4819`) avoids the code-page warning; `-arch=native` works with CMake 4.2.
 
 ---
 
-## 9. M1/M2 实测结果（首版 CUDA 实现）
+## 8. Open questions
 
-工程：`cuda/`（`src/sph.h` + `src/sph_kernels.cu` + `src/sph_host.cu` + `CMakeLists.txt`），
-CMake + nvcc 13.3 + MSVC 14.51 编译通过，`-arch=native`（sm_120）。
+1. Precision route: **A (FP64 first, recommended)** / B (FP64 state + FP32 pair arithmetic) / C (all FP32)?
+2. Acceptance: the "noise floor" tolerance of §4.2 (recommended), or another requirement (e.g. bitwise identity with one specific version)?
+3. Scope: solver only, or also `input.dat` pre/post-processing (e.g. ParaView export)?
 
-### 9.1 功能状态
+---
 
-| 项 | 结果 |
+## 9. M1/M2 measured results (first CUDA implementation)
+
+Project: `cuda/` (`src/sph.h` + `src/sph_kernels.cu` + `src/sph_host.cu` + `CMakeLists.txt`),
+built with CMake + nvcc 13.3 + MSVC 14.51, `-arch=native` (sm_120).
+
+### 9.1 Functional status
+
+| Item | Result |
 |---|---|
-| 读 `input.dat` / 初始化（NorVector、GraCorrec） | ✅ |
-| 邻居对数 | **11,102,707，与 CPU 逐位相同**（T=0/T=1 完全一致，之后仅差 2~15 对） |
-| 单步中间量逐数组对拍（F/DFdt/Pia/rho/SForce/PIJW/drhodt/vxdt/viscos/SurF） | ✅ 见下表 |
-| 500 步稳定运行 | ✅ 无 NaN/Inf |
-| 输出格式 | ✅ 列数/制表符/6 位有效数字，与 `CompareResults.exe` 兼容 |
+| Read `input.dat` / initialisation (NorVector, GraCorrec) | ✅ |
+| Neighbour pair count | **11,102,707, bitwise identical to the CPU** (T=0/T=1 exactly equal, then only 2–15 pairs differ) |
+| One-step intermediate arrays compared one by one (F/DFdt/Pia/rho/SForce/PIJW/drhodt/vxdt/viscos/SurF) | ✅ see table below |
+| 500-step stable run | ✅ no NaN/Inf |
+| Output format | ✅ column count/tabs/6 significant digits, compatible with `CompareResults.exe` |
 
-单步（1 step）真值对拍（不是打印值）：
+One-step comparison against the true values (not the printed values):
 
-| 量 | maxAbs | maxRel |
+| Quantity | maxAbs | maxRel |
 |---|---|---|
-| F11（固-固变形梯度） | 2.2e-15 | 2.2e-15 |
+| F11 (solid-solid deformation gradient) | 2.2e-15 | 2.2e-15 |
 | DFdt11 | 4.5e-17 | 1.0e-12 |
-| rho（固体） | 4.0e-12 | 4.0e-15 |
+| rho (solid) | 4.0e-12 | 4.0e-15 |
 | Pia11 | 3.0e-8 | 3.1e-10 |
-| p = ΣPia（固体） | 8.8e-8 | 2.7e-10 |
-| drhodt（流体） | 1.1e-11 | 5.6e-10 |
-| dvxdt / viscos（流体） | 3.5e-13 / 1.8e-15 | 2.9e-10 / 1.7e-9 |
-| x（位置） | 打印位完全一致 | — |
-| A（梯度修正矩阵，初始化） | 2.7e-15 | 1.3e-15 |
+| p = ΣPia (solid) | 8.8e-8 | 2.7e-10 |
+| drhodt (fluid) | 1.1e-11 | 5.6e-10 |
+| dvxdt / viscos (fluid) | 3.5e-13 / 1.8e-15 | 2.9e-10 / 1.7e-9 |
+| x (position) | identical at printed precision | — |
+| A (gradient-correction matrix, initialisation) | 2.7e-15 | 1.3e-15 |
 
-### 9.2 性能（首版，未优化）
+### 9.2 Performance (first version, unoptimised)
 
-| | 500 步耗时 | 每步 |
+| | 500-step time | Per step |
 |---|---|---|
-| CPU 32 线程 | 105.6 s | 211 ms |
-| **CUDA（首版）** | 28.1 s | 56 ms |
-| 其中 pass1 / pass2 / 网格 | — | 41.7 / 13.8 / 0.1 ms（优化后 25.6 / 10.8 / 0.1，整步 37.1 ms，见 §11） |
+| CPU 32 threads | 105.6 s | 211 ms |
+| **CUDA (first version)** | 28.1 s | 56 ms |
+| of which pass1 / pass2 / grid | — | 41.7 / 13.8 / 0.1 ms (after optimisation 25.6 / 10.8 / 0.1, whole step 37.1 ms, see §11) |
 
-加速比 3.8×。距 FP64 屋顶（约 2.3 GFLOP/步 ÷ 0.81 TFLOPS ≈ 3 ms）还有 ~9× 空间，已定位瓶颈：
-每个邻居访问要做 12~14 次**跨数组**的随机读（每次 32 线程落在 32 条不同 cache line → 448 次事务/warp），
-寄存器 94（pass1_fluid）/109（pass1_solid），占用率仅 25%。
-优化方向（M3）：①按 cell 序枚举工作粒子（同 warp 线程邻域高度重叠 → 合并访存）；②邻域热数据打包成
-AoS（104~112 B/粒子，1~2 条 cache line）；③预置倒数减少 FP64 除法（每访问 6 次 → 2~3 次）。
+Speedup 3.8×. Against the FP64 roof (about 2.3 GFLOP/step ÷ 0.81 TFLOPS ≈ 3 ms) there is still ~9× of headroom; the bottleneck was located:
+each neighbour visit performs 12–14 **cross-array** random reads (each of the 32 threads in a warp hits a different cache line → 448 transactions/warp),
+registers 94 (pass1_fluid)/109 (pass1_solid), occupancy only 25%.
+Optimisation directions (M3): (1) enumerate work particles in cell order (threads in a warp then have highly overlapping neighbourhoods → coalesced access); (2) pack the hot neighbourhood data into
+AoS (104–112 B/particle, 1–2 cache lines); (3) precompute reciprocals to reduce FP64 divisions (6 per visit → 2–3).
 
-### 9.3 首版的一个真 bug（已修）：`eta` 用的是"编号较大那个粒子"的 SurFD
+### 9.3 A real bug in the first version (fixed): `eta` used the SurFD of "the higher-numbered particle"
 
-首版 500 步跑完，p 最大差 80（相对 2.7%）。当时我先把它归因于"混沌放大"，**这个判断是错的**。
-继续逐行核对 `1.cpp` 的 `continue_density` 后发现：
+After the first 500-step run, p differed by up to 80 (2.7% relative). I initially attributed it to "chaotic amplification"; **that judgement was wrong**.
+Checking `continue_density` in `1.cpp` line by line revealed:
 
 ```c
 if(fabs(SurFD[i])<2.5){eta = 0.001;}else{eta = 0.00002;}
-if(fabs(SurFD[j])<2.5){eta = 0.001;}else{eta = 0.00002;}   // 第二次赋值覆盖第一次
+if(fabs(SurFD[j])<2.5){eta = 0.001;}else{eta = 0.00002;}   // the second assignment overwrites the first
 ```
 
-`eta` 是**每对只算一次、两侧共用**的，而且永远取 `SurFD[j]`（原代码里恒有 `i<j`）。
-我原先的 gather 用的是"邻居的 SurFD"：当当前粒子是 i 侧时恰好正确，是 **j 侧时就错**——
-人工粘度在 0.001 与 2e-5 之间差 **50 倍**。
+`eta` is computed **once per pair and shared by both sides**, and it always takes `SurFD[j]` (the original always has `i<j`).
+My gather version used "the neighbour's SurFD": correct when the current particle is the i side, **wrong on the j side** —
+artificial viscosity differs by a factor of **50** between 0.001 and 2e-5.
 
-这个 bug 之所以在 step 0 的逐数组对拍里完全看不出来：**第 0 步 `SurFD` 恒为 0**（`SurF` 在
-`NorVector` 里清过），于是全部粒子 eta=0.001；而第 0 步之后立刻有 **96802/101250 = 95.6%** 的流体粒子
-`|SurF| ≥ 2.5`，从第 2 步起 eta 就开始在 0.001 / 2e-5 之间分化。所以 `result0` 对得上、`result1` 就差了 7.2。
+The reason this bug was completely invisible in the step-0 array comparison: **at step 0 `SurFD` is always 0** (`SurF` is cleared in
+`NorVector`), so every particle has eta=0.001; immediately after step 0, **96802/101250 = 95.6%** of fluid particles have
+`|SurF| ≥ 2.5`, so from step 2 onward eta splits between 0.001 and 2e-5. That is why `result0` matched but `result1` was off by 7.2.
 
-修正：`eta` 改用 `SurFD[(p>q) ? p : q]`（即 pair 里编号较大者），见 `k_pass1_fluid` 注释。
+Fix: `eta` now uses `SurFD[(p>q) ? p : q]` (the higher-numbered particle in the pair), see the comment in `k_pass1_fluid`.
 
-### 9.4 修正后的实测结果（500 步，`CompareResults` 对 `result0..9`）
+### 9.4 Measured results after the fix (500 steps, `CompareResults` against `result0..9`)
 
-| 列 | 差异数 | maxAbs | 参考：CPU 自己重跑的噪声底 |
+| Column | Differing values | maxAbs | Reference: CPU's own rerun noise floor |
 |---|---|---|---|
 | `x0 / x1 / x2` | **0** | **0** | 0 |
 | `rho / mass / itype / X00..X02 / rho0` | **0** | **0** | 0 |
 | `p` | 81991 | **1e-3** | 0.01 |
 | `vx0 / vx1 / vx2` | 320 / 1517 / 17 | **1e-9** | 1e-9 |
-| 每文件不同行数 | ~8300 / 237298 | — | 2500–4500 |
+| Differing rows per file | ~8300 / 237298 | — | 2500–4500 |
 
-**全部列都落在 CPU 自身重跑的噪声底以内（`p` 甚至好一个数量级）**，§4.2 的原始验收条件
-（`p ≤ 0.1`、`vx ≤ 1e-8`、`x/rho` 打印位一致）**已满足**。
+**Every column is inside the CPU's own rerun noise floor (`p` is even an order of magnitude better)**, so the original acceptance criteria of §4.2
+(`p ≤ 0.1`, `vx ≤ 1e-8`, `x/rho` identical at printed precision) **are satisfied**.
 
-### 9.5 第二个算例：把"从未被执行"的分支也覆盖上
+### 9.5 Second case: also cover the branch that "was never executed"
 
-原算例里 **fluid-solid 对 = 0**（固体板与流体不接触，耦合全部走壁面），
-所以 `SForce` / `vecn` / `PRii` 这条路径**一次都没跑过**，对拍结果全是 0 不能算验证。
-为此构造了第二个算例：把 75728 个壁面粒子（itype −2）全部改标为固体（−20），
-于是 fluid-solid 对大量出现（`SForce` 量级 3.7e2），两边各跑 1 步逐数组对拍：
+In the original case **fluid-solid pairs = 0** (the solid plate never touches the fluid; all coupling goes through walls),
+so the `SForce` / `vecn` / `PRii` path **never ran**, and an all-zero comparison cannot count as validation.
+A second case was therefore constructed: all 75728 wall particles (itype −2) were relabelled as solid (−20),
+which produces many fluid-solid pairs (`SForce` magnitude 3.7e2); both sides ran 1 step and every array was compared:
 
-| 量 | maxAbs | 相对（对量级） |
+| Quantity | maxAbs | Relative (to magnitude) |
 |---|---|---|
-| `SForce0/1/2` | 2.8e-13 | 5.8e-11（~3.7e2） |
+| `SForce0/1/2` | 2.8e-13 | 5.8e-11 (~3.7e2) |
 | `vecn0/1/2` | 7.1e-11 | — |
-| `PIJW0/1/2` | 2.0e-9 | 4e-12（~5e-2…5e2） |
-| `Pia11/22/33` | 3.1e-8 | 4.5e-12（~6.9e3） |
-| `F11` / `DFdt11` / `rho` | 2.2e-15 / 1.6e-17 / 4.0e-12 | 1e-15 量级 |
+| `PIJW0/1/2` | 2.0e-9 | 4e-12 (~5e-2…5e2) |
+| `Pia11/22/33` | 3.1e-8 | 4.5e-12 (~6.9e3) |
+| `F11` / `DFdt11` / `rho` | 2.2e-15 / 1.6e-17 / 4.0e-12 | 1e-15 level |
 
-### 9.6 教训（写进流程）
+### 9.6 Lessons (written into the process)
 
-1. **"1 步对拍通过"不等于移植正确**：必须让每个分支都被执行到（本例 fluid-solid 对为 0，
-   导致 `SForce/vecn/PRii` 全程空跑）。
-2. **`eta` 这类"两侧共用、且只取某一侧"的量最容易在 gather 化时被悄悄改错**，
-   这类量要专门列一张表逐个核对（本文件 §3.2 已补）。
-3. 出现"对不上"时，先怀疑实现，再怀疑精度；"混沌放大"是一个会掩盖 bug 的方便结论。
+1. **"One-step comparison passes" does not mean the port is correct**: every branch must actually be executed (in this case fluid-solid pairs were 0, so `SForce/vecn/PRii` ran empty throughout).
+2. **Quantities like `eta` that are "shared by both sides and taken from only one side" are the easiest to silently break during gather-isation**; list them in a dedicated table and check each one (added to §3.2 of this document).
+3. When something "does not match", suspect the implementation before the precision; "chaotic amplification" is a convenient conclusion that hides bugs.
 
-### 9.7 建议的验收口径（两级，均已达成）
+### 9.7 Proposed acceptance criteria (two levels, both met)
 
-- **L1 逐点（1 步，两个算例）**：全部中间量相对差 ≤ 1e-9；`x` 打印位一致；邻居对数与 CPU 逐位相同。
-  → 已达成（最差 `Pia` 4.5e-12、`SForce` 5.8e-11）。
-- **L2 逐点（500 步）**：与 `result0..9` 比对，全部列落在 CPU 自身重跑噪声底以内。→ 已达成。
-- **L3 稳定性**：500 步无 NaN/Inf。→ 已达成。
-### 9.8 两个算例仍未覆盖的代码（只做了人工核对）
+- **L1 pointwise (1 step, two cases)**: relative difference ≤ 1e-9 for every intermediate quantity; `x` identical at printed precision; neighbour pair count bitwise identical to the CPU.
+  → met (worst: `Pia` 4.5e-12, `SForce` 5.8e-11).
+- **L2 pointwise (500 steps)**: compare with `result0..9`; every column inside the CPU's own rerun noise floor. → met.
+- **L3 stability**: 500 steps with no NaN/Inf. → met.
 
-| 位置 | 条件 | 本算例为何不触发 |
+### 9.8 Code the two cases still do not cover (manually reviewed only)
+
+| Location | Condition | Why this case does not trigger it |
 |---|---|---|
-| `k_update_fluid` 限速 | `sqrt(v²+1e-5) > 30` | 实际速度 ~1e-2 m/s |
-| `k_update_fluid` 密度下限 | `rho < 960` | `rho ≈ 1000` |
-| `k_constitution` 奇点回退 | `|J| < 1e-6` → `rho0 = 1000` | `J ≈ 1 + 1e-5` |
-| `k_gra_invert` 奇点回退 | `|Da| < 1e-6` → `A = I` | `|Da| ≈ 4` |
+| `k_update_fluid` speed cap | `sqrt(v²+1e-5) > 30` | actual speed ~1e-2 m/s |
+| `k_update_fluid` density floor | `rho < 960` | `rho ≈ 1000` |
+| `k_constitution` singularity fallback | `abs(J) < 1e-6` → `rho0 = 1000` | `J ≈ 1 + 1e-5` |
+| `k_gra_invert` singularity fallback | `abs(Da) < 1e-6` → `A = I` | `abs(Da) ≈ 4` |
 
-这四段都是单行 `if` 钳位，语义已逐行比对；要 100% 覆盖需要另造极端算例（例如给某个固体粒子
-一个 100 m/s 的初速，或人为把 rho0 设成 0 触发 `J` 奇异）。
+These are all single-line `if` clamps and their semantics have been compared line by line; 100% coverage would need extreme cases (for example
+giving one solid particle an initial speed of 100 m/s, or forcing rho0 to 0 to make `J` singular).
+
 ---
 
-## 10. 精度模板（fp64 / fp32 可切换）
+## 10. Precision template (switchable fp64 / fp32)
 
-### 10.1 用法
+### 10.1 Usage
 
-求解器整体按标量类型 `Real` 模板化（`SphPtrsT<Real>`、全部 kernel、主机侧 `Solver<Real>`），
-**默认两种精度都编进同一个 exe**，运行期选择：
+The whole solver is templated on the scalar type `Real` (`SphPtrsT<Real>`, all kernels, the host-side `Solver<Real>`),
+and **both precisions are compiled into the same exe by default**, selected at run time:
 
 ```bat
-sph_cuda.exe                 :: fp64（默认，与 CPU 参考对齐）
+sph_cuda.exe                 :: fp64 (default, aligned with the CPU reference)
 sph_cuda.exe --fp32          :: fp32
-set SPH_PRECISION=fp32       :: 同上（环境变量）
-sph_cuda.exe --fp64 --help   :: 其它参数
+set SPH_PRECISION=fp32       :: same, via the environment
+sph_cuda.exe --fp64 --help   :: other options
 ```
 
-CMake 侧：
+CMake side:
 
-| 选项 | 默认 | 说明 |
+| Option | Default | Description |
 |---|---|---|
-| `SPH_ENABLE_FP64` | ON | 是否编 double 实例 |
-| `SPH_ENABLE_FP32` | ON | 是否编 float 实例（只留一种可把编译时间/体积减半） |
-| `SPH_DEFAULT_PRECISION` | `double` | 不带参数时的默认精度 |
+| `SPH_ENABLE_FP64` | ON | whether to compile the double instance |
+| `SPH_ENABLE_FP32` | ON | whether to compile the float instance (keeping only one halves compile time/binary size) |
+| `SPH_DEFAULT_PRECISION` | `double` | default precision when no flag is given |
 
 ```bat
 cmake -S . -B build -DSPH_ENABLE_FP64=ON -DSPH_ENABLE_FP32=ON -DSPH_DEFAULT_PRECISION=double
 ```
 
-### 10.2 实现要点（踩过的坑）
+### 10.2 Implementation notes (pitfalls encountered)
 
-1. **字面量必须写成 `Real(x)`**。否则 `0.5*(a+b)` 这种式子在 `Real=float` 时会被 C++ 提升成
-   double 运算——在消费级 GPU 上 FP64 只有 FP32 的 1/67 吞吐，一处提升就能把加速比吃光。
-   全文约 130 处字面量都做了显式转换；用 `cuobjdump -sass` 核对过：fp32-only 构建里
-   **没有任何 double 算术指令**。
-2. **邻居判定仍用 `sph_add_rn/sph_mul_rn`**（float 走 `__fadd_rn/__fmul_rn`），避免 FMA 收缩；
-   fp64 下这样能保证粒子对集合与 `direct_find` 逐位相同。
-3. **输出/对拍一律转 double**：`result<N>.dat` 的数值格式、`CompareResults.exe`、
-   调试 dump 的二进制格式都与精度无关，切换后对比流程不用改。
-4. 模板实例在 `sph_kernels.cu` 底部显式实例化（受 `SPH_HAVE_FP64/32` 宏控制），
-   主机侧 `run_case<Real>()` 各走一条。
+1. **Literals must be written as `Real(x)`**. Otherwise an expression such as `0.5*(a+b)` is promoted to double when `Real=float`,
+   and on consumer GPUs FP64 is only 1/67 of FP32 throughput, so one promotion can eat the whole speedup.
+   All ~130 literals in the file were explicitly converted; `cuobjdump -sass` confirmed that the fp32-only build contains
+   **no double arithmetic instructions**.
+2. **The neighbour test still uses `sph_add_rn/sph_mul_rn`** (float uses `__fadd_rn/__fmul_rn`) to avoid FMA contraction;
+   in fp64 this keeps the particle-pair set bitwise identical to `direct_find`.
+3. **Output and comparisons always convert to double**: the numeric format of `result<N>.dat`, `CompareResults.exe` and the
+   binary debug dumps are independent of precision, so the comparison workflow does not change when switching.
+4. Template instances are explicitly instantiated at the bottom of `sph_kernels.cu` (guarded by the `SPH_HAVE_FP64/32` macros),
+   and the host-side `run_case<Real>()` takes one path per precision.
 
-### 10.3 实测：两种精度的代价与收益（500 步，RTX 5080）
+### 10.3 Measured cost and benefit of the two precisions (500 steps, RTX 5080)
 
-| 项 | fp64 | fp32 |
+| Item | fp64 | fp32 |
 |---|---|---|
-| 每步 | 55.9 ms | **4.20 ms（13.3×）** |
-| 500 步 | 28.1 s | 2.1 s |
-| 其中 pass1 / pass2 | 41.9 / 13.7 ms | 2.4 / 1.7 ms |
-| 每粒子状态 | 552 B（69 double） | 276 B（69 float） |
-| 邻居对数（T=0） | 11,102,707（与 CPU 逐位相同） | 11,209,220（多 0.96%，见下） |
-| `x` 最大差（1 步） | 打印位一致 | 7e-6（相对 2e-5，= float 粒度） |
-| `rho` 最大差（1 步） | 0 | 0.09（9e-5 相对，≈1.5 ulp） |
-| `p` 最大差（1 步） | 1e-4 | **202**（见下） |
-| 500 步整体量 | 见 §9.4 | KE 差 **0.000%**、平均压力差 **0.18%** |
+| Per step | 55.9 ms | **4.20 ms (13.3×)** |
+| 500 steps | 28.1 s | 2.1 s |
+| of which pass1 / pass2 | 41.9 / 13.7 ms | 2.4 / 1.7 ms |
+| Per-particle state | 552 B (69 doubles) | 276 B (69 floats) |
+| Neighbour pairs (T=0) | 11,102,707 (bitwise identical to CPU) | 11,209,220 (0.96% more, see below) |
+| `x` max difference (1 step) | identical at printed precision | 7e-6 (2e-5 relative, = float granularity) |
+| `rho` max difference (1 step) | 0 | 0.09 (9e-5 relative, ≈1.5 ulp) |
+| `p` max difference (1 step) | 1e-4 | **202** (see below) |
+| 500-step global quantities | see §9.4 | KE difference **0.000%**, mean pressure difference **0.18%** |
 
-**fp32 的 `p` 为什么差 1% 量级**：不是实现问题，是本构的固有病态。
-固体 `Pia ≈ λ·log10(J)·F⁻ᵀ`，`λ=1.33e7`、`J≈1+1.7e-5`，
-`dPia/Pia ≈ 6e4·(dJ/J)`：fp32 里 `F` 的相对误差 ~1e-6，放大到 `Pia` 就是 **~6e-2 相对**（≈200 Pa）。
-同样的机制让 fp32 的邻居对数多出 0.96%——晶格里有大量粒子对**正好**落在 `r = 3h` 的刀口上，
-float 舍入把它们判成"在域内"（这些对的核函数值为 0，对物理无影响，只影响计数打印）。
+**Why fp32's `p` differs at the 1% level**: not an implementation problem, but the inherent ill-conditioning of the constitution.
+Solid `Pia ≈ λ·log10(J)·F⁻ᵀ` with `λ=1.33e7`, `J≈1+1.7e-5`,
+so `dPia/Pia ≈ 6e4·(dJ/J)`: a relative error of ~1e-6 in `F` in fp32 is amplified to **~6e-2 relative** in `Pia` (≈200 Pa).
+The same mechanism gives fp32 0.96% more neighbour pairs — many pairs in the lattice sit **exactly** on the knife edge at `r = 3h`,
+and float rounding classifies them as "inside" (their kernel value is 0, so the physics is unaffected; only the printed count changes).
 
-结论：
-- **验收/生产算例用 fp64**（与 CPU 参考同量级，56 ms/步，比 CPU 32 线程快 3.8×）；
-- **fp32 适合扫参数/看趋势**（4.2 ms/步，比 CPU 快 50×，整体量 0.2% 内一致），
-  但不要拿它跟 fp64 逐点比，也不要看固体的绝对压力值；
-- 若既要 fp32 的速度又要固体的精度，下一步可做"流体 fp32 + 固体本构 fp64"的混合路径
-  （只改 `k_pass1_solid`/`k_constitution` 两处，代价约 +0.2 ms/步量级，需实测）。
+Conclusions:
+
+- **Use fp64 for acceptance and production cases** (same order as the CPU reference, 56 ms/step, 3.8× faster than 32-thread CPU);
+- **fp32 is suitable for parameter sweeps and trends** (4.2 ms/step, 50× faster than the CPU, global quantities within 0.2%),
+  but do not compare it pointwise with fp64 and do not look at absolute solid pressure values;
+- If both fp32 speed and solid accuracy are needed, the next step is a mixed path "fluid fp32 + solid constitution fp64"
+  (only `k_pass1_solid`/`k_constitution` change, about +0.2 ms/step, to be measured).
+
 ---
 
-## 11. 速度瓶颈：实测定位与已做的优化
+## 11. Speed bottleneck: measured localisation and optimisations applied
 
-### 11.1 逐 kernel 计时（`SPH_BENCH=1`，每项单独跑 20 次）
+### 11.1 Per-kernel timing (`SPH_BENCH=1`, each item run 20 times)
 
-| kernel | fp64 优化前 | fp64 优化后 | fp32 优化后 | 说明 |
+| Kernel | fp64 before | fp64 after | fp32 after | Notes |
 |---|---|---|---|---|
-| `pass1_fluid` | 32.68 ms | **17.32 ms** | 1.23 ms | 流体侧受力（占大头） |
-| `pass2_solid` | 10.36 ms | **8.50 ms** | 1.40 ms | PIJW / 流固耦合力 |
-| `pass1_solid` | 9.86 ms | **8.30 ms** | 0.77 ms | 变形梯度 F / DFdt |
-| `count_pairs`（纯邻居遍历） | 4.14 ms | 4.13 ms | 0.72 ms | **遍历地板**：只走 27 邻居格 + 距离判定 |
-| `pass2_fluid` | 2.28 ms | 2.28 ms | 0.41 ms | 本算例没有 fluid-solid 对 → 空跑 |
+| `pass1_fluid` | 32.68 ms | **17.32 ms** | 1.23 ms | fluid-side forces (the largest share) |
+| `pass2_solid` | 10.36 ms | **8.50 ms** | 1.40 ms | PIJW / fluid-solid coupling force |
+| `pass1_solid` | 9.86 ms | **8.30 ms** | 0.77 ms | deformation gradient F / DFdt |
+| `count_pairs` (pure neighbour traversal) | 4.14 ms | 4.13 ms | 0.72 ms | **traversal floor**: only the 27 neighbour cells + distance test |
+| `pass2_fluid` | 2.28 ms | 2.28 ms | 0.41 ms | this case has no fluid-solid pairs → empty run |
 | cell(hist+scan+scatter) | 0.08 ms | 0.08 ms | 0.08 ms | |
-| constitution | 0.05 ms | 0.05 ms | 0.008 ms | 固体本构（无邻居循环） |
+| constitution | 0.05 ms | 0.05 ms | 0.008 ms | solid constitution (no neighbour loop) |
 | prepare + update ×3 | 0.03 ms | 0.03 ms | 0.02 ms | |
-| **合计** | **59.5 ms** | **36.4 ms** | **4.7 ms** | 实测整步 55.9 → **37.1 ms** / 4.20 → **3.91 ms** |
+| **Total** | **59.5 ms** | **36.4 ms** | **4.7 ms** | whole step measured 55.9 → **37.1 ms** / 4.20 → **3.91 ms** |
 
-### 11.2 根因：每个邻居访问 17 次 FP64 除法子程序调用
+### 11.2 Root cause: 17 FP64 division subroutine calls per neighbour visit
 
-用 `cuobjdump -sass` 数 `k_pass1_fluid<double>` 最内层循环（一次邻居访问）：
+Counting the innermost loop of `k_pass1_fluid<double>` (one neighbour visit) with `cuobjdump -sass`:
 
-| | 优化前 | 优化后 |
+| | Before | After |
 |---|---|---|
-| 真实指令数 | 576 | 518 |
-| FP64 ALU（DFMA/DMUL/DADD） | 249 | **168** |
-| `CALL.REL.NOINC`（除法/开方子程序） | **17** | **4** |
-| 64-bit 全局读（LDG.E.64） | 17 | 18 |
+| Real instruction count | 576 | 518 |
+| FP64 ALU (DFMA/DMUL/DADD) | 249 | **168** |
+| `CALL.REL.NOINC` (division/sqrt subroutines) | **17** | **4** |
+| 64-bit global loads (LDG.E.64) | 17 | 18 |
 
-消费级 GPU 的 FP64 除法**不是一条指令**，而是 `MUFU.RCP64H` + 若干 Newton 迭代的一段子程序，
-每次访问 17 次 → 这一项就吃掉了右图之外的一半时间。改法（纯代数等价，只差 1-2 ulp）：
+On consumer GPUs, FP64 division is **not one instruction** but a subroutine of `MUFU.RCP64H` plus several Newton iterations;
+17 of them per visit consumed half the time on their own. The fix (pure algebra, only 1–2 ulp difference):
 
-1. `q = dr/h` → `dr * (1/h)`，`1/h` 是编译期常量（`sph_inv_h<>()`）；
-2. `1/dr`、`1/(ρ_i+ρ_j)`、`1/(dr²+0.01h²)` 各只算一次，其余改成乘法；
-3. 新增 `irho[i] = 1/ρ[i]` 数组（`k_prepare` 里填，固体在 `k_constitution` 里刷新），
-   消掉 `m_j/ρ_j`、`PM/(ρ_iρ_j)`、`S·m_j/ρ_j` 三类除法；
-4. `3/c0`、`1/(c0²)` 等常量除法在编译期折叠。
+1. `q = dr/h` → `dr * (1/h)`, with `1/h` a compile-time constant (`sph_inv_h<>()`);
+2. compute `1/dr`, `1/(ρ_i+ρ_j)` and `1/(dr²+0.01h²)` once each and turn the rest into multiplications;
+3. add an `irho[i] = 1/ρ[i]` array (filled in `k_prepare`, refreshed for solids in `k_constitution`)
+   to remove the `m_j/ρ_j`, `PM/(ρ_iρ_j)` and `S·m_j/ρ_j` divisions;
+4. constant divisions such as `3/c0` and `1/(c0²)` are folded at compile time.
 
-结果：**55.9 → 37.1 ms/步（1.5×）**，500 步仍与 CPU 参考在噪声底内一致
-（`p` maxAbs 1e-3、`x/rho/mass/itype/X0/rho0` 打印位相同）。
+Result: **55.9 → 37.1 ms/step (1.5×)**, and 500 steps are still within the noise floor of the CPU reference
+(`p` maxAbs 1e-3, `x/rho/mass/itype/X0/rho0` identical at printed precision).
 
-### 11.3 现在的瓶颈：非合并的邻居数据读取
+### 11.3 The bottleneck at that point: uncoalesced neighbour data reads
 
-有两条硬证据：
+Two pieces of hard evidence:
 
-1. **纯遍历地板**：`count_pairs` 只读邻居的 `x[3]`（4 次读）就要 4.13 ms；
-   `pass1_fluid` 读 18 个字段 → 17.3 ms。**两者之比 17.3/4.13 = 4.19，恰好等于 18/4 = 4.5**。
-2. **有效带宽只有 82 GB/s**（10.5M 次访问 × 136 B / 17.3 ms），峰值 848 GB/s →
-   不是带宽瓶颈，而是**事务**瓶颈：每个 warp 的 32 个线程各读不同粒子，一次 `LDG.E.64`
-   要拆成最多 32 个 128 B 事务，实际只用到 8 B。
+1. **Pure traversal floor**: `count_pairs` reads only the neighbour's `x[3]` (4 loads) and takes 4.13 ms;
+   `pass1_fluid` reads 18 fields → 17.3 ms. **The ratio 17.3/4.13 = 4.19 is exactly 18/4 = 4.5**.
+2. **Effective bandwidth only 82 GB/s** (10.5M visits × 136 B / 17.3 ms), against a peak of 848 GB/s →
+   this is not a bandwidth limit but a **transaction** limit: the 32 threads of a warp read 32 different particles, so one `LDG.E.64`
+   is split into up to 32 128 B transactions while only 8 B is used.
 
-所以下一步不是再抠算术，而是**减少每次访问的“散读”次数**：
+So the next step is not more arithmetic but **fewer scattered reads per visit**:
 
-| 方案 | 做法 | 预估 |
+| Option | Approach | Estimate |
 |---|---|---|
-| A. 邻域数据打包成 AoS | 每步用 0.1 ms 把 `x/vx/ρ/ρ⁻¹/m/p/itype/SurFD/vecn` 打包成 ~144 B/粒子 的连续块；warp 内线程访问的是相邻粒子（cell 序），事务数降一个量级 | pass1_fluid 17.3 → **5~7 ms** |
-| B. 共享内存分块 | 一个 block 负责若干 cell，协作把 27 邻域数据搬进 shared memory，再逐粒子读 shared | 更快，但要重写邻居循环 + 处理 halos |
-| C. 合并 pass1/pass2 的遍历 | 流体侧两次遍历合并（本算例 pass2_fluid 纯空跑 2.3 ms）；固体侧因 `ρ` 在本构里被改写，只能按 cell 标志跳过 | −2.3 ms |
-| D. 固体 kernel 的 `A[9]`/`Pia[9]` 打包 | `pass2_solid` 每次访问读 2 个 3×3 张量（18 次散读） | 8.5 → 4~5 ms |
+| A. Pack neighbourhood data into AoS | every step, spend 0.1 ms packing `x/vx/ρ/ρ⁻¹/m/p/itype/SurFD/vecn` into a contiguous ~144 B/particle block; threads in a warp then access adjacent particles (cell order), cutting transactions by an order of magnitude | pass1_fluid 17.3 → **5–7 ms** |
+| B. Shared-memory tiling | one block handles several cells, cooperatively stages the 27-cell neighbourhood into shared memory, then reads shared per particle | faster, but requires rewriting the neighbour loop and handling halos |
+| C. Fuse the pass1/pass2 traversals | fuse the two fluid-side traversals (in this case pass2_fluid is an empty 2.3 ms); the solid side can only skip by cell flag because `ρ` is overwritten in the constitution | −2.3 ms |
+| D. Pack `A[9]`/`Pia[9]` in the solid kernels | `pass2_solid` reads two 3×3 tensors per visit (18 scattered reads) | 8.5 → 4–5 ms |
 
-A + C + D 做完，fp64 有望到 **10~12 ms/步**（相对 CPU 32 线程 211 ms/步约 **18~21×**），
-fp32 同步受益。
-### 11.4 用探针修正结论：**不是访存，是算术**
+With A + C + D, fp64 should reach **10–12 ms/step** (about **18–21×** the 32-thread CPU's 211 ms/step), and fp32 benefits too.
 
-ncu（在 `C:\Program Files\NVIDIA Corporation\Nsight Compute 2026.2.1\...\ncu.exe`）能跑起来，
-但 `ERR_NVGPUCTRPERM`：硬件计数器需要管理员权限，本机非管理员、也改不了
-`HKLM\SOFTWARE\NVIDIA Corporation\Global\NVTweak\RmProfilingAdminOnly`。
-于是改用"可控探针"：写一个和 `pass1_fluid` **同样的邻居遍历、同样读 13 个字段、但不做任何算术**
-的 kernel（`k_bench_loads`，另有一个把邻居地址换成跨 warp 连续地址的合并访问版本）。
+### 11.4 Correcting the conclusion with probes: **not memory, but arithmetic**
 
-| 实验 | fp64 | fp32 |
+ncu (at `C:\Program Files\NVIDIA Corporation\Nsight Compute 2026.2.1\...\ncu.exe`) runs,
+but returns `ERR_NVGPUCTRPERM`: hardware counters need administrator rights, and this machine has neither admin rights nor the ability to change
+`HKLM\SOFTWARE\NVIDIA Corporation\Global\NVTweak\RmProfilingAdminOnly`.
+So a "controllable probe" was used: a kernel with **the same neighbour traversal as `pass1_fluid`, reading the same 13 fields, but doing no arithmetic**
+(`k_bench_loads`, plus a coalesced variant that maps neighbour addresses to consecutive addresses across the warp).
+
+| Experiment | fp64 | fp32 |
 |---|---|---|
-| 遍历 + 13 次**散读**（无算术） | 3.66 ms | 1.01 ms |
-| 遍历 + 13 次**合并读**（无算术） | 3.65 ms | 0.86 ms |
-| 完整 `pass1_fluid` | **14.26 ms** | **1.23 ms** |
-| ⇒ 算术占 `pass1_fluid` | **10.6 ms（74%）** | — |
+| Traversal + 13 **scattered reads** (no arithmetic) | 3.66 ms | 1.01 ms |
+| Traversal + 13 **coalesced reads** (no arithmetic) | 3.65 ms | 0.86 ms |
+| Full `pass1_fluid` | **14.26 ms** | **1.23 ms** |
+| ⇒ arithmetic share of `pass1_fluid` | **10.6 ms (74%)** | — |
 
-**散读惩罚 ≈ 0**（3.66 vs 3.65 ms）——之前"每个 warp 448 次事务"的推测是错的：
-同一 warp 内线程处理的粒子在 cell 序上相邻，邻居列表高度重叠，L1/L2 命中率很高。
-（注意：`count_pairs` 的 4.15 ms 不能当地板用，它每粒子做一次 `atomicAdd` 到同一地址，被原子竞争拖慢了。）
+**The scattered-read penalty is ≈ 0** (3.66 vs 3.65 ms) — the earlier "448 transactions per warp" guess was wrong:
+threads in the same warp process particles that are adjacent in cell order, their neighbour lists overlap heavily, and the L1/L2 hit rate is high.
+(Note: `count_pairs`'s 4.15 ms cannot be used as the floor; it does one `atomicAdd` to the same address per particle, which is slowed down by atomic contention.)
 
-所以瓶颈是**算术效率**：约 100 个 FP64 运算/次访问，算术部分 10.6 ms
-对应 ~2.6 ms 的 FP64 屋顶（0.81 TFLOPS），即**只跑到屋顶的 19~25%**，属于指令延迟/占用率受限。
+So the bottleneck is **arithmetic efficiency**: about 100 FP64 operations per visit, and the 10.6 ms arithmetic part
+corresponds to a FP64 roof of ~2.6 ms (0.81 TFLOPS), i.e. **only 19–25% of the roof**, which means instruction-latency/occupancy limited.
 
-### 11.5 第二轮优化（本轮）
+### 11.5 Second optimisation round (this round)
 
-1. **核函数多项式只算一次**：`dwdr` 与三个 `dwdx` 分量共用同一个
-   `coe·((2-q)⁴-2(1+2q)(2-q)³)`（`sph_wq()`），每次访问少算 3 遍多项式，约 −24 个 FP64 运算。
-2. **提高占用率**：`k_pass1_fluid` 加 `__launch_bounds__(256,4)`，寄存器从 94 压到 ≤64，
-   SM 驻留 warp 数翻倍（25% → 50% 占用率）。
+1. **Compute the kernel polynomial once**: `dwdr` and the three `dwdx` components share the same
+   `coe·((2-q)⁴-2(1+2q)(2-q)³)` (`sph_wq()`), saving three polynomial evaluations per visit, about −24 FP64 operations.
+2. **Raise occupancy**: add `__launch_bounds__(256,4)` to `k_pass1_fluid`, reducing registers from 94 to ≤64 and doubling
+   the warps resident per SM (25% → 50% occupancy).
 
-| | 首版 | 除法定数化后 | 本轮后 |
+| | First version | After division factoring | After this round |
 |---|---|---|---|
 | `pass1_fluid` | 32.68 | 17.32 | **14.26 ms** |
 | `pass1_solid` | 9.86 | 8.30 | **6.69 ms** |
 | `pass2_solid` | 10.36 | 8.50 | **7.13 ms** |
-| 整步 fp64 | 55.9 | 37.1 | **31.2 ms** |
-| 整步 fp32 | 4.20 | 3.91 | **~3.3 ms** |
-| 相对 CPU 32 线程（211 ms/步） | 3.8× | 5.7× | **6.8×** |
+| Whole step fp64 | 55.9 | 37.1 | **31.2 ms** |
+| Whole step fp32 | 4.20 | 3.91 | **~3.3 ms** |
+| Relative to 32-thread CPU (211 ms/step) | 3.8× | 5.7× | **6.8×** |
 
-500 步重新比对：`p` maxAbs 1e-3、`x/rho/mass/itype/X0/rho0` 打印位一致，仍在噪声底内。
+Re-compared after 500 steps: `p` maxAbs 1e-3, `x/rho/mass/itype/X0/rho0` identical at printed precision, still inside the noise floor.
 
-### 11.6 下一步（按收益排序，均未做）
+### 11.6 Next steps (ordered by payoff, none done yet)
 
-| 方案 | 依据 | 预估 |
+| Option | Basis | Estimate |
 |---|---|---|
-| A. 继续压算术 | 仍在 FP64 屋顶的 ~25%；`PM/UM` 里的 `min/max`、`eta` 选择、`rhoR` 等还能再省 | `pass1_fluid` 14.3 → 10~11 ms |
-| B. 占用率继续提 | 若压到 48 寄存器 → 6 block/SM | 视 spill 情况 |
-| C. 跳过空跑遍历 | 本算例 fluid-solid 对为 0，`pass2_fluid` 2.28 ms 纯空转；用 per-cell "含固体" 标志可近乎 0 成本跳过 | −2.2 ms |
-| D. 固体张量打包/共享内存 | `pass2_solid` 每次访问读 `A[9]`+`Pia[9]`；`pass1_solid` 读 `A[9]` | 7.1+6.7 → 8~9 ms（合计） |
+| A. Keep cutting arithmetic | still at ~25% of the FP64 roof; the `min/max` in `PM/UM`, the `eta` selection, `rhoR` etc. can still be reduced | `pass1_fluid` 14.3 → 10–11 ms |
+| B. Raise occupancy further | if registers reach 48 → 6 blocks/SM | depends on spilling |
+| C. Skip empty traversals | this case has no fluid-solid pairs, so `pass2_fluid` is 2.28 ms of pure idle work; a per-cell "contains solid" flag skips it at nearly zero cost | −2.2 ms |
+| D. Pack solid tensors / shared memory | `pass2_solid` reads `A[9]`+`Pia[9]` per visit; `pass1_solid` reads `A[9]` | 7.1+6.7 → 8–9 ms (combined) |
 
-C+D 做完预计 **整步 ~22 ms（相对 CPU 约 10×）**，A 再叠加可到 ~19 ms。
-### 11.7 第三轮优化（本轮）
+With C+D the whole step should be **~22 ms (about 10× the CPU)**, and adding A brings it to ~19 ms.
 
-1. **跳过空跑遍历**：`k_cell_hist` 顺带统计每格固体数（`cellSolid`），`k_pass2_fluid` 进门先看 27 邻格里有没有固体，没有就直接返回（本算例 fluid-solid 对为 0）。
-   → `pass2_fluid` **2.28 → 0.435 ms**。
-2. **固体静态数据打包**：把每个固体粒子的 `{X0[3], A[9], rho0, mass}` 打包成 14 个连续 double
-   （`solidPack`，初始化后建一次，之后不再变），固体 kernel 里 13 次散读变成 1~2 条 cache line。
-   → `pass1_solid` **6.69 → 6.26 ms**。
-3. **占用率扫描**：把 `k_pass1_fluid` 的 `__launch_bounds__(256,N)` 从 N=4 扫到 6，时间 14.5/14.27/14.31 ms
-   —— **基本无差**，说明它不是"warps 不够"，而是 FP64 流水线依赖链限制（这个卡的 FP64 只有 FP32 的 1/64）。
+### 11.7 Third optimisation round (this round)
 
-| | 首版 | 第二轮 | **本轮** |
+1. **Skip empty traversals**: `k_cell_hist` also counts the solids per cell (`cellSolid`), and `k_pass2_fluid` first checks whether any of the 27 neighbour cells contains a solid; if not it returns immediately (this case has no fluid-solid pairs).
+   → `pass2_fluid` **2.28 → 0.435 ms**.
+2. **Pack static solid data**: pack each solid particle's `{X0[3], A[9], rho0, mass}` into 14 consecutive doubles
+   (`solidPack`, built once after initialisation and never changed), turning 13 scattered reads in the solid kernels into 1–2 cache lines.
+   → `pass1_solid` **6.69 → 6.26 ms**.
+3. **Occupancy sweep**: sweep `__launch_bounds__(256,N)` in `k_pass1_fluid` from N=4 to 6; times 14.5/14.27/14.31 ms
+   — **essentially no difference**, showing it is not "not enough warps" but the FP64 pipeline dependency chain (this card's FP64 is only 1/64 of FP32).
+
+| | First version | Second round | **This round** |
 |---|---|---|---|
 | `pass1_fluid` | 32.68 | 14.26 | 14.26 ms |
 | `pass1_solid` | 9.86 | 6.69 | **6.26 ms** |
 | `pass2_solid` | 10.36 | 7.13 | 7.22 ms |
 | `pass2_fluid` | 2.28 | 2.28 | **0.44 ms** |
-| **整步 fp64** | 55.9 | 31.2 | **29.9 ms（相对 CPU 7.1×）** |
-| **整步 fp32** | 4.20 | 3.75 | **3.35 ms（相对 CPU 63×）** |
+| **Whole step fp64** | 55.9 | 31.2 | **29.9 ms (7.1× the CPU)** |
+| **Whole step fp32** | 4.20 | 3.75 | **3.35 ms (63× the CPU)** |
 
-**⚠ 打包引入过一次越界 bug**：`solidPack` 只覆盖 `[NTOTAL, NALL)`，
-但 `itype<-10` 的粒子可能在这个区间之外（第二个算例把壁面改标成固体就是这个情况），
-索引会越界读到野值 → 结果出 NaN。已加 `inpack` 判断回退到 SoA 数组（1.cpp 里这些粒子的 `A` 本来就是 0）。
-主算例不受影响（它的固体全在区间内），但**只有第二个算例能暴露它**——再次说明"要有覆盖每个分支的算例"。
+**⚠ The packing introduced an out-of-bounds bug once**: `solidPack` covers only `[NTOTAL, NALL)`,
+but particles with `itype<-10` can lie outside that interval (the second case, which relabels walls as solid, is exactly that situation),
+so the index read out of bounds into garbage → NaN results. An `inpack` check now falls back to the SoA arrays (in 1.cpp these particles' `A` is 0 anyway).
+The main case is unaffected (all its solids are inside the interval), but **only the second case could expose it** — again showing that "you need cases that cover every branch".
 
-500 步重新比对：`p` maxAbs ≤ 1e-3、`x/rho/mass/itype/X0/rho0` 打印位一致；合成算例 60 步 maxAbs 1e-6。
+Re-compared after 500 steps: `p` maxAbs ≤ 1e-3, `x/rho/mass/itype/X0/rho0` identical at printed precision; the synthetic case is identical to 1e-6 after 60 steps.
 
-### 11.8 结论：fp64 的剩余空间
+### 11.8 Conclusion: remaining headroom for fp64
 
-`pass1_fluid` 现在 14.26 ms，其中遍历+读 3.65 ms、算术 10.6 ms。按 168 条 FP64 指令/次访问算，
-算术屋顶约 2.6~4.4 ms，即仍在屋顶的 **25~40%**；但占用率扫描无效，说明受限于
-**消费级 GPU 的 FP64 流水线本身**（1/64 速率 + 依赖链延迟），继续抠算术收益有限。
+`pass1_fluid` now takes 14.26 ms, of which traversal+loads are 3.65 ms and arithmetic 10.6 ms. At 168 FP64 instructions per visit,
+the arithmetic roof is about 2.6–4.4 ms, so it is still at **25–40%** of the roof; but the occupancy sweep had no effect, meaning it is limited by
+**the consumer GPU's FP64 pipeline itself** (1/64 rate plus dependency-chain latency); further arithmetic trimming has limited payoff.
 
-要再快只有两条路：
-1. **fp32（或混合精度）**：fp32 已到 3.35 ms/步（相对 CPU 63×），代价是固体应力精度（见 §9.7/§10.3）；
-2. **混合精度**：流体 fp32 + 固体本构 fp64，预估 4~5 ms/步，固体压力精度保持 fp64 量级。
-### 11.9 试过的方案：`Pia` 改 AoS + 向量化读（收益 ≈ 0）
+There are only two ways to go faster:
 
-按"固体 kernel 是访存受限"的假设做了一版：`Pia` 从分量主序 `Pia[c*NUM+i]` 改成
-每固体粒子 12 个连续 Real（9 个有效 + 3 个填充，96 B，保证 16 字节对齐）的 AoS，
-`k_pass2_solid` 里用 `double2`（fp32 用 `float2`）一次读 16 B。
+1. **fp32 (or mixed precision)**: fp32 is already at 3.35 ms/step (63× the CPU), at the cost of solid stress accuracy (see §9.7/§10.3);
+2. **Mixed precision**: fluid fp32 + solid constitution fp64, estimated 4–5 ms/step, keeping solid pressure accuracy at the fp64 level.
 
-结果（SASS 确认向量化生效）：
+### 11.9 Tried: `Pia` as AoS + vectorised loads (payoff ≈ 0)
 
-| | 改前 | 改后 |
+Based on the assumption "the solid kernels are memory-bound", a version was built with `Pia` changed from component-major `Pia[c*NUM+i]` to
+12 consecutive Reals per solid particle (9 used + 3 padding, 96 B, 16-byte aligned) in AoS form,
+and `k_pass2_solid` reads 16 B at a time with `double2` (`float2` in fp32).
+
+Results (SASS confirms the vectorisation is active):
+
+| | Before | After |
 |---|---|---|
-| `pass2_solid` 循环内 64-bit 散读 | 64 | **42**（其中 4 条 `LDG.E.128`） |
-| 循环内 FP64 ALU / CALL | 199 / 7 | 190 / 7 |
-| `pass2_solid` 耗时 | 7.47 ms | **7.79 ms（略差）** |
-| 整步 fp64 | 29.48 ms | 29.60 ms |
-| 整步 fp32 | 3.07 ms | **2.96 ms** |
+| 64-bit scattered reads in the `pass2_solid` loop | 64 | **42** (including 4 `LDG.E.128`) |
+| FP64 ALU / CALL in the loop | 199 / 7 | 190 / 7 |
+| `pass2_solid` time | 7.47 ms | **7.79 ms (slightly worse)** |
+| Whole step fp64 | 29.48 ms | 29.60 ms |
+| Whole step fp32 | 3.07 ms | **2.96 ms** |
 
-**结论：固体 kernel 也不是访存受限。** 把读砍掉 1/3 之后没变快，说明卡住它的是
-**190 条 FP64 ALU + 7 条 `CALL.REL`（sqrt/除法的软件子程序）的延迟**，
-和 `pass1_fluid` 是同一个墙。之前我按"静态读指令数 ≈ 耗时"推断访存受限，这个推断错了。
+**Conclusion: the solid kernels are not memory-bound either.** Cutting a third of the loads did not make it faster, so what holds it back is
+**the latency of 190 FP64 ALU instructions + 7 `CALL.REL` (software sqrt/division subroutines)**, the same wall as `pass1_fluid`.
+My earlier inference of "static load-instruction count ≈ time, therefore memory-bound" was wrong.
 
-附带修了一个我自己引入的问题：调试 dump 还按旧的 Pia 布局读，`g.Pia + 8*NUM` 会越界
-（`cudaMemcpy` 报 invalid argument）。已改成专门的 `dump_pia()`（AoS → 9 个 NUM 长的数组，
-固体区间外补 0）。
+A problem I introduced myself was also fixed: the debug dump still read the old Pia layout, so `g.Pia + 8*NUM` went out of bounds
+(`cudaMemcpy` reported invalid argument). It now uses a dedicated `dump_pia()` (AoS → nine NUM-long arrays, zero-padded outside the solid range).
 
-验证：主算例 500 步 `p` maxAbs ≤ 1e-3、`x/rho/...` 打印位一致；合成算例 1 步
-`Pia` 2.6e-8 / `PIJW` 1.4e-9 / `F` 2e-15，60 步输出 maxAbs 1e-6。
+Validation: main case, 500 steps, `p` maxAbs ≤ 1e-3 and `x/rho/...` identical at printed precision; synthetic case, 1 step,
+`Pia` 2.6e-8 / `PIJW` 1.4e-9 / `F` 2e-15, 60-step output maxAbs 1e-6.
 
-**下一步真正有希望的是 ILP**：三个热点 kernel 都是"依赖链上串着 2~7 个 sqrt/除法子程序"，
-每线程处理 2 个粒子能让两条链交错，把 CALL 的延迟填掉（不改结果，只改调度）。
-预估 `pass1_fluid` 14.4 → 10~12、`pass2_solid` 7.8 → 6、`pass1_solid` 6.4 → 5，
-整步 fp64 约 **22~25 ms**。
-### 11.10 ILP（每个循环迭代处理 2 个邻居）—— fp32 有效，fp64 无效
+**The genuinely promising next step is ILP**: the three hot kernels all have "2–7 sqrt/division subroutines chained on the dependency path";
+processing two particles per thread lets the two chains interleave and fills the CALL latency (no change to results, only scheduling).
+Estimated `pass1_fluid` 14.4 → 10–12, `pass2_solid` 7.8 → 6, `pass1_solid` 6.4 → 5,
+whole step fp64 about **22–25 ms**.
 
-`sph_neigh2()`：邻居集合、累加顺序与 `sph_neigh()` **完全相同**（同一个 cell、同一个 a 升序），
-只是一次迭代内同时算两个邻居的 `r²`/`sqrt`/除法，让两条独立依赖链在流水线里交错。
+### 11.10 ILP (process two neighbours per loop iteration) — effective in fp32, not in fp64
 
-| | ILP 前 | ILP 后 |
+`sph_neigh2()`: the neighbour set and accumulation order are **exactly the same** as `sph_neigh()` (same cell, same ascending a);
+it only computes two neighbours' `r²`/`sqrt`/division in one iteration so two independent dependency chains interleave in the pipeline.
+
+| | Before ILP | After ILP |
 |---|---|---|
-| `pass1_fluid` fp64 | 14.39 ms | 14.3 ms（**无变化**） |
-| `pass1_solid` fp64 | 6.35 | 6.3（无变化） |
-| `pass2_solid` fp64 | 7.47 | 7.4（无变化） |
-| **整步 fp64** | 29.5 | **29.6 ms（无变化）** |
-| **整步 fp32** | 2.96 | **2.47 ms（−17%）** |
+| `pass1_fluid` fp64 | 14.39 ms | 14.3 ms (**no change**) |
+| `pass1_solid` fp64 | 6.35 | 6.3 (no change) |
+| `pass2_solid` fp64 | 7.47 | 7.4 (no change) |
+| **Whole step fp64** | 29.5 | **29.6 ms (no change)** |
+| **Whole step fp32** | 2.96 | **2.47 ms (−17%)** |
 
-结论很清楚：**fp64 是 FP64 流水线吞吐受限，不是延迟受限**——所以加 ILP（填延迟）没用；
-fp32 才是延迟受限，ILP 直接吃到 −17%。这也解释了之前"占用率扫描无效"：
-FP64 单元已经跑满，多开 warp 也没用。
+The conclusion is clear: **fp64 is FP64-pipeline-throughput limited, not latency limited** — so adding ILP (filling latency) does nothing;
+fp32 is latency limited, and ILP takes 17% directly. This also explains why the earlier occupancy sweep had no effect:
+the FP64 units are already saturated, so more warps do not help.
 
-代码保留（fp64 无害、fp32 赚 17%）。验证：主算例 500 步 `p` maxAbs ≤ 1e-3、`x/rho/...` 打印位一致；
-合成算例 60 步 maxAbs 1e-6。因为累加顺序没变，结果与不带 ILP 的版本等价。
+The code is kept (harmless in fp64, 17% gain in fp32). Validation: main case, 500 steps, `p` maxAbs ≤ 1e-3 and `x/rho/...` identical at printed precision;
+synthetic case, 60 steps, maxAbs 1e-6. Because the accumulation order is unchanged, the results are equivalent to the version without ILP.
 
-### 11.11 当前最终性能
+### 11.11 Current final performance
 
-| | ms/步 | 相对 CPU 32 线程（211 ms/步） |
+| | ms/step | Relative to 32-thread CPU (211 ms/step) |
 |---|---|---|
 | fp64 | **29.6** | **7.1×** |
 | fp32 | **2.47** | **85×** |
-| （起点，本次会话第一版） | 55.9 / 4.20 | 3.8× / 50× |
+| (starting point, first version of this session) | 55.9 / 4.20 | 3.8× / 50× |
 
-fp64 的进一步加速只剩"减少 FP64 运算本身"（算法级改写、会改变算术），
-调度/访存/占用率这几条路已经全部试完并封死。
+Further fp64 speedup would require only "reducing the FP64 operations themselves" (algorithmic rewrites that change the arithmetic);
+scheduling, memory access and occupancy have all been tried and are exhausted.

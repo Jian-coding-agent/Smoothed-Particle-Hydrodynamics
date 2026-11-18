@@ -2,7 +2,7 @@
 
 **A 3D SPH fluid–structure interaction solver: a reference CPU implementation and a validated CUDA port.**
 
-[中文](README.zh-CN.md) · English
+English documentation
 
 ---
 
@@ -113,7 +113,7 @@ cpu/                     reference solver: 1.cpp, CMake project, build scripts
 cuda/                    CUDA port: src/, CMakeLists.txt, build.bat
   docs/DESIGN.md         design, porting notes, validation, performance analysis
 docs/
-  CUDA_PORT_ANALYSIS.md  source analysis and porting plan (Chinese)
+  CUDA_PORT_ANALYSIS.md  source analysis and porting plan
 ```
 
 ## Documentation
@@ -121,7 +121,7 @@ docs/
 | document | contents |
 |---|---|
 | [`cuda/docs/DESIGN.md`](cuda/docs/DESIGN.md) | algorithm mapping, precision template, validation, measured performance, remaining work |
-| [`docs/CUDA_PORT_ANALYSIS.md`](docs/CUDA_PORT_ANALYSIS.md) | analysis of `1.cpp` and the initial porting plan (Chinese) |
+| [`docs/CUDA_PORT_ANALYSIS.md`](docs/CUDA_PORT_ANALYSIS.md) | analysis of `1.cpp` and the initial porting plan |
 | [`cuda/README.md`](cuda/README.md) | CUDA build, run options, diagnostics |
 | [`cpu/README.md`](cpu/README.md) | CPU project, build matrix, troubleshooting |
 | [`cpu/QUICKSTART.txt`](cpu/QUICKSTART.txt) | one-page CPU quick start |

@@ -5,7 +5,7 @@
     {
       "name": "vs2019-x64",
       "displayName": "Visual Studio 2019 x64 (v142, C++17)",
-      "description": "等同于在 build 目录里执行 cmake ..",
+      "description": "Equivalent to running cmake .. from the build directory",
       "generator": "Visual Studio 16 2019",
       "architecture": "x64",
       "toolset": "v142",
@@ -14,7 +14,7 @@
     {
       "name": "vs2019-x64-cxx20",
       "displayName": "Visual Studio 2019 x64 (v142, C++20)",
-      "description": "同上，但使用 /std:c++20（需 VS2019 16.11+）",
+      "description": "Same as above, but with /std:c++20 (requires VS2019 16.11+)",
       "inherits": "vs2019-x64",
       "binaryDir": "${sourceDir}/build-cxx20",
       "cacheVariables": { "SPH_USE_CXX20": "ON" }
