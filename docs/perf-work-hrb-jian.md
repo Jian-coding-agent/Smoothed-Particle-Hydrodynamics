@@ -6,7 +6,7 @@
 | Machine | RTX 5080 (`sm_120`, 84 SMs, 16 GB), CUDA 13.3, Windows 11, MSVC 2022 |
 | Case | `input.dat`: 237 298 particles (101 250 fluid, 60 320 solid, 75 728 wall), `dt = 1e-5`, 11.10 M neighbour pairs at t=0 |
 | Baseline | `d284042` (the build Claude reviewed), measured in the same session on the same machine |
-| Companion | [`docs/work-2026-11-19-12-19`](../work-2026-11-19-12-19/README.md) — correctness side of the same change |
+| Companion | [`docs/edit-2026-11-19-12-19`](edit-2026-11-19-12-19.md) — correctness side of the same change |
 
 All numbers are milliseconds per time step unless stated otherwise, measured
 with `SPH_BENCH=1` (20 iterations per kernel) and with 500-step runs for the
@@ -161,7 +161,7 @@ A warp that walks step `j` therefore reads 32 consecutive slots from each array
 instead of 32 CSR segments ~89 entries apart.  The fill pass writes the entries
 in the same visiting order as before, so the ELL rewrite itself does not reorder
 any particle's sum.  (The byte-level difference against the pre-change build
-comes from C1's pair set, not from this layout change -- see the work log §3.5.)
+comes from C1's pair set, not from this layout change -- see edit-2026-11-19-12-19.md §3.5.)
 
 ELL pads every particle to the widest one: `width` is the maximum count, taken
 from the count pass, and the fill pass writes directly into the padded layout

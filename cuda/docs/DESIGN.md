@@ -425,7 +425,7 @@ acceleration items A3/A4/A5 (sec. 11, 12) and the post-review work of sec. 13
 
 (The CPU figure was quoted as 211 ms/step in earlier versions of this section.
 Re-measured twice: 81.4 s and 80.7 s for 500 steps, i.e. 163 ms/step, with the
-start-up and the writer separated out in `docs/perf-work-hrb-jian` sec. 10 —
+start-up and the writer separated out in `docs/perf-work-hrb-jian.md` sec. 10 —
 compute alone is 131 ms/step, so the like-for-like ratio to the GPU is 26x for
 fp64 and 80x for fp32.)
 
