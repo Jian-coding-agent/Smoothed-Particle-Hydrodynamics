@@ -7,7 +7,7 @@
 | Toolchain | CUDA 12.2 (`nvcc` V12.2.91), GCC 11.4 as host compiler, CMake bypassed |
 | Case | `input.dat`, 237 298 particles (101 250 fluid, 60 320 solid, 75 728 wall), `dt = 1e-5` |
 | Revisions | `d284042` (base, rebuilt here) vs `98fcf58` (HEAD) |
-| Companion | [`docs/perf-work-hrb-jian`](perf-work-hrb-jian/README.md) — the same change measured on the RTX 5080 / Windows; [`docs/work-2026-11-19-12-19`](work-2026-11-19-12-19/README.md) — correctness side |
+| Companion | [`docs/perf-work-hrb-jian.md`](perf-work-hrb-jian.md) — the same change measured on the RTX 5080 / Windows; [`docs/edit-2026-11-19-12-19.md`](edit-2026-11-19-12-19.md) — correctness side |
 
 This is the independent re-measurement of the P1/P2 change on different hardware
 and a different toolchain: different GPU architecture (sm_89 vs sm_120), Linux
@@ -152,7 +152,7 @@ bench reads the fused kernel ~6 % cheap; the step-level numbers are the reliable
 | peak device memory | 1050 MiB fp64 (base 966 MiB): ELL 402.2 MB fp64 / 211.7 MB fp32 + 77.8 MB fluid list |
 
 Not done here: racecheck (only memcheck), the fp32 `A = I` refusal path, and the
-two bad-deck input-validation cases; those are covered by the work log on the
+two bad-deck input-validation cases; those are covered by `docs/edit-2026-11-19-12-19.md` on the
 5080 and no code changed since.
 
 ## 7. CPU reference baseline (same machine, same deck)
@@ -179,7 +179,7 @@ sections of the loop):
   in bulk with `to_chars` (A2). Output is 12 % of the CPU wall clock and 47 % of
   the GPU fp32 wall clock.
 - The 5080 log now quotes **163 ms/step of wall clock** on its 9950X
-  (131 ms/step of compute, `docs/perf-work-hrb-jian` §10). The same source on
+  (131 ms/step of compute, `docs/perf-work-hrb-jian.md` §10). The same source on
   this machine is 77–85 ms/step of compute, 89–97 ms/step of wall, so the
   4090/CPU ratio here is 20.5x rather than their 33x. The CPU side is the
   difference, not the GPU: a GCC `-O3` build against MSVC `/fp:precise` is worth
