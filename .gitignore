@@ -27,3 +27,6 @@ NEXT_SESSION.md
 # OS clutter
 Thumbs.db
 .DS_Store
+
+# Local archive: pre-restructure duplicates and build output
+_legacy/
