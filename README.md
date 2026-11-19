@@ -37,6 +37,12 @@ summation order, so `p` varies by up to ~1e-3 Pa between runs -- that is the noi
 floor any GPU-vs-CPU comparison has to be read against
 ([`docs/algorithm-cpu-vs-gpu.md`](docs/algorithm-cpu-vs-gpu.md) sec. 7.6).
 
+> The CUDA figures above are from the fixed-case build (237 298 particles, text
+> I/O).  The current port is runtime-sized -- counts and the neighbour grid come
+> from the deck -- and reads/writes a self-describing binary container; the
+> new-case (1 203 508 particles) measurements are in
+> [`cuda/docs/BINARY_IO.md`](cuda/docs/BINARY_IO.md).
+
 ## How it works
 
 The port keeps the reference scheme unchanged and reorganises it for the GPU:

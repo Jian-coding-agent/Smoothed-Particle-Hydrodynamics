@@ -16,7 +16,7 @@
 // ============================================================================
 #include "sph.h"
 
-#define N SPH_NUM
+#define N (s.d.num)
 
 // C8: number of particles whose gradient-correction matrix is singular and fell
 // back to A = I (k_gra_invert).  Declared here so the kernel below can bump it;
@@ -65,20 +65,20 @@ __device__ __forceinline__ void sph_neigh(const SphPtrsT<Real>& s, int p,
     const Real r2max = (Real(3.0) * Real(SPH_HSML)) * (Real(3.0) * Real(SPH_HSML));
     const float lim2 = (float)r2max * 1.0001f;
     const float f0p = (float)xp0, f1p = (float)xp1, f2p = (float)xp2;
-    const int c = sph_cell(xp0, xp1, xp2);
-    const int ix = c % SPH_NX;
-    const int iy = (c / SPH_NX) % SPH_NY;
-    const int iz = c / (SPH_NX * SPH_NY);
+    const int c = sph_cell(s, xp0, xp1, xp2);
+    const int ix = c % s.d.nx;
+    const int iy = (c / s.d.nx) % s.d.ny;
+    const int iz = c / (s.d.nx * s.d.ny);
     for (int dz = -1; dz <= 1; ++dz)
     {
-        const int jz = iz + dz; if (jz < 0 || jz >= SPH_NZ) continue;
+        const int jz = iz + dz; if (jz < 0 || jz >= s.d.nz) continue;
         for (int dy = -1; dy <= 1; ++dy)
         {
-            const int jy = iy + dy; if (jy < 0 || jy >= SPH_NY) continue;
+            const int jy = iy + dy; if (jy < 0 || jy >= s.d.ny) continue;
             for (int dx = -1; dx <= 1; ++dx)
             {
-                const int jx = ix + dx; if (jx < 0 || jx >= SPH_NX) continue;
-                const int c2 = (jz * SPH_NY + jy) * SPH_NX + jx;
+                const int jx = ix + dx; if (jx < 0 || jx >= s.d.nx) continue;
+                const int c2 = (jz * s.d.ny + jy) * s.d.nx + jx;
                 const int a0 = s.cellStart[c2];
                 const int a1 = s.cellStart[c2 + 1];
                 for (int a = a0; a < a1; ++a)
@@ -111,19 +111,19 @@ __device__ __forceinline__ void sph_neigh(const SphPtrsT<Real>& s, int p,
 template <class Real, class F>
 __device__ __forceinline__ void sph_neigh_cells(const SphPtrsT<Real>& s, int c, F&& body)
 {
-    const int ix = c % SPH_NX;
-    const int iy = (c / SPH_NX) % SPH_NY;
-    const int iz = c / (SPH_NX * SPH_NY);
+    const int ix = c % s.d.nx;
+    const int iy = (c / s.d.nx) % s.d.ny;
+    const int iz = c / (s.d.nx * s.d.ny);
     for (int dz = -1; dz <= 1; ++dz)
     {
-        const int jz = iz + dz; if (jz < 0 || jz >= SPH_NZ) continue;
+        const int jz = iz + dz; if (jz < 0 || jz >= s.d.nz) continue;
         for (int dy = -1; dy <= 1; ++dy)
         {
-            const int jy = iy + dy; if (jy < 0 || jy >= SPH_NY) continue;
+            const int jy = iy + dy; if (jy < 0 || jy >= s.d.ny) continue;
             for (int dx = -1; dx <= 1; ++dx)
             {
-                const int jx = ix + dx; if (jx < 0 || jx >= SPH_NX) continue;
-                const int c2 = (jz * SPH_NY + jy) * SPH_NX + jx;
+                const int jx = ix + dx; if (jx < 0 || jx >= s.d.nx) continue;
+                const int c2 = (jz * s.d.ny + jy) * s.d.nx + jx;
                 const int a0 = s.cellStart[c2];
                 const int a1 = s.cellStart[c2 + 1];
                 for (int a = a0; a < a1; ++a) body(s.sorted[a]);
@@ -140,8 +140,8 @@ __global__ void k_cell_hist(SphPtrsT<Real> s, int* __restrict__ cnt,
                             int* __restrict__ csolid, int* __restrict__ cfluid)
 {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NUM) return;
-    const int c = sph_cell(s.x[p], s.x[N + p], s.x[2 * N + p]);
+    if (p >= s.d.num) return;
+    const int c = sph_cell(s, s.x[p], s.x[N + p], s.x[2 * N + p]);
     atomicAdd(&cnt[c], 1);
     if (s.itype[p] < Real(-10.0)) atomicAdd(&csolid[c], 1);
     if (s.itype[p] > Real(0.0))   atomicAdd(&cfluid[c], 1);
@@ -155,11 +155,11 @@ template <class Real>
 __global__ void k_build_solid_pack(SphPtrsT<Real> s, int base)
 {
     const int p = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NALL) return;
-    const int k = p - SPH_NTOTAL;
+    if (p >= s.d.nall) return;
+    const int k = p - s.d.ntotal;
     Real* d = s.solidPack + (size_t)k * 14;
     d[0] = s.X0[p]; d[1] = s.X0[N + p]; d[2] = s.X0[2 * N + p];
-    for (int c = 0; c < 9; ++c) d[3 + c] = s.A[(size_t)c * SPH_NUM + p];
+    for (int c = 0; c < 9; ++c) d[3 + c] = s.A[(size_t)c * s.d.num + p];
     d[12] = s.rho0[p];
     d[13] = s.mass[p];
 }
@@ -204,18 +204,18 @@ __device__ __forceinline__ bool solid_pair_geom(const SphPtrsT<Real>& s, int q,
 template <class Real>
 __global__ void k_solid_pair_count(SphPtrsT<Real> s, int* __restrict__ cnt)
 {
-    const int p = SPH_NTOTAL + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NALL) return;
+    const int p = s.d.ntotal + blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= s.d.nall) return;
 
     const Real Xp0 = s.X0[p], Xp1 = s.X0[N + p], Xp2 = s.X0[2 * N + p];
     int n = 0;
-    sph_neigh_cells(s, sph_cell(Xp0, Xp1, Xp2), [&](int q)
+    sph_neigh_cells(s, sph_cell(s, Xp0, Xp1, Xp2), [&](int q)
     {
         if (q == p || s.itype[q] >= Real(-10.0)) return;
         Real g0x, g0y, g0z;
         if (solid_pair_geom(s, q, Xp0, Xp1, Xp2, g0x, g0y, g0z)) ++n;
     });
-    cnt[p - SPH_NTOTAL] = n;
+    cnt[p - s.d.ntotal] = n;
 }
 
 // pass 2 of 2: write the per-pair constants at slot j*SOLNUM + k (ELL, P2).
@@ -226,10 +226,10 @@ __global__ void k_solid_pair_count(SphPtrsT<Real> s, int* __restrict__ cnt)
 template <class Real>
 __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
 {
-    const int p = SPH_NTOTAL + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NALL) return;
+    const int p = s.d.ntotal + blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= s.d.nall) return;
 
-    const int k = p - SPH_NTOTAL;
+    const int k = p - s.d.ntotal;
     const Real Xp0 = s.X0[p], Xp1 = s.X0[N + p], Xp2 = s.X0[2 * N + p];
     const Real Ap0 = s.A[p],         Ap1 = s.A[N + p],     Ap2 = s.A[2 * N + p];
     const Real Ap3 = s.A[3 * N + p], Ap4 = s.A[4 * N + p], Ap5 = s.A[5 * N + p];
@@ -237,7 +237,7 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
 
     const size_t L = (size_t)s.sw;              // length of one component array
     int j = 0;
-    sph_neigh_cells(s, sph_cell(Xp0, Xp1, Xp2), [&](int q)
+    sph_neigh_cells(s, sph_cell(s, Xp0, Xp1, Xp2), [&](int q)
     {
         if (q == p || s.itype[q] >= Real(-10.0)) return;
         Real g0x, g0y, g0z;
@@ -257,7 +257,7 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
         const Real Dy = -(Aq3 * Gx + Aq4 * Gy + Aq5 * Gz);
         const Real Dz = -(Aq6 * Gx + Aq7 * Gy + Aq8 * Gz);
 
-        const size_t e = (size_t)j * SPH_SOLNUM + k;
+        const size_t e = (size_t)j * s.d.solnum + k;
         s.sQ[e]      = q;
         s.sG[e]      = Gx; s.sG[L + e]      = Gy; s.sG[2 * L + e]      = Gz;
         s.sB[e]      = Bx; s.sB[L + e]      = By; s.sB[2 * L + e]      = Bz;
@@ -267,55 +267,64 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
     cur[k] = j;
 }
 
-// exclusive scan over SPH_NCELL (single block, 1024 threads, 32 cells/thread),
-// then re-arm the cursor array for the scatter pass
-__global__ void k_cell_scan(int* __restrict__ start, int* __restrict__ cnt)
+// exclusive scan over s.d.ncell, then re-arm the cursor array for the scatter
+// pass.  One 1024-thread block walks the cells in chunks of 1024*32 and carries
+// the running total across chunks, so the grid may be any size (the new deck
+// needs 188552 cells; the old case needed 32076, hence the old static_assert).
+__global__ void k_cell_scan(int* __restrict__ start, int* __restrict__ cnt, int ncell)
 {
-    const int T = 1024;
-    const int C = 32;                       // SPH_NCELL = 32076 <= T*C
-    static_assert(SPH_NCELL <= 1024 * 32, "k_cell_scan covers at most 1024*32 cells; enlarge it with the grid");
-    __shared__ int sh[1024];
+    const int T = 512;
+    const int C = 32;                       // cells per thread per chunk
+    __shared__ int sh[512];
+    __shared__ int carry_sh;
     const int t = threadIdx.x;
-
-    int own = 0;
-    for (int k = 0; k < C; ++k)
+    int carry = 0;
+    for (int base = 0; base < ncell; base += T * C)
     {
-        const int c = t * C + k;
-        if (c < SPH_NCELL) own += cnt[c];
-    }
-    sh[t] = own;
-    __syncthreads();
-
-    for (int off = 1; off < T; off <<= 1)
-    {
-        const int v = (t >= off) ? sh[t - off] : 0;
-        __syncthreads();
-        sh[t] += v;
-        __syncthreads();
-    }
-
-    int run = sh[t] - own;
-    for (int k = 0; k < C; ++k)
-    {
-        const int c = t * C + k;
-        if (c < SPH_NCELL)
+        int own = 0;
+        for (int k = 0; k < C; ++k)
         {
-            const int v = cnt[c];
-            start[c] = run;
-            cnt[c] = run;
-            run += v;
+            const int c = base + t * C + k;
+            if (c < ncell) own += cnt[c];
         }
+        sh[t] = own;
+        __syncthreads();
+
+        for (int off = 1; off < T; off <<= 1)
+        {
+            const int v = (t >= off) ? sh[t - off] : 0;
+            __syncthreads();
+            sh[t] += v;
+            __syncthreads();
+        }
+
+        int run = carry + sh[t] - own;
+        for (int k = 0; k < C; ++k)
+        {
+            const int c = base + t * C + k;
+            if (c < ncell)
+            {
+                const int v = cnt[c];
+                start[c] = run;
+                cnt[c] = run;
+                run += v;
+            }
+        }
+        __syncthreads();
+        if (t == T - 1) carry_sh = carry + sh[T - 1];
+        __syncthreads();
+        carry = carry_sh;
     }
-    if (t == T - 1) start[SPH_NCELL] = sh[T - 1];
+    if (t == 0) start[ncell] = carry;
 }
 
 // deterministic order inside each cell (insertion sort by particle index).
 // Without it the neighbour sum order follows the atomic scatter arrival order,
 // so runs are not bit-identical and an optimisation cannot be verified by bits.
-__global__ void k_cell_sort(const int* __restrict__ start, int* __restrict__ sorted)
+__global__ void k_cell_sort(const int* __restrict__ start, int* __restrict__ sorted, int ncell)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= SPH_NCELL) return;
+    if (c >= ncell) return;
     const int a0 = start[c], a1 = start[c + 1];
     for (int a = a0 + 1; a < a1; ++a)
     {
@@ -330,8 +339,8 @@ template <class Real>
 __global__ void k_cell_scatter(SphPtrsT<Real> s, int* __restrict__ cursor)
 {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NUM) return;
-    const int c = sph_cell(s.x[p], s.x[N + p], s.x[2 * N + p]);
+    if (p >= s.d.num) return;
+    const int c = sph_cell(s, s.x[p], s.x[N + p], s.x[2 * N + p]);
     const int pos = atomicAdd(&cursor[c], 1);
     s.sorted[pos] = p;
 }
@@ -341,7 +350,7 @@ template <class Real>
 __global__ void k_nbr_count(SphPtrsT<Real> s, int* __restrict__ out)
 {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NUM) return;
+    if (p >= s.d.num) return;
     int n = 0;
     sph_neigh(s, p, s.x[p], s.x[N + p], s.x[2 * N + p],
               [&](int, Real, Real, Real, Real) { n += 1; });
@@ -364,7 +373,7 @@ template <class Real>
 __global__ void k_count_pairs(SphPtrsT<Real> s, int* __restrict__ niac)
 {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NUM) return;
+    if (p >= s.d.num) return;
     int n = 0;
     sph_neigh(s, p, s.x[p], s.x[N + p], s.x[2 * N + p],
               [&](int, Real, Real, Real, Real) { n += 1; });
@@ -381,14 +390,14 @@ template <class Real, bool SCATTER>
 __global__ void k_bench_loads(SphPtrsT<Real> s, Real* __restrict__ out)
 {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NTOTAL) return;
+    if (p >= s.d.ntotal) return;
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
     Real acc = Real(0.0);
     int it = 0;
     sph_neigh2(s, p, xp0, xp1, xp2, [&](int q, Real, Real, Real, Real)
     {
         int base = p + (it & 7); ++it;
-        const int icoal = (base >= SPH_NUM) ? (base - SPH_NUM) : base;
+        const int icoal = (base >= s.d.num) ? (base - s.d.num) : base;
         const int idx = SCATTER ? q : icoal;
         acc += s.x[idx] + s.x[N + idx] + s.x[2 * N + idx]
              + s.vx[idx] + s.vx[N + idx] + s.vx[2 * N + idx]
@@ -409,20 +418,20 @@ __device__ __forceinline__ void sph_neigh2(const SphPtrsT<Real>& s, int p,
     const Real r2max = (Real(3.0) * Real(SPH_HSML)) * (Real(3.0) * Real(SPH_HSML));
     const float lim2 = (float)r2max * 1.0001f;      // A4 pre-filter, see sph_neigh
     const float f0p = (float)xp0, f1p = (float)xp1, f2p = (float)xp2;
-    const int c = sph_cell(xp0, xp1, xp2);
-    const int ix = c % SPH_NX;
-    const int iy = (c / SPH_NX) % SPH_NY;
-    const int iz = c / (SPH_NX * SPH_NY);
+    const int c = sph_cell(s, xp0, xp1, xp2);
+    const int ix = c % s.d.nx;
+    const int iy = (c / s.d.nx) % s.d.ny;
+    const int iz = c / (s.d.nx * s.d.ny);
     for (int dz = -1; dz <= 1; ++dz)
     {
-        const int jz = iz + dz; if (jz < 0 || jz >= SPH_NZ) continue;
+        const int jz = iz + dz; if (jz < 0 || jz >= s.d.nz) continue;
         for (int dy = -1; dy <= 1; ++dy)
         {
-            const int jy = iy + dy; if (jy < 0 || jy >= SPH_NY) continue;
+            const int jy = iy + dy; if (jy < 0 || jy >= s.d.ny) continue;
             for (int dx = -1; dx <= 1; ++dx)
             {
-                const int jx = ix + dx; if (jx < 0 || jx >= SPH_NX) continue;
-                const int c2 = (jz * SPH_NY + jy) * SPH_NX + jx;
+                const int jx = ix + dx; if (jx < 0 || jx >= s.d.nx) continue;
+                const int c2 = (jz * s.d.ny + jy) * s.d.nx + jx;
                 const int a0 = s.cellStart[c2];
                 const int a1 = s.cellStart[c2 + 1];
                 int a = a0;
@@ -473,7 +482,7 @@ template <class Real>
 __global__ void k_prepare(SphPtrsT<Real> s)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= SPH_NUM) return;
+    if (i >= s.d.num) return;
     const Real C0 = Real(SPH_C0);
     s.SurFD[i] = s.SurF[i];
     Real pi_ = C0 * C0 * (s.rho[i] - Real(1000.0));
@@ -492,7 +501,7 @@ template <class Real>
 __global__ void __launch_bounds__(256, 4) k_pass1_fluid(SphPtrsT<Real> s)
 {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NTOTAL) return;
+    if (p >= s.d.ntotal) return;
 
     const Real C0   = Real(SPH_C0);
     const Real HS   = Real(SPH_HSML);
@@ -606,13 +615,13 @@ template <class Real>
 __global__ void k_fluid_nbr_build(SphPtrsT<Real> s)
 {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NTOTAL) return;
+    if (p >= s.d.ntotal) return;
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
     const int W = s.fwidth;
     int n = 0;
     sph_neigh2(s, p, xp0, xp1, xp2, [&](int q, Real, Real, Real, Real)
     {
-        if (n < W) s.fnbr[(size_t)n * SPH_NTOTAL + p] = q;
+        if (n < W) s.fnbr[(size_t)n * s.d.ntotal + p] = q;
         ++n;
     });
     s.fcnt[p] = (n <= W) ? n : -1;
@@ -627,7 +636,7 @@ template <class Real, bool USE_LIST>
 __global__ void __launch_bounds__(256, 4) k_pass1_fluid_body(SphPtrsT<Real> s)
 {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NTOTAL) return;
+    if (p >= s.d.ntotal) return;
 
     const Real C0   = Real(SPH_C0);
     const Real HS   = Real(SPH_HSML);
@@ -712,7 +721,7 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid_body(SphPtrsT<Real> s)
         {
             for (int j = 0; j < n; ++j)
             {
-                const int q = s.fnbr[(size_t)j * SPH_NTOTAL + p];
+                const int q = s.fnbr[(size_t)j * s.d.ntotal + p];
                 const Real d0 = xp0 - s.x[q];
                 const Real d1 = xp1 - s.x[N + q];
                 const Real d2 = xp2 - s.x[2 * N + q];
@@ -751,7 +760,7 @@ __global__ void k_pass1_solid(SphPtrsT<Real> s, int base)
     const Real invh = sph_inv_h<Real>();
 
     const int p = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NALL) return;
+    if (p >= s.d.nall) return;
 
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
     const Real vi0 = s.vx[p], vi1 = s.vx[N + p], vi2 = s.vx[2 * N + p];
@@ -784,8 +793,8 @@ __global__ void k_pass1_solid(SphPtrsT<Real> s, int base)
 
         // solidPack only covers [NTOTAL, NALL); particles outside that range can
         // still carry itype < -10 (they then have A = 0, exactly as in 1.cpp)
-        const int kq = q - SPH_NTOTAL;
-        const bool inpack = (kq >= 0) && (kq < SPH_SOLNUM);
+        const int kq = q - s.d.ntotal;
+        const bool inpack = (kq >= 0) && (kq < s.d.solnum);
         const Real* pk = s.solidPack + (size_t)(inpack ? kq : 0) * 14;
         const Real qX0 = inpack ? pk[0] : s.X0[q];
         const Real qX1 = inpack ? pk[1] : s.X0[N + q];
@@ -843,8 +852,8 @@ __global__ void k_pass1_solid(SphPtrsT<Real> s, int base)
 template <class Real>
 __global__ void k_pass1_solid_static(SphPtrsT<Real> s)
 {
-    const int p = SPH_NTOTAL + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NALL) return;
+    const int p = s.d.ntotal + blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= s.d.nall) return;
 
     const bool lowp = (sizeof(Real) < sizeof(double));
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
@@ -860,12 +869,12 @@ __global__ void k_pass1_solid_static(SphPtrsT<Real> s)
     Real D21 = Real(0.0), D22 = Real(0.0), D23 = Real(0.0);
     Real D31 = Real(0.0), D32 = Real(0.0), D33 = Real(0.0);
 
-    const int k = p - SPH_NTOTAL;
+    const int k = p - s.d.ntotal;
     const int n = s.sCnt[k];
     const size_t L = (size_t)s.sw;
     for (int j = 0; j < n; ++j)
     {
-        const size_t e = (size_t)j * SPH_SOLNUM + k;
+        const size_t e = (size_t)j * s.d.solnum + k;
         const int q = s.sQ[e];
         const Real bx = s.sB[e], by = s.sB[L + e], bz = s.sB[2 * L + e];
         const Real gx = s.sG[e], gy = s.sG[L + e], gz = s.sG[2 * L + e];
@@ -902,7 +911,7 @@ template <class Real>
 __global__ void k_constitution(SphPtrsT<Real> s, int base)
 {
     const int p = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NALL) return;
+    if (p >= s.d.nall) return;
 
     // Evaluated in double for BOTH precisions (C = calculation type).  For Real =
     // double nothing changes.  For Real = float: the law is ill conditioned
@@ -989,7 +998,7 @@ __global__ void k_constitution(SphPtrsT<Real> s, int base)
     const C t31 = n13, t32 = n23, t33 = n33;
 
     const C lg = log10(Jacb);
-    Real* pb = s.Pia + (size_t)(p - SPH_NTOTAL) * SPH_PIA_STRIDE;
+    Real* pb = s.Pia + (size_t)(p - s.d.ntotal) * SPH_PIA_STRIDE;
     pb[0] = Real(MU * (F11 - t11) + LA * lg * t11 + PD11);
     pb[1] = Real(MU * (F12 - t12) + LA * lg * t12 + PD12);
     pb[2] = Real(MU * (F13 - t13) + LA * lg * t13 + PD13);
@@ -1010,25 +1019,25 @@ __global__ void k_pass2_fluid(SphPtrsT<Real> s)
     const Real invh = sph_inv_h<Real>();
 
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NTOTAL) return;
+    if (p >= s.d.ntotal) return;
 
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
 
     // no solid anywhere in the 27-cell neighbourhood -> this pass has nothing to do
     {
-        const int c = sph_cell(xp0, xp1, xp2);
-        const int ix = c % SPH_NX, iy = (c / SPH_NX) % SPH_NY, iz = c / (SPH_NX * SPH_NY);
+        const int c = sph_cell(s, xp0, xp1, xp2);
+        const int ix = c % s.d.nx, iy = (c / s.d.nx) % s.d.ny, iz = c / (s.d.nx * s.d.ny);
         int any = 0;
         for (int dz = -1; dz <= 1 && !any; ++dz)
         {
-            const int jz = iz + dz; if (jz < 0 || jz >= SPH_NZ) continue;
+            const int jz = iz + dz; if (jz < 0 || jz >= s.d.nz) continue;
             for (int dy = -1; dy <= 1 && !any; ++dy)
             {
-                const int jy = iy + dy; if (jy < 0 || jy >= SPH_NY) continue;
+                const int jy = iy + dy; if (jy < 0 || jy >= s.d.ny) continue;
                 for (int dx = -1; dx <= 1; ++dx)
                 {
-                    const int jx = ix + dx; if (jx < 0 || jx >= SPH_NX) continue;
-                    if (s.cellSolid[(jz * SPH_NY + jy) * SPH_NX + jx]) { any = 1; break; }
+                    const int jx = ix + dx; if (jx < 0 || jx >= s.d.nx) continue;
+                    if (s.cellSolid[(jz * s.d.ny + jy) * s.d.nx + jx]) { any = 1; break; }
                 }
             }
         }
@@ -1076,7 +1085,7 @@ __global__ void k_pass2_solid(SphPtrsT<Real> s, int base)
     const Real invh = sph_inv_h<Real>();
 
     const int p = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NALL) return;
+    if (p >= s.d.nall) return;
 
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
     const Real rhoi = s.rho[p];
@@ -1086,7 +1095,7 @@ __global__ void k_pass2_solid(SphPtrsT<Real> s, int base)
     // compiler cannot hoist the loads (it cannot prove Pia/PIJW do not alias), and
     // the loop ended up issuing 64 scattered 64-bit loads per neighbour.
     typedef typename SphVec2T<Real>::type V2;
-    const Real* pbp = s.Pia + (size_t)(p - SPH_NTOTAL) * SPH_PIA_STRIDE;
+    const Real* pbp = s.Pia + (size_t)(p - s.d.ntotal) * SPH_PIA_STRIDE;
     const V2* vp = reinterpret_cast<const V2*>(pbp);
     const Real P00 = vp[0].x, P01 = vp[0].y;
     const Real P02 = vp[1].x, P10 = vp[1].y;
@@ -1105,8 +1114,8 @@ __global__ void k_pass2_solid(SphPtrsT<Real> s, int base)
     {
         const Real mq = s.mass[q], rhoq = s.rho[q];
 
-        const int kq = q - SPH_NTOTAL;
-        const bool inpack = (kq >= 0) && (kq < SPH_SOLNUM);
+        const int kq = q - s.d.ntotal;
+        const bool inpack = (kq >= 0) && (kq < s.d.solnum);
         const Real* pk = s.solidPack + (size_t)(inpack ? kq : 0) * 14;
         const Real qX0 = inpack ? pk[0] : s.X0[q];
         const Real qX1 = inpack ? pk[1] : s.X0[N + q];
@@ -1140,7 +1149,7 @@ __global__ void k_pass2_solid(SphPtrsT<Real> s, int base)
             }
             else
             {
-                sph_matvec(s.A, q, -g0x, -g0y, -g0z, vj0, vj1, vj2);
+                sph_matvec(s, s.A, q, -g0x, -g0y, -g0z, vj0, vj1, vj2);
             }
 
             const Real Pi0 = P00 * vi0 + P01 * vi1 + P02 * vi2;
@@ -1215,15 +1224,15 @@ __global__ void k_pass2_solid_static(SphPtrsT<Real> s)
 {
     const Real invh = sph_inv_h<Real>();
 
-    const int p = SPH_NTOTAL + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NALL) return;
+    const int p = s.d.ntotal + blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= s.d.nall) return;
 
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
     const Real rhoi = s.rho[p];
     const Real vn0 = s.vecn[p], vn1 = s.vecn[N + p], vn2 = s.vecn[2 * N + p];
 
     typedef typename SphVec2T<Real>::type V2;
-    const Real* pbp = s.Pia + (size_t)(p - SPH_NTOTAL) * SPH_PIA_STRIDE;
+    const Real* pbp = s.Pia + (size_t)(p - s.d.ntotal) * SPH_PIA_STRIDE;
     const V2* vp = reinterpret_cast<const V2*>(pbp);
     const Real P00 = vp[0].x, P01 = vp[0].y;
     const Real P02 = vp[1].x, P10 = vp[1].y;
@@ -1238,20 +1247,20 @@ __global__ void k_pass2_solid_static(SphPtrsT<Real> s)
     Real u10 = Real(0.0), u11 = Real(0.0), u12 = Real(0.0);   // sum vol_q g0
     Real t0 = Real(0.0), t1 = Real(0.0), t2 = Real(0.0);      // sum vol_q Pia_q A_q(-g0)
 
-    const int k = p - SPH_NTOTAL;
+    const int k = p - s.d.ntotal;
     const int n = s.sCnt[k];
     const size_t L = (size_t)s.sw;
     for (int j = 0; j < n; ++j)
     {
-        const size_t e = (size_t)j * SPH_SOLNUM + k;
+        const size_t e = (size_t)j * s.d.solnum + k;
         const int q = s.sQ[e];
         const Real kq3 = s.rho0[q] * s.irho[q];               // rho0_q / rho_q
         u10 += kq3 * s.sG[e];
         u11 += kq3 * s.sG[L + e];
         u12 += kq3 * s.sG[2 * L + e];
 
-        const int kq = q - SPH_NTOTAL;
-        if (kq < 0 || kq >= SPH_SOLNUM) continue;             // no Pia for those
+        const int kq = q - s.d.ntotal;
+        if (kq < 0 || kq >= s.d.solnum) continue;             // no Pia for those
         const Real f0 = kq3 * s.sD[e], f1 = kq3 * s.sD[L + e], f2 = kq3 * s.sD[2 * L + e];
         const V2* vq = reinterpret_cast<const V2*>(s.Pia + (size_t)kq * SPH_PIA_STRIDE);
         const Real q00 = vq[0].x, q01 = vq[0].y;
@@ -1274,19 +1283,19 @@ __global__ void k_pass2_solid_static(SphPtrsT<Real> s)
     // ---------------- fluid / solid : SForce, live cell list -------------------
     Real a0x = Real(0.0), a1x = Real(0.0), a2x = Real(0.0);
     {
-        const int c = sph_cell(xp0, xp1, xp2);
-        const int ix = c % SPH_NX, iy = (c / SPH_NX) % SPH_NY, iz = c / (SPH_NX * SPH_NY);
+        const int c = sph_cell(s, xp0, xp1, xp2);
+        const int ix = c % s.d.nx, iy = (c / s.d.nx) % s.d.ny, iz = c / (s.d.nx * s.d.ny);
         int any = 0;
         for (int dz = -1; dz <= 1 && !any; ++dz)
         {
-            const int jz = iz + dz; if (jz < 0 || jz >= SPH_NZ) continue;
+            const int jz = iz + dz; if (jz < 0 || jz >= s.d.nz) continue;
             for (int dy = -1; dy <= 1 && !any; ++dy)
             {
-                const int jy = iy + dy; if (jy < 0 || jy >= SPH_NY) continue;
+                const int jy = iy + dy; if (jy < 0 || jy >= s.d.ny) continue;
                 for (int dx = -1; dx <= 1; ++dx)
                 {
-                    const int jx = ix + dx; if (jx < 0 || jx >= SPH_NX) continue;
-                    if (s.cellFluid[(jz * SPH_NY + jy) * SPH_NX + jx]) { any = 1; break; }
+                    const int jx = ix + dx; if (jx < 0 || jx >= s.d.nx) continue;
+                    if (s.cellFluid[(jz * s.d.ny + jy) * s.d.nx + jx]) { any = 1; break; }
                 }
             }
         }
@@ -1330,7 +1339,7 @@ template <class Real>
 __global__ void k_copy_xf(SphPtrsT<Real> s)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= SPH_NUM) return;
+    if (i >= s.d.num) return;
     s.xf[i]         = (float)s.x[i];
     s.xf[N + i]     = (float)s.x[N + i];
     s.xf[2 * N + i] = (float)s.x[2 * N + i];
@@ -1343,7 +1352,7 @@ template <class Real>
 __global__ void k_update_fluid(SphPtrsT<Real> s)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= SPH_NTOTAL) return;
+    if (i >= s.d.ntotal) return;
 
     const Real dt = Real(SPH_DT);
     const Real GRAV = Real(9.8);
@@ -1377,6 +1386,9 @@ __global__ void k_update_fluid(SphPtrsT<Real> s)
         v1 = Real(SPH_MAXV) * v1 / absv;
         v2 = Real(SPH_MAXV) * v2 / absv;
     }
+    // 1.cpp:186 -- reflect the vertical velocity at the free surface.
+    // Same place in the sequence: after the MaxV clamp, before the store.
+    if (s.x[2 * N + i] > Real(1.0)) v2 = -v2;
     s.vx[i] = v0; s.vx[N + i] = v1; s.vx[2 * N + i] = v2;
 }
 
@@ -1384,7 +1396,7 @@ template <class Real>
 __global__ void k_update_solid(SphPtrsT<Real> s, int base)
 {
     const int i = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= SPH_NALL) return;
+    if (i >= s.d.nall) return;
 
     const Real dt = Real(SPH_DT);
     const Real GRAV = Real(9.8);
@@ -1393,10 +1405,8 @@ __global__ void k_update_solid(SphPtrsT<Real> s, int base)
     Real v1 = s.vx[N + i]     + dt * s.PIJW[N + i]     + dt * s.SForce[N + i];
     Real v2 = s.vx[2 * N + i] + dt * s.PIJW[2 * N + i] + dt * s.SForce[2 * N + i] - dt * GRAV;
 
-    if (s.x[2 * N + i] <= Real(0.01) || s.x[N + i] <= Real(0.01) || s.x[N + i] >= Real(0.49))
-    {
-        v0 = Real(0.0); v1 = Real(0.0); v2 = Real(0.0);
-    }
+    // New case (1.cpp): the old test-only box clamp is commented out there
+    // (it froze the plate); the solid now deforms freely.
     s.vx[i] = v0; s.vx[N + i] = v1; s.vx[2 * N + i] = v2;
 }
 
@@ -1404,7 +1414,7 @@ template <class Real>
 __global__ void k_update_pos(SphPtrsT<Real> s)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= SPH_NUM) return;
+    if (i >= s.d.num) return;
     const Real dt = Real(SPH_DT);
     if (sizeof(Real) < sizeof(double))
     {
@@ -1443,7 +1453,7 @@ __global__ void k_nor_sumvecn(SphPtrsT<Real> s, Real* __restrict__ sumvecn)
     const Real invh = sph_inv_h<Real>();
 
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NUM) return;
+    if (p >= s.d.num) return;
     if (s.itype[p] >= Real(0.0)) return;
 
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
@@ -1469,8 +1479,8 @@ template <class Real>
 __global__ void k_nor_normalize(SphPtrsT<Real> s, const Real* __restrict__ sumvecn)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= SPH_NUM) return;
-    if (i < SPH_NTOTAL)
+    if (i >= s.d.num) return;
+    if (i < s.d.ntotal)
     {
         s.vecn[i] = Real(0.0); s.vecn[N + i] = Real(0.0); s.vecn[2 * N + i] = Real(0.0);
     }
@@ -1488,7 +1498,7 @@ __global__ void k_gra_correc(SphPtrsT<Real> s, Real* __restrict__ a, int base)
     const Real invh = sph_inv_h<Real>();
 
     const int p = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= SPH_NALL) return;
+    if (p >= s.d.nall) return;
 
     const Real Xp0 = s.X0[p], Xp1 = s.X0[N + p], Xp2 = s.X0[2 * N + p];
     Real a11 = Real(0.0), a12 = Real(0.0), a13 = Real(0.0);
@@ -1526,7 +1536,7 @@ template <class Real>
 __global__ void k_gra_invert(SphPtrsT<Real> s, const Real* __restrict__ a, int base)
 {
     const int i = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= SPH_NALL) return;
+    if (i >= s.d.nall) return;
 
     const Real a11 = a[i], a12 = a[N + i], a13 = a[2 * N + i];
     const Real a21 = a[3 * N + i], a22 = a[4 * N + i], a23 = a[5 * N + i];
@@ -1584,71 +1594,71 @@ int gra_fallback_count()
 template <class Real>
 void launch_cell_hist(SphPtrsT<Real> s, int* d_count, int* d_solid, int* d_fluid, cudaStream_t st)
 {
-    k_cell_hist<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s, d_count, d_solid, d_fluid);
+    k_cell_hist<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_count, d_solid, d_fluid);
 }
 
 template <class Real>
 void launch_build_solid_pack(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_build_solid_pack<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, SPH_NTOTAL);
+    k_build_solid_pack<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
 }
 
 template <class Real>
 void launch_copy_xf(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_copy_xf<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s);
+    k_copy_xf<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s);
 }
 
 template <class Real>
 void launch_solid_pair_count(SphPtrsT<Real> s, int* d_cnt, cudaStream_t st)
 {
-    k_solid_pair_count<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, d_cnt);
+    k_solid_pair_count<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, d_cnt);
 }
 
 template <class Real>
 void launch_solid_pair_fill(SphPtrsT<Real> s, int* d_cur, cudaStream_t st)
 {
-    k_solid_pair_fill<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, d_cur);
+    k_solid_pair_fill<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, d_cur);
 }
 
 template <class Real>
 void launch_fluid_nbr_build(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_fluid_nbr_build<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+    k_fluid_nbr_build<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
 }
 
 template <class Real>
 void launch_pass1_fluid_over_list(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_pass1_fluid_body<Real, true><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+    k_pass1_fluid_body<Real, true><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
 }
 
-void launch_cell_sort(const int* d_cellStart, int* d_sorted, cudaStream_t st)
+void launch_cell_sort(const int* d_cellStart, int* d_sorted, int ncell, cudaStream_t st)
 {
-    k_cell_sort<<<(SPH_NCELL + BLK - 1) / BLK, BLK, 0, st>>>(d_cellStart, d_sorted);
+    k_cell_sort<<<(ncell + BLK - 1) / BLK, BLK, 0, st>>>(d_cellStart, d_sorted, ncell);
 }
 
-void launch_cell_scan(int* d_cellStart, int* d_count, cudaStream_t st)
+void launch_cell_scan(int* d_cellStart, int* d_count, int ncell, cudaStream_t st)
 {
-    k_cell_scan<<<1, 1024, 0, st>>>(d_cellStart, d_count);
+    k_cell_scan<<<1, 512, 0, st>>>(d_cellStart, d_count, ncell);
 }
 
 template <class Real>
 void launch_cell_scatter(SphPtrsT<Real> s, int* d_cursor, cudaStream_t st)
 {
-    k_cell_scatter<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s, d_cursor);
+    k_cell_scatter<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_cursor);
 }
 
 template <class Real>
 void launch_count_pairs(SphPtrsT<Real> s, int* d_niac, cudaStream_t st)
 {
-    k_count_pairs<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s, d_niac);
+    k_count_pairs<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_niac);
 }
 
 template <class Real>
 void launch_nbr_count(SphPtrsT<Real> s, int* d_out, cudaStream_t st)
 {
-    k_nbr_count<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s, d_out);
+    k_nbr_count<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_out);
 }
 
 template <class Real>
@@ -1660,14 +1670,14 @@ void launch_nbr_list(SphPtrsT<Real> s, int target, int* d_out, int* d_n, cudaStr
 template <class Real>
 void launch_bench_loads(SphPtrsT<Real> s, Real* out, bool scatter, cudaStream_t st)
 {
-    if (scatter) k_bench_loads<Real, true><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s, out);
-    else         k_bench_loads<Real, false><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s, out);
+    if (scatter) k_bench_loads<Real, true><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s, out);
+    else         k_bench_loads<Real, false><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s, out);
 }
 
 template <class Real>
 void launch_prepare(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_prepare<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s);
+    k_prepare<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s);
 }
 
 template <class Real>
@@ -1682,7 +1692,7 @@ void launch_pass1_fluid(SphPtrsT<Real> s, cudaStream_t st)
 {
     if (!sph_fast_fluid_loop)
     {
-        k_pass1_fluid<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+        k_pass1_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
         return;
     }
     // P1: the list pays off only in fp64; fp32 is traversal bound and the fused
@@ -1691,15 +1701,15 @@ void launch_pass1_fluid(SphPtrsT<Real> s, cudaStream_t st)
     {
         if (sph_use_fluid_list && s.fwidth > 0)
         {
-            k_fluid_nbr_build<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
-            k_pass1_fluid_body<Real, true><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+            k_fluid_nbr_build<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
+            k_pass1_fluid_body<Real, true><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
             return;
         }
-        k_pass1_fluid_body<Real, false><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+        k_pass1_fluid_body<Real, false><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
     }
     else
     {
-        k_pass1_fluid_body<Real, false><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+        k_pass1_fluid_body<Real, false><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
     }
 }
 
@@ -1707,48 +1717,48 @@ template <class Real>
 void launch_pass1_solid(SphPtrsT<Real> s, cudaStream_t st)
 {
     if (sph_use_static_solid && s.npair > 0)
-        k_pass1_solid_static<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s);
+        k_pass1_solid_static<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s);
     else
-        k_pass1_solid<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, SPH_NTOTAL);
+        k_pass1_solid<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
 }
 
 template <class Real>
 void launch_pass2_fluid(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_pass2_fluid<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+    k_pass2_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
 }
 
 template <class Real>
 void launch_pass2_solid(SphPtrsT<Real> s, cudaStream_t st)
 {
     if (sph_use_static_solid && s.npair > 0)
-        k_pass2_solid_static<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s);
+        k_pass2_solid_static<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s);
     else
-        k_pass2_solid<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, SPH_NTOTAL);
+        k_pass2_solid<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
 }
 
 template <class Real>
 void launch_update_fluid(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_update_fluid<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
+    k_update_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
 }
 
 template <class Real>
 void launch_update_solid(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_update_solid<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, SPH_NTOTAL);
+    k_update_solid<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
 }
 
 template <class Real>
 void launch_update_pos(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_update_pos<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s);
+    k_update_pos<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s);
 }
 
 template <class Real>
 void launch_constitution(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_constitution<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, SPH_NTOTAL);
+    k_constitution<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
 }
 
 template <class Real>
@@ -1761,33 +1771,33 @@ void launch_pass2(SphPtrsT<Real> s, cudaStream_t st)
 template <class Real>
 void launch_update(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_update_fluid<Real><<<nblocks(SPH_NTOTAL), BLK, 0, st>>>(s);
-    k_update_solid<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, SPH_NTOTAL);
-    k_update_pos<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s);
+    k_update_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
+    k_update_solid<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
+    k_update_pos<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s);
 }
 
 template <class Real>
 void launch_nor_sumvecn(SphPtrsT<Real> s, Real* d_sumvecn, cudaStream_t st)
 {
-    k_nor_sumvecn<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s, d_sumvecn);
+    k_nor_sumvecn<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_sumvecn);
 }
 
 template <class Real>
 void launch_nor_normalize(SphPtrsT<Real> s, Real* d_sumvecn, cudaStream_t st)
 {
-    k_nor_normalize<Real><<<nblocks(SPH_NUM), BLK, 0, st>>>(s, d_sumvecn);
+    k_nor_normalize<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_sumvecn);
 }
 
 template <class Real>
 void launch_gra_correc(SphPtrsT<Real> s, Real* d_a, cudaStream_t st)
 {
-    k_gra_correc<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, d_a, SPH_NTOTAL);
+    k_gra_correc<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, d_a, s.d.ntotal);
 }
 
 template <class Real>
 void launch_gra_invert(SphPtrsT<Real> s, Real* d_a, cudaStream_t st)
 {
-    k_gra_invert<Real><<<nblocks(SPH_SOLNUM), BLK, 0, st>>>(s, d_a, SPH_NTOTAL);
+    k_gra_invert<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, d_a, s.d.ntotal);
 }
 
 // ---------------------------------------------------------------------------

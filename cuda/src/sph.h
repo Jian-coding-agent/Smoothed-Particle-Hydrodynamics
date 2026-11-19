@@ -26,16 +26,25 @@
 #include <cmath>
 
 // ---------------------------------------------------------------------------
-// Problem size (from 1.cpp: num, ntotal, SolNum)
-//   [0, NTOTAL)        fluid       itype =  2
-//   [NTOTAL, NALL)     solid       itype = -20
-//   [NALL, NUM)        wall        itype = -2
+// Runtime problem size.  Everything that used to be a compile-time constant
+// (num / ntotal / solnum and the neighbour grid) now comes from the deck, so
+// one binary runs any case.  The host fills s.d before the first launch; the
+// kernels read it through the SphPtrsT they already receive.
+//   [0, ntotal)        fluid       itype > 0
+//   [ntotal, nall)     solid       itype < -10
+//   [nall, num)        wall        -10 <= itype <= 0
 // ---------------------------------------------------------------------------
-#define SPH_NUM    237298
-#define SPH_NTOTAL 101250
-#define SPH_SOLNUM 60320
-#define SPH_NALL   (SPH_NTOTAL + SPH_SOLNUM)
-#define SPH_NWALL  (SPH_NUM - SPH_NALL)
+struct SphDims
+{
+    int num;        // total particles
+    int ntotal;     // fluid
+    int solnum;     // solid
+    int nall;       // fluid + solid
+    int nwall;      // rigid
+    int nx, ny, nz; // neighbour grid
+    int ncell;
+    double gx0, gy0, gz0;   // grid origin (cell edge = SPH_CS = 3*hsml)
+};
 
 // ---------------------------------------------------------------------------
 // Physical / scheme constants (1.cpp main())
@@ -48,21 +57,8 @@
 #define SPH_MAXV   30.0
 #define SPH_PI_    3.141592653589793
 
-// ---------------------------------------------------------------------------
-// Neighbour grid: fixed domain, cell edge = 3*hsml
-// nx = floor(0.8/0.03)+1 = 27, ny = 27, nz = floor(1.3/0.03)+1 = 44
-// ---------------------------------------------------------------------------
-#define SPH_GX0   (-0.10)
-#define SPH_GY0   (-0.10)
-#define SPH_GZ0   (-0.10)
-#define SPH_GX1   ( 0.70)
-#define SPH_GY1   ( 0.70)
-#define SPH_GZ1   ( 1.20)
+// Neighbour grid: cell edge = 3*hsml, origin/dims computed from the deck.
 #define SPH_CS    (3.0 * SPH_HSML)
-#define SPH_NX    27
-#define SPH_NY    27
-#define SPH_NZ    44
-#define SPH_NCELL (SPH_NX * SPH_NY * SPH_NZ)
 #define SPH_PIA_STRIDE 12
 
 // P1: slots per fluid particle in the neighbour list.  This deck's worst fluid
@@ -88,6 +84,7 @@
 template <class Real>
 struct SphPtrsT
 {
+    SphDims d;      // runtime sizes / grid, filled by the host before any launch
     Real* x;        // [3*NUM]
     Real* vx;       // [3*NUM]
     Real* X0;       // [3*NUM]
@@ -269,24 +266,26 @@ __device__ __forceinline__ Real sph_min(Real mi, Real mj) { return mi >= mj ? mj
 
 // Cell index, with the same clamping as direct_find()
 template <class Real>
-__device__ __forceinline__ int sph_cell(Real x, Real y, Real z)
+__device__ __forceinline__ int sph_cell(const SphPtrsT<Real>& s, Real x, Real y, Real z)
 {
     const Real inv = Real(1.0) / Real(SPH_CS);
-    int ix = (int)floor((x - Real(SPH_GX0)) * inv); if (ix < 0) ix = 0; if (ix >= SPH_NX) ix = SPH_NX - 1;
-    int iy = (int)floor((y - Real(SPH_GY0)) * inv); if (iy < 0) iy = 0; if (iy >= SPH_NY) iy = SPH_NY - 1;
-    int iz = (int)floor((z - Real(SPH_GZ0)) * inv); if (iz < 0) iz = 0; if (iz >= SPH_NZ) iz = SPH_NZ - 1;
-    return (iz * SPH_NY + iy) * SPH_NX + ix;
+    const SphDims& d = s.d;
+    int ix = (int)floor((x - Real(d.gx0)) * inv); if (ix < 0) ix = 0; if (ix >= d.nx) ix = d.nx - 1;
+    int iy = (int)floor((y - Real(d.gy0)) * inv); if (iy < 0) iy = 0; if (iy >= d.ny) iy = d.ny - 1;
+    int iz = (int)floor((z - Real(d.gz0)) * inv); if (iz < 0) iz = 0; if (iz >= d.nz) iz = d.nz - 1;
+    return (iz * d.ny + iy) * d.nx + ix;
 }
 
 // y = M * v  for the component-major 3x3 stored in M at particle i
 template <class Real>
-__device__ __forceinline__ void sph_matvec(const Real* M, int i,
+__device__ __forceinline__ void sph_matvec(const SphPtrsT<Real>& s, const Real* M, int i,
                                            Real v0, Real v1, Real v2,
                                            Real& y0, Real& y1, Real& y2)
 {
-    y0 = M[0 * SPH_NUM + i] * v0 + M[1 * SPH_NUM + i] * v1 + M[2 * SPH_NUM + i] * v2;
-    y1 = M[3 * SPH_NUM + i] * v0 + M[4 * SPH_NUM + i] * v1 + M[5 * SPH_NUM + i] * v2;
-    y2 = M[6 * SPH_NUM + i] * v0 + M[7 * SPH_NUM + i] * v1 + M[8 * SPH_NUM + i] * v2;
+    const int N = s.d.num;
+    y0 = M[0 * N + i] * v0 + M[1 * N + i] * v1 + M[2 * N + i] * v2;
+    y1 = M[3 * N + i] * v0 + M[4 * N + i] * v1 + M[5 * N + i] * v2;
+    y2 = M[6 * N + i] * v0 + M[7 * N + i] * v1 + M[8 * N + i] * v2;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,8 +306,8 @@ extern int sph_use_fluid_list;
 int gra_fallback_count();
 
 template <class Real> void launch_cell_hist(SphPtrsT<Real> s, int* d_count, int* d_solid, int* d_fluid, cudaStream_t st);
-void launch_cell_scan(int* d_cellStart, int* d_count, cudaStream_t st);
-void launch_cell_sort(const int* d_cellStart, int* d_sorted, cudaStream_t st);
+void launch_cell_scan(int* d_cellStart, int* d_count, int ncell, cudaStream_t st);
+void launch_cell_sort(const int* d_cellStart, int* d_sorted, int ncell, cudaStream_t st);
 template <class Real> void launch_cell_scatter(SphPtrsT<Real> s, int* d_cursor, cudaStream_t st);
 template <class Real> void launch_count_pairs(SphPtrsT<Real> s, int* d_niac, cudaStream_t st);
 template <class Real> void launch_nbr_count(SphPtrsT<Real> s, int* d_out, cudaStream_t st);

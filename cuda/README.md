@@ -4,6 +4,14 @@ A GPU (CUDA) port of the three-dimensional SPH fluid-structure interaction solve
 from `1.cpp`.  The solver is templated on the scalar type: the same code runs in
 double (default) or single precision, selected at run time.
 
+> **2026-11-19 revision — one binary, any deck.**  The particle counts and the
+> neighbour grid now come from the deck at start-up; decks are stored in a
+> self-describing `.sphbin` container (the 14-column text deck is still
+> accepted); results are binary `.sphbin` files.  Details, format and the
+> new-case measurements: [`docs/BINARY_IO.md`](docs/BINARY_IO.md).  The
+> fixed-case numbers further down describe the previous build.
+
+
 ## Requirements
 
 | | |
@@ -32,15 +40,25 @@ cmake --build build --config Release
 
 ## Run
 
-The solver reads `input.dat` and writes `result<N>.dat` from the **current
-directory**, so start it from a directory that contains `input.dat`:
+The first argument is the deck; the name is arbitrary.  A `.sphbin` container is
+read directly, a text deck is parsed as before.  Results are written to the
+**current directory** as `result<N>.sphbin` every 500 steps:
 
 ```bat
-sph_cuda.exe                          :: fp64 (default)
-sph_cuda.exe --fp32                   :: single precision
-sph_cuda.exe --precision=fp32
-set SPH_PRECISION=fp32                :: same, via the environment
+sph_cuda.exe cases\dam_1203k.sphbin            :: fp64 (default)
+sph_cuda.exe cases\dam_1203k.sphbin --fp32     :: single precision
+sph_cuda.exe input.dat                          :: legacy 14-column text deck
+sph_cuda.exe --precision=fp32 <deck>
+set SPH_PRECISION=fp32                          :: same, via the environment
 sph_cuda.exe --help
+```
+
+Convert a text deck once (the converter also counts `itype` and checks the
+fluid | solid | wall block order):
+
+```bat
+python tools\sphbin.py make input_1203k.dat input_1203k.sphbin
+python tools\sphbin.py info input_1203k.sphbin
 ```
 
 Environment variables:
@@ -49,6 +67,7 @@ Environment variables:
 |---|---|
 | `SPH_MAXSTEP` | maximum number of time steps (default 10 000 001) |
 | `SPH_PRECISION` | `fp64` / `fp32` when no command-line flag is given |
+| `SPH_OUT_F32=1` | write results as float32 (half the size) |
 | `SPH_PROFILE` | per-phase timing (prepare / cell / pass1 / constitution / pass2 / update) |
 | `SPH_SOLDDYN=1` | walk the grid in the solid kernels instead of the static pair list |
 | `SPH_LITERALFLUID=1` | literal `pass1_fluid` body instead of the factored one |
@@ -67,7 +86,9 @@ Both instantiations are compiled in by default; CMake can trim the build:
 | `SPH_ENABLE_FP32` | ON | build the single path |
 | `SPH_DEFAULT_PRECISION` | `double` | default when no flag is given |
 
-Measured on an RTX 5080, 237 298 particles, 11.1 M neighbour pairs:
+Measured on an RTX 5080, 237 298 particles, 11.1 M neighbour pairs (previous
+fixed-case build; the current build is runtime-sized and reports the new-case
+numbers in [`docs/BINARY_IO.md`](docs/BINARY_IO.md)):
 
 | | ms/step | vs 32-thread CPU (163 ms/step) | accuracy vs fp64 |
 |---|---|---|---|
@@ -87,6 +108,12 @@ remaining fp32 error is the quantisation of `p = c0^2(rho-1000)` with `rho` near
 1000 (0.14 Pa per step).
 
 ## Validation
+
+> The numbers below were obtained with the previous fixed-case build and its
+> text output.  The current build uses the new-case boundary conditions (no
+> test-only solid clamp, `z > 1.0` reflection) and binary I/O; the new-case
+> comparison against the CPU reference is in
+> [`docs/BINARY_IO.md`](docs/BINARY_IO.md).
 
 Against the original package (`result0..9.dat` = 500 steps) and against a
 3000-step pristine CPU run (which reaches fluid/plate contact at step 566):
@@ -129,16 +156,20 @@ Debug dumps (used for the array-by-array validation) are available through
 ```
 CMakeLists.txt        build definition (no absolute paths, precision switches)
 build.bat             one-click build
-src/sph.h             constants, SoA container, device math, prototypes
+src/sph.h             runtime dims, SoA container, device math, prototypes
 src/sph_kernels.cu    all CUDA kernels and launch wrappers
-src/sph_host.cu       host driver (I/O, initialisation, step loop, output)
+src/sph_host.cu       host driver (binary/text loading, dynamic allocation, step loop, binary output)
 docs/DESIGN.md        algorithm, porting notes, validation, performance analysis
+docs/BINARY_IO.md     binary container, runtime sizing, new-case measurements
+tools/sphbin.py       text deck -> .sphbin converter / inspector
+tools/cmp_bin_text.py compare a .sphbin result against a legacy text result
 tools/                result comparison helper (from the original package)
 ```
 
-`input.dat` (20 MB, 237 298 particles x 14 columns) is included so the package
-runs out of the box; the 500-step reference results stay in the original
-package because they are ~200 MB.
+`input.dat` (20 MB, 237 298 particles x 14 columns) is included as a text deck;
+the binary decks are generated from it with `tools\sphbin.py` and are not
+committed.  The 500-step reference results stay in the original package because
+they are ~200 MB.
 
 ## Design notes
 

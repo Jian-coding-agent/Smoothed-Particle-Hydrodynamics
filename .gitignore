@@ -4,6 +4,7 @@ out/
 
 # Simulation output
 result*.dat
+*.sphbin
 gpu_*.bin
 
 # Visual Studio / MSVC intermediates
