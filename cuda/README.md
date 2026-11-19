@@ -72,9 +72,23 @@ Environment variables:
 | `SPH_SOLDDYN=1` | walk the grid in the solid kernels instead of the static pair list |
 | `SPH_LITERALFLUID=1` | literal `pass1_fluid` body instead of the factored one |
 | `SPH_FLUIDLIST=0` | fused fp64 `pass1_fluid` instead of the two-phase list version |
+| `SPH_A3_FULL=1` / `=0` | force the fat (stored `sG/sB/sD`) / lean (index-only) solid pair list; unset = auto |
+| `SPH_A3_LIMIT_MB` | auto threshold: go lean when the fat list would exceed this (default 4096 MB) |
 
 The last three are diagnostics for A/B comparison; the optimised paths are the
 default and are what was validated.
+
+The solid pair list has two layouts (A6, added for 10^7-particle decks).  The
+fat one stores the three per-pair weight vectors, 88 B per pair; the lean one
+stores only the partner index (4 B/pair) and rebuilds the weights from the
+static solid pack every step, with exactly the arithmetic that filled the arrays
+— both produce **byte-identical** `result*.sphbin`.  On the 1 203 508-particle
+deck the list drops from 1 254 MB (6.95 KB per solid particle) to 66 MB
+(0.35 KB), total VRAM from 2.93 GB to 1.77 GB, and the step time goes from
+11.3 ms to 13.4 ms (+19 %, the pack is a gather while the stored list is
+slot-major and coalesced).  Auto mode keeps the fat list while it fits under
+`SPH_A3_LIMIT_MB`, so the current cases keep full speed and only the very large
+decks pay the surcharge.
 
 ## Precision
 

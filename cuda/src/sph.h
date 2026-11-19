@@ -36,7 +36,7 @@
 // ---------------------------------------------------------------------------
 struct SphDims
 {
-    int num;        // total particles
+    int num;        // total particles (owned by this rank)
     int ntotal;     // fluid
     int solnum;     // solid
     int nall;       // fluid + solid
@@ -44,6 +44,18 @@ struct SphDims
     int nx, ny, nz; // neighbour grid
     int ncell;
     double gx0, gy0, gz0;   // grid origin (cell edge = SPH_CS = 3*hsml)
+
+    // ------------------------------------------------------------------
+    // Domain decomposition (D1).  A rank owns [0, num) and may also hold a
+    // copy of neighbouring ranks' boundary particles ("ghosts") in
+    // [num, numP): first the ghost fluid, then the ghost solid, then the ghost
+    // wall.  Ghosts are read by the physics kernels but never written: every
+    // process loop is bounded by the owned counts above, so a ghost can never
+    // race with the owner.  numP == num on a single-GPU run.
+    // ------------------------------------------------------------------
+    int numP;       // particles present in the arrays (num + ghosts)
+    int gs0;        // first ghost-solid index (numP when there are none)
+    int ngs;        // number of ghost solids
 };
 
 // ---------------------------------------------------------------------------
@@ -167,7 +179,30 @@ struct SphPtrsT
     Real* u;        // [3*NUM] displacement x - X0 of the solid-type particles
     Real* xc;       // [3*NUM] running compensation of the position/displacement sum
     Real* rhoc;     // [NUM]   running compensation of the density sum
+
+    // ------------------------------------------------------------------
+    // D1: global particle id of every local slot: the deck index for an owned
+    // particle, the id it was copied from for a ghost.  nullptr on a
+    // single-GPU run, where the local index IS the global id -- the two
+    // kernels that need the reference solver's "higher indexed particle" rule
+    // (the eta selection in pass1_fluid) then keep using the local index and
+    // their behaviour is unchanged bit for bit.
+    // ------------------------------------------------------------------
+    int* gid;       // [NUM] (or [NUM_P] with ghosts)
 };
+
+// The reference solver's eta rule takes the SurFD of the *higher indexed* of
+// the two particles (the second of the two assignments in 1.cpp wins, and the
+// original always has i < j).  With DomainDecomposition a ghost slot is
+// appended after every owned one, so the local index no longer reproduces the
+// deck order; s.gid restores it.
+template <class Real>
+__device__ __forceinline__ int sph_pair_hi(const SphPtrsT<Real>& s, int p, int q)
+{
+    if (s.gid != nullptr)
+        return (s.gid[p] > s.gid[q]) ? p : q;
+    return (p > q) ? p : q;
+}
 
 // 2-wide vector type used to pull the Pia block with 16-byte loads
 template <class Real> struct SphVec2T;
@@ -295,6 +330,13 @@ __device__ __forceinline__ void sph_matvec(const SphPtrsT<Real>& s, const Real* 
 // A3 switch: 1 = use the static solid pair list (default), 0 = walk the cell
 // list every step like before A3 (kept for A/B verification; SPH_SOLDDYN=1).
 extern int sph_use_static_solid;
+// A6 switch: 1 = the static list stores only the partner index (sQ) and the
+// per-pair weights are recomputed from solidPack every step (default), so the
+// list costs 4 B/pair instead of 88 B/pair; 0 = store sG/sB/sD like A3 did
+// (kept for A/B verification and as the faster-but-fatter mode; SPH_A3_FULL=1).
+// Both modes are bit-identical: the lean path evaluates the same expressions,
+// in the same order, as k_solid_pair_fill did when it filled the arrays.
+extern int sph_a3_lean;
 // A5 switch: 1 = factored inner loop of pass1_fluid (default), 0 = the literal
 // transcription of 1.cpp (kept for verification; SPH_LITERALFLUID=1).
 extern int sph_fast_fluid_loop;
@@ -341,3 +383,16 @@ template <class Real> void launch_nor_sumvecn(SphPtrsT<Real> s, Real* d_sumvecn,
 template <class Real> void launch_nor_normalize(SphPtrsT<Real> s, Real* d_sumvecn, cudaStream_t st);
 template <class Real> void launch_gra_correc(SphPtrsT<Real> s, Real* d_a, cudaStream_t st);
 template <class Real> void launch_gra_invert(SphPtrsT<Real> s, Real* d_a, cudaStream_t st);
+
+// ---------------------------------------------------------------------------
+// D1: exchange kernels (fp64 only).  All records of all peers live in one
+// pinned arena per rank at host-computed offsets; the gather kernel writes
+// them into the mapped arena, the scatter kernel reads the peers' arenas
+// directly (see the layout comment in sph_kernels.cu).
+// ---------------------------------------------------------------------------
+void launch_xch_gather(const SphPtrsD s, int mode, const int* d_idx, const int* d_off,
+                       int n, double* d_arena, cudaStream_t st);
+void launch_xch_scatter(SphPtrsD s, int mode, const int* d_idx, const int* d_off,
+                        int n, const double* d_base, cudaStream_t st);
+// TASK 2: rebuild 1/rho for the ghost block after E1 instead of sending it
+void launch_xch_irho(SphPtrsD s, cudaStream_t st);
