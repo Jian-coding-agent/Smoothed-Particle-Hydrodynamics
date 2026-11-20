@@ -74,10 +74,14 @@ target_include_directories(sph_cuda PRIVATE src)
 # FMA contraction is allowed (the nvcc default, kept explicit).  The fp64
 # neighbour-membership test opts out with __dadd_rn/__dmul_rn, so that one
 # comparison keeps the reference build's rounding; everything else contracts.
+#
+# /Zc:preprocessor is required by CUB (the cell scan, P15): CCCL refuses the
+# traditional MSVC preprocessor, which is still the default in VS 2019.
 target_compile_options(sph_cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=true>
-    $<$<COMPILE_LANGUAGE:CXX>:/W3 /wd4819>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4819>)
+    $<$<COMPILE_LANGUAGE:CXX>:/W3 /wd4819 /Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4819>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
 
 target_compile_definitions(sph_cuda PRIVATE
     $<$<BOOL:${SPH_ENABLE_FP64}>:SPH_HAVE_FP64=1>

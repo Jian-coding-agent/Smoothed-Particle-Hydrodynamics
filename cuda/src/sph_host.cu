@@ -123,6 +123,8 @@ struct Solver
     SphPtrsT<Real> g = SphPtrsT<Real>();
     int*  d_niac = nullptr;
     int*  d_nbr  = nullptr;
+    int*  d_scan_tmp = nullptr;      // P15: cub scan scratch
+    size_t d_scan_bytes = 0;
     Real* d_sumvecn = nullptr;
     Real* d_a = nullptr;
 
@@ -212,7 +214,7 @@ struct Solver
         }
 
         g.cellStart = (int*)dev_alloc((g.d.ncell + 1) * sizeof(int));
-        g.cellCur   = (int*)dev_alloc(g.d.ncell * sizeof(int));
+        g.cellCur   = (int*)dev_alloc((size_t)(g.d.ncell + 1) * sizeof(int));
         g.cellSolid = (int*)dev_alloc(g.d.ncell * sizeof(int));
         g.cellFluid = (int*)dev_alloc(g.d.ncell * sizeof(int));
         g.sorted    = (int*)dev_alloc((size_t)g.d.numP * sizeof(int));
@@ -223,6 +225,8 @@ struct Solver
         g.xc   = dev_alloc_real(n3);
         g.rhoc = dev_alloc_real(n1);
 
+        // P15: the cell scan reads ncell + 1 counts (the trailing one stays 0, so
+        // the total lands in start[ncell]); cellCur is the cursor the scatter re-arms.
         d_niac    = (int*)dev_alloc(sizeof(int));
         d_nbr     = (int*)dev_alloc(g.d.num * sizeof(int));
         d_sumvecn = dev_alloc_real(n3);
@@ -245,11 +249,12 @@ struct Solver
             g.fnbr, g.fcnt,
             g.cellStart, g.cellCur, g.cellSolid, g.cellFluid, g.sorted,
             g.xf, g.u, g.xc, g.rhoc, g.gid,
-            d_niac, d_nbr, d_sumvecn, d_a
+            d_niac, d_nbr, d_sumvecn, d_a, d_scan_tmp
         };
         for (void* p : ptrs) if (p) cudaFree(p);
         g = SphPtrsT<Real>();
         d_niac = nullptr; d_nbr = nullptr; d_sumvecn = nullptr; d_a = nullptr;
+        d_scan_tmp = nullptr; d_scan_bytes = 0;
     }
 
     // ---------------- input ----------------
@@ -446,11 +451,11 @@ struct Solver
     // is the live configuration.  build_solid_lists() calls it with x = X0.
     void build_cells_for(const SphPtrsT<Real>& s)
     {
-        CUDA_CHECK(cudaMemset(g.cellCur, 0, g.d.ncell * sizeof(int)));
+        CUDA_CHECK(cudaMemset(g.cellCur, 0, (size_t)(g.d.ncell + 1) * sizeof(int)));
         CUDA_CHECK(cudaMemset(g.cellSolid, 0, g.d.ncell * sizeof(int)));
         CUDA_CHECK(cudaMemset(g.cellFluid, 0, g.d.ncell * sizeof(int)));
         launch_cell_hist(s, g.cellCur, g.cellSolid, g.cellFluid, 0);
-        launch_cell_scan(g.cellStart, g.cellCur, g.d.ncell, 0);
+        launch_cell_scan(g.cellStart, g.cellCur, g.d.ncell, d_scan_tmp, d_scan_bytes, 0);
         // C1: the *same* positions as the histogram -- with the live x this list
         // would disagree with the counts whenever the solid has moved away from
         // its reference position (the A3 rebuild after a repartition hits this:
@@ -526,26 +531,34 @@ struct Solver
         g.npair  = (int)total;
         g.swidth = width;
         g.sw     = width * n;                   // slots; one component array is this long
-        if (width <= 0) { build_cells(); return; }
 
-        // A6: the fat list stores 9 Reals per slot; the lean one stores only the
-        // partner index.  Both are bit-identical (see sph.h), so the choice is a
-        // pure memory/speed trade: pick the lean list once the fat one would eat
-        // a significant slice of VRAM, which is what happens at 10^7 particles.
+        // A6 / C12: the fat list stores 9 Reals per slot; the lean one stores only
+        // the partner index.  Both are bit-identical (see sph.h), so the choice is
+        // a pure memory/speed trade.
+        //
+        // C16: this decision is collective, so it has to happen on *every* rank --
+        // including one whose computing solids have no pair at all.  It used to sit
+        // after the `width <= 0` return below, and such a rank then walked past the
+        // hook's barriers and arrived at the next one (the E1 exchange) out of phase.
         if (sph_a3_lean < 0)
         {
             double limit_mb = 4096.0;
             if (const char* e = getenv("SPH_A3_LIMIT_MB")) limit_mb = atof(e);
             double fat_mb = (double)g.sw * 9.0 * (double)sizeof(Real) / 1048576.0;
-            // C12: with more than one rank the choice has to be the agreed
-            // maximum, not whichever rank thread got here first
             if (sph_a3_fat_hook) fat_mb = sph_a3_fat_hook(fat_mb);
             sph_a3_lean = (fat_mb > limit_mb) ? 1 : 0;
             printf("[A3] list mode: %s (fat would be %.0f MB, limit %.0f MB)\n",
                    sph_a3_lean ? "lean" : "fat", fat_mb, limit_mb);
         }
 
+        // C19: the per-solid counts exist even when no pair was found, so a rank
+        // with an empty list can still run the *static* kernels (over an empty
+        // list) instead of silently switching to the cell-walk path, which is not
+        // bit-identical to it.
         g.sCnt = (int*)dev_alloc_raw((size_t)n * sizeof(int));
+        CUDA_CHECK(cudaMemcpy(g.sCnt, h.data(), (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
+        if (width <= 0) { build_cells(); return; }      // nothing to store
+
         g.sQ   = (int*)dev_alloc_raw((size_t)g.sw * sizeof(int));
         // A6: in lean mode the per-pair weights are recomputed from the pack, so
         // the three 3*sw arrays (72 B/pair) are never allocated.
@@ -554,7 +567,6 @@ struct Solver
         g.sD   = sph_a3_lean ? nullptr : dev_alloc_real_raw((size_t)3 * g.sw);
 
         int* d_cur = (int*)dev_alloc_raw((size_t)n * sizeof(int));
-        CUDA_CHECK(cudaMemcpy(g.sCnt, h.data(), (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
         launch_solid_pair_fill(g, d_cur, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaGetLastError());
@@ -706,11 +718,11 @@ struct Solver
 
         launch_prepare(g, 0);
 
-        CUDA_CHECK(cudaMemsetAsync(g.cellCur, 0, g.d.ncell * sizeof(int), 0));
+        CUDA_CHECK(cudaMemsetAsync(g.cellCur, 0, (size_t)(g.d.ncell + 1) * sizeof(int), 0));
         CUDA_CHECK(cudaMemsetAsync(g.cellSolid, 0, g.d.ncell * sizeof(int), 0));
         CUDA_CHECK(cudaMemsetAsync(g.cellFluid, 0, g.d.ncell * sizeof(int), 0));
         launch_cell_hist(g, g.cellCur, g.cellSolid, g.cellFluid, 0);
-        launch_cell_scan(g.cellStart, g.cellCur, g.d.ncell, 0);
+        launch_cell_scan(g.cellStart, g.cellCur, g.d.ncell, d_scan_tmp, d_scan_bytes, 0);
         launch_cell_scatter(g, g.cellCur, 0);
         launch_cell_sort(g.cellStart, g.sorted, g.d.ncell, g.gid, 0);
 
@@ -959,6 +971,7 @@ struct DLink
     std::vector<int> recvF, recvS, recvW;
     int off[5] = { 0, 0, 0, 0, 0 };
     int recvOff[5] = { 0, 0, 0, 0, 0 };
+    size_t peerE1 = 0;                 // P17: the peer's E1 block length (doubles)
     int peerOff[5] = { 0, 0, 0, 0, 0 };
 };
 
@@ -1003,14 +1016,13 @@ struct Rank
     double* dXBuild = nullptr;
     unsigned long long* dMaxDisp = nullptr;
     bool rebuild_due = false;      // agreed across ranks, set by the step
+    size_t nSendE1 = 0;            // P17: doubles of this rank's E1 block
+    double disp = 0.0;             // exact global max displacement (E1 tail)
     double last_disp = 0.0;        // C9: what triggered the pending rebuild
-    // C9: the reduce is one kernel and an 8-byte readback, and a synchronous
-    // readback costs ~0.6 ms on Windows/WDDM -- a quarter of the step.  So the
-    // check runs every `gap` steps, chosen from the measured rate so the value can
-    // never pass s/2 + 10% of s unseen (see step_d1).
-    int    next_disp = 0;
-    int    last_check_step = 0;
-    double last_dm = 0.0;
+    // P17: the check is exact every step and costs nothing extra -- the value rides
+    // in the tail of the E1 send block, so it is copied and relayed with the
+    // records (no synchronous 8-byte readback, no rate extrapolation, no C18
+    // overshoot).
     // exchange breakdown (profiling only)
     double x_bar = 0.0;      // time parked on the exchange barriers
     double x_g = 0.0, x_c = 0.0, x_r = 0.0, x_h = 0.0;   // gather / copy / relay / copy-back
@@ -1029,7 +1041,6 @@ struct Job
     // is being written.  outBusy[s] says stage s still has a writer running.
     struct OutBuf { std::vector<double> gx, gy, gz, gp; };
     OutBuf out[2];
-    int  outStage = 0;
     bool outBusy[2] = { false, false };
     std::future<void> outFut[2];
     int num = 0, ntotal = 0, solnum = 0;
@@ -1196,6 +1207,9 @@ struct Deck
     int num = 0;
     std::vector<double> x, y, z, w;
     std::vector<double> x0, y0, z0;      // reference positions (C14; solids only)
+    // C17: an explicit type flag.  Identifying solids by comparing their weight
+    // (w == 0.5) silently broke as soon as the weight became configurable.
+    std::vector<char>   solid;
     std::vector<int> ordX, ordY, ordZ;   // deck sorted along each axis
 };
 
@@ -1334,7 +1348,7 @@ static Part make_part(const Deck& D, int nx, int ny, int nz, double skin,
     if (have_ref)
         for (int g = 0; g < num; ++g)
         {
-            if (D.w[g] != 0.5) continue;               // solids only
+            if (!D.solid[g]) continue;                 // C17: solids only
             const int r = P.owner[g];
             const double v[3] = { D.x0[g], D.y0[g], D.z0[g] };
             for (int c = 0; c < 3; ++c)
@@ -1360,7 +1374,7 @@ static Part make_part(const Deck& D, int nx, int ny, int nz, double skin,
             if (P.owner[g] == r) continue;
             bool in = D.x[g] >= x0 && D.x[g] <= x1 && D.y[g] >= y0 && D.y[g] <= y1 &&
                       D.z[g] >= z0 && D.z[g] <= z1;
-            if (!in && has_solid && D.w[g] == 0.5)
+            if (!in && has_solid && D.solid[g])
                 in = D.x0[g] >= rx0 && D.x0[g] <= rx1 && D.y0[g] >= ry0 &&
                      D.y0[g] <= ry1 && D.z0[g] >= rz0 && D.z0[g] <= rz1;
             if (in) { ++ng; gw += D.w[g]; }
@@ -1379,7 +1393,8 @@ static Part make_part(const Deck& D, int nx, int ny, int nz, double skin,
 
 static bool build_ranks(Job& J, const std::vector<double>& rows,
                         const std::vector<int>& ownerRank,
-                        const std::vector<double>& box);
+                        const std::vector<double>& box,
+                        const double* pos = nullptr);
 
 static bool build_job(Job& J, const std::vector<double>& rows)
 {
@@ -1390,7 +1405,7 @@ static bool build_job(Job& J, const std::vector<double>& rows)
     Deck D;
     D.num = num;
     D.x.resize(num); D.y.resize(num); D.z.resize(num); D.w.resize(num);
-    D.x0.resize(num); D.y0.resize(num); D.z0.resize(num);
+    D.x0.resize(num); D.y0.resize(num); D.z0.resize(num); D.solid.resize(num);
     double total = 0.0;
     for (int i = 0; i < num; ++i)
     {
@@ -1398,6 +1413,7 @@ static bool build_job(Job& J, const std::vector<double>& rows)
         D.x[i] = r[0]; D.y[i] = r[1]; D.z[i] = r[2];
         const double t = r[9];
         D.w[i] = (t > 0.0) ? 1.0 : ((t < -10.0) ? g_w_solid : 0.0);
+        D.solid[i] = (t < -10.0) ? 1 : 0;
         D.x0[i] = r[10]; D.y0[i] = r[11]; D.z0[i] = r[12];
         total += D.w[i];
     }
@@ -1458,6 +1474,11 @@ static bool build_job(Job& J, const std::vector<double>& rows)
         return false;
     }
     J.gnx = best.nx; J.gny = best.ny; J.gnz = best.nz;
+    // P16: keep the ownership map.  A halo refresh reuses it (only the boxes are
+    // recomputed from the live positions), so a rebuild no longer has to re-cut the
+    // domain and re-sort the whole deck.
+    J.owner = best.owner;
+    J.box   = best.box;
     return build_ranks(J, rows, best.owner, best.box);
 }
 
@@ -1469,7 +1490,8 @@ static bool build_job(Job& J, const std::vector<double>& rows)
 // ---------------------------------------------------------------------------
 static bool build_ranks(Job& J, const std::vector<double>& rows,
                         const std::vector<int>& ownerRank,
-                        const std::vector<double>& box)
+                        const std::vector<double>& box,
+                        const double* pos)
 {
     const int nf = 14;
     const int num = J.num, K = J.K;
@@ -1527,10 +1549,12 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
         const double rx0 = rbox[6 * r + 0] - band, rx1 = rbox[6 * r + 1] + band;
         const double ry0 = rbox[6 * r + 2] - band, ry1 = rbox[6 * r + 3] + band;
         const double rz0 = rbox[6 * r + 4] - band, rz1 = rbox[6 * r + 5] + band;
-        auto layer1 = [&](const double* rw) -> bool
+        auto layer1 = [&](int g, const double* rw) -> bool
         {
-            if (rw[0] >= x0 && rw[0] <= x1 && rw[1] >= y0 && rw[1] <= y1 &&
-                rw[2] >= z0 && rw[2] <= z1) return true;
+            // C10/P16: the box test uses the live positions when the caller has them
+            const double* px = pos ? (pos + 3 * (size_t)g) : rw;
+            if (px[0] >= x0 && px[0] <= x1 && px[1] >= y0 && px[1] <= y1 &&
+                px[2] >= z0 && px[2] <= z1) return true;
             if (!has_solid || rw[9] >= -10.0) return false;
             return rw[10] >= rx0 && rw[10] <= rx1 && rw[11] >= ry0 &&
                    rw[11] <= ry1 && rw[12] >= rz0 && rw[12] <= rz1;
@@ -1539,7 +1563,7 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
         {
             if (ownerRank[g] == r) continue;
             const double* rw = &rows[(size_t)g * nf];
-            if (!layer1(rw)) continue;
+            if (!layer1(g, rw)) continue;
             const double t = rw[9];
             if (t > 0.0)        ghostF[r].push_back(g);
             else if (t < -10.0) ghostS1[r].push_back(g);
@@ -1564,7 +1588,7 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
                 if (ownerRank[g] == r) continue;
                 const double* rw = &rows[(size_t)g * nf];
                 if (rw[9] >= -10.0) continue;                   // solids only
-                if (layer1(rw)) continue;                       // already layer 1
+                if (layer1(g, rw)) continue;                    // already layer 1
                 if (rw[10] >= rb[0] && rw[10] <= rb[1] &&
                     rw[11] >= rb[2] && rw[11] <= rb[3] &&
                     rw[12] >= rb[4] && rw[12] <= rb[5]) ghostS2[r].push_back(g);
@@ -1661,6 +1685,7 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
             o[0] += SPH_XCH_REC_F * nf + SPH_XCH_REC_S * ns;
             o[4] += SPH_XCH_REC_ST * (ns + nw);
         }
+        R.nSendE1 = (size_t)o[0];         // P17: E1 block length (doubles)
         R.sendCap = 0;
         for (int k = 0; k < 5; ++k)
             if (k != 1) R.sendCap = std::max(R.sendCap, (size_t)o[k]);
@@ -1687,6 +1712,7 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
         {
             for (const DLink& M : J.ranks[L.peer].links)
                 if (M.peer == r) { for (int k = 0; k < 5; ++k) L.peerOff[k] = M.off[k]; }
+            L.peerE1 = J.ranks[L.peer].nSendE1;      // P17: where its tail value sits
         }
 
     // every ghost slot must be fed by exactly one link (a silent wrong answer
@@ -1737,12 +1763,21 @@ static void xch_pack(Job& J, Rank& R, int mode)
     if (J.K == 1) return;              // no peers: nothing to exchange, no barrier
     const double t0 = now_s();
     Solver<double>& S = R.S;
-    size_t bytes = 0;
     (void)mode;                        // one exchange point left (P11)
-    bytes = ((size_t)SPH_XCH_REC_F * R.nSend[0] +
-             (size_t)SPH_XCH_REC_S * R.nSend[1]) * sizeof(double);
+    size_t bytes = ((size_t)SPH_XCH_REC_F * R.nSend[0] +
+                    (size_t)SPH_XCH_REC_S * R.nSend[1]) * sizeof(double);
+    R.nSendE1 = bytes / sizeof(double);
     launch_xch_gather(S.g, 0, R.dSendIdx[0], R.dSendOff[0], R.nSend[0], R.dStage, 0);
     launch_xch_gather(S.g, 1, R.dSendIdx[1], R.dSendOff[1], R.nSend[1], R.dStage, 0);
+    // P17: the halo trigger's input rides in the tail of this block, so the copy
+    // below carries it for free and the relay hands the peers' values over.
+    if (J.skin > 0.0 && R.dXBuild && R.dMaxDisp)
+    {
+        CUDA_CHECK(cudaMemsetAsync(R.dMaxDisp, 0, sizeof(unsigned long long), 0));
+        launch_disp_max(S.g, R.dXBuild, R.dMaxDisp, 0);
+        launch_disp_store(R.dMaxDisp, R.dStage + R.nSendE1, 0);
+        bytes += sizeof(double);
+    }
     const double tg = now_s();
     R.x_g += tg - t0;
     if (bytes)
@@ -1805,8 +1840,7 @@ static void xch(Job& J, Rank& R, int mode)
 
 // C9 helpers (defined with the repartition code below)
 static void monitor_init(Rank& R);
-static void disp_publish(Job& J, Rank& R, int itime);
-static double disp_max(const Job& J, int itime);
+static void disp_collect(Job& J, Rank& R);
 
 // one-off: the static fields of the ghost block.  A and vecn only a rank's
 // owner can produce (they depend on that rank's own neighbour set), and
@@ -1857,12 +1891,6 @@ static void step_d1(Job& J, Rank& R, int itime)
     };
     if (prof) R.ph_t = now_s();
 
-    // C9: publish how far the owned particles have moved since the ghost set
-    // was chosen.  The value is a plain store into this rank's slot of a
-    // double-buffered array, released by the E1 barrier below; every rank then
-    // reads the same maximum, so they all decide to rebuild together.
-    const bool check_disp = (J.skin > 0.0 && itime >= R.next_disp);
-    if (check_disp) disp_publish(J, R, itime);
     lap(0);
 
     launch_prepare(S.g, 0);
@@ -1870,35 +1898,25 @@ static void step_d1(Job& J, Rank& R, int itime)
 
     xch(J, R, 0);                    // E1: x vx rho (+SurFD for fluids)
     lap(2);
-    if (check_disp)
+    if (J.skin > 0.0)
     {
-        const double dm = disp_max(J, itime);
-        R.rebuild_due = (dm > 0.5 * J.skin);
-        R.last_disp = dm;
-        // Schedule the next check: 10% of the skin is the most it may grow unseen.
-        // Every rank uses the same dm and the same history, so they all pick the
-        // same step -- the rebuild decision stays collective.
-        const int dsteps = std::max(1, itime - R.last_check_step);
-        const double rate = (dm - R.last_dm) / (double)dsteps;
-        R.last_dm = dm;
-        R.last_check_step = itime;
-        int gap = 8;
-        if (rate > 0.0)
-        {
-            const double g = (0.1 * J.skin) / rate;
-            gap = (int)std::min(64.0, std::max(1.0, g));
-        }
-        R.next_disp = itime + (R.rebuild_due ? 1 : gap);
+        // P17: exact every step, from the E1 block itself.  The trigger sits one
+        // MaxV*dt below s/2 because the step that detects the crossing runs on the
+        // halo it is about to replace (C18).
+        disp_collect(J, R);
+        const double thresh = 0.5 * J.skin - 2.0 * SPH_MAXV * SPH_DT;
+        R.rebuild_due = (R.disp > thresh);
+        R.last_disp = R.disp;
     }
     launch_copy_xf(S.g, 0);          // ghosts moved: refresh the float copy
 
-    CUDA_CHECK(cudaMemsetAsync(S.g.cellCur, 0, S.g.d.ncell * sizeof(int), 0));
+    CUDA_CHECK(cudaMemsetAsync(S.g.cellCur, 0, (size_t)(S.g.d.ncell + 1) * sizeof(int), 0));
     CUDA_CHECK(cudaMemsetAsync(S.g.cellSolid, 0, S.g.d.ncell * sizeof(int), 0));
     CUDA_CHECK(cudaMemsetAsync(S.g.cellFluid, 0, S.g.d.ncell * sizeof(int), 0));
     lap(3);
     launch_cell_hist(S.g, S.g.cellCur, S.g.cellSolid, S.g.cellFluid, 0);
     lap(4);
-    launch_cell_scan(S.g.cellStart, S.g.cellCur, S.g.d.ncell, 0);
+    launch_cell_scan(S.g.cellStart, S.g.cellCur, S.g.d.ncell, S.d_scan_tmp, S.d_scan_bytes, 0);
     lap(5);
     launch_cell_scatter(S.g, S.g.cellCur, 0);
     lap(6);
@@ -2082,38 +2100,22 @@ static void monitor_init(Rank& R)
                               (size_t)n * sizeof(double), cudaMemcpyDeviceToDevice));
 }
 
-// Publish this rank's max displacement into the parity-buffered slot the other
-// ranks read after the *next* barrier (E1's).  Writing before the barrier and
-// reading after it is what makes every rank agree on the rebuild decision
-// without spending a barrier of its own: the barrier in xch_pack() releases
-// these stores to the other rank threads, and the two slots are written two
-// steps apart, so a slow rank always finds its peer's value intact.
-static void disp_publish(Job& J, Rank& R, int itime)
+// P17: the displacement is reduced into the tail of the E1 staging block (xch_pack
+// does that), and after E1's barrier every rank reads the maximum over the peers'
+// blocks -- the same relay it already performs, no readback of its own.
+static void disp_collect(Job& J, Rank& R)
 {
-    if (!R.dXBuild || !R.dMaxDisp) return;
-    CUDA_CHECK(cudaMemsetAsync(R.dMaxDisp, 0, sizeof(unsigned long long), 0));
-    launch_disp_max(R.S.g, R.dXBuild, R.dMaxDisp, 0);
-    unsigned long long bits = 0;
-    CUDA_CHECK(cudaMemcpy(&bits, R.dMaxDisp, sizeof(bits), cudaMemcpyDeviceToHost));
-    double d = 0.0;
-    memcpy(&d, &bits, sizeof(d));
-    if (getenv("SPH_D1_DBG"))
+    if (!R.dXBuild || R.nSendE1 == 0) { R.disp = 0.0; return; }
+    double mx = R.hSendB[R.sendSlot][R.nSendE1];
+    for (const DLink& L : R.links)
     {
-        double hx = 0.0, hb = 0.0;
-        CUDA_CHECK(cudaMemcpy(&hx, R.S.g.x, sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&hb, R.dXBuild, sizeof(double), cudaMemcpyDeviceToHost));
-        printf("[dbg] step %d rank %d: disp=%g x0=%g xb0=%g num=%d numP=%d\n",
-               itime, R.id, d, hx, hb, R.S.g.d.num, R.S.g.d.numP);
+        const double v = J.ranks[L.peer].hSendB[R.sendSlot][L.peerE1];
+        if (v > mx) mx = v;
     }
-    J.disp[(size_t)(itime & 1) * J.K + R.id] = d;
-}
-
-static double disp_max(const Job& J, int itime)
-{
-    double mx = 0.0;
-    for (int r = 0; r < J.K; ++r)
-        mx = std::max(mx, J.disp[(size_t)(itime & 1) * J.K + r]);
-    return mx;
+    R.disp = mx;
+    if (getenv("SPH_D1_DBG") && R.id == 0)
+        printf("[dbg] step: global max displacement %.6g mm (skin %.3g mm)\n",
+               1000.0 * mx, 1000.0 * J.skin);
 }
 
 static void mig_snapshot(Job& J, Rank& R)
@@ -2162,10 +2164,11 @@ static void mig_restore(Job& J, Rank& R)
     }
 }
 
-static void repartition(Job& J, Rank& R, int itime, const char* why)
+static void repartition(Job& J, Rank& R, int itime, const char* why, bool recut)
 {
     const double t0 = now_s();
     const int n = R.S.g.d.num, N = R.S.g.d.numP;
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: repartition(%s, recut=%d) start\n", R.id, why, (int)recut);
 
     // 1) publish my positions and my dynamic state, both indexed by gid
     {
@@ -2178,89 +2181,111 @@ static void repartition(Job& J, Rank& R, int itime, const char* why)
                 J.pos[(size_t)R.gid[i] * 3 + c] = buf[i];
         }
     }
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: positions published\n", R.id);
     mig_snapshot(J, R);
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: mig snapshot ok\n", R.id);
     J.bar.wait();
 
     // 2) the new layout, from the current positions (identical on every rank
     //    because rank 0 publishes it and the others wait)
+    // 2) the new layout.  P16: a *skin* refresh keeps the ownership -- the cut
+    // planes are still balanced, the particles are only a few millimetres from
+    // where the cut was made -- and derives each rank's box from its own current
+    // particles.  That skips the three whole-deck sorts, the re-cut search and the
+    // whole-deck copy, which were most of an event's cost.  A re-cut (an explicit
+    // SPH_D1_REPART, or SPH_D1_REGRID) walks the full path.
     if (R.id == 0)
     {
-        Deck D;
-        D.num = J.num;
-        D.x.resize(J.num); D.y.resize(J.num); D.z.resize(J.num); D.w.resize(J.num);
-        D.x0.resize(J.num); D.y0.resize(J.num); D.z0.resize(J.num);
-        for (int g = 0; g < J.num; ++g)
+        Part P;                                   // only filled by the re-cut path
+        if (recut)
         {
-            D.x[g] = J.pos[(size_t)g * 3 + 0];
-            D.y[g] = J.pos[(size_t)g * 3 + 1];
-            D.z[g] = J.pos[(size_t)g * 3 + 2];
-            const double t = J.deckRows[(size_t)g * 14 + 9];
-            D.w[g] = (t > 0.0) ? 1.0 : ((t < -10.0) ? 0.5 : 0.0);
-            D.x0[g] = J.deckRows[(size_t)g * 14 + 10];
-            D.y0[g] = J.deckRows[(size_t)g * 14 + 11];
-            D.z0[g] = J.deckRows[(size_t)g * 14 + 12];
-        }
-        auto sort_axis = [&](const std::vector<double>& c)
-        {
-            std::vector<int> o(J.num);
-            for (int i = 0; i < J.num; ++i) o[i] = i;
-            std::sort(o.begin(), o.end(), [&](int a, int b)
-            { return (c[a] < c[b]) || (c[a] == c[b] && a < b); });
-            return o;
-        };
-        D.ordX = sort_axis(D.x);
-        D.ordY = sort_axis(D.y);
-        D.ordZ = sort_axis(D.z);
+            Deck D;
+            D.num = J.num;
+            D.x.resize(J.num); D.y.resize(J.num); D.z.resize(J.num); D.w.resize(J.num);
+            D.x0.resize(J.num); D.y0.resize(J.num); D.z0.resize(J.num); D.solid.resize(J.num);
+            for (int g = 0; g < J.num; ++g)
+            {
+                D.x[g] = J.pos[(size_t)g * 3 + 0];
+                D.y[g] = J.pos[(size_t)g * 3 + 1];
+                D.z[g] = J.pos[(size_t)g * 3 + 2];
+                const double t = J.deckRows[(size_t)g * 14 + 9];
+                D.w[g] = (t > 0.0) ? 1.0 : ((t < -10.0) ? g_w_solid : 0.0);
+                D.solid[g] = (t < -10.0) ? 1 : 0;
+                D.x0[g] = J.deckRows[(size_t)g * 14 + 10];
+                D.y0[g] = J.deckRows[(size_t)g * 14 + 11];
+                D.z0[g] = J.deckRows[(size_t)g * 14 + 12];
+            }
+            auto sort_axis = [&](const std::vector<double>& c)
+            {
+                std::vector<int> o(J.num);
+                for (int i = 0; i < J.num; ++i) o[i] = i;
+                std::sort(o.begin(), o.end(), [&](int a, int b)
+                { return (c[a] < c[b]) || (c[a] == c[b] && a < b); });
+                return o;
+            };
+            D.ordX = sort_axis(D.x);
+            D.ordY = sort_axis(D.y);
+            D.ordZ = sort_axis(D.z);
 
-        std::vector<int> ixOf(J.num), iyOf(J.num), izOf(J.num), acc;
-        Part P = make_part(D, J.gnx, J.gny, J.gnz, J.skin, ixOf, iyOf, izOf, acc);
-        if (J.regrid)
+            std::vector<int> ixOf(J.num), iyOf(J.num), izOf(J.num), acc;
+            P = make_part(D, J.gnx, J.gny, J.gnz, J.skin, ixOf, iyOf, izOf, acc);
+            if (J.regrid)
+            {
+                // re-search the grid with the current positions
+                Part best = P;
+                for (int nx = 1; nx <= J.K; ++nx)
+                    for (int ny = 1; ny <= J.K / nx; ++ny)
+                    {
+                        if (J.K % (nx * ny) != 0) continue;
+                        const int nz = J.K / (nx * ny);
+                        if (nx == J.gnx && ny == J.gny && nz == J.gnz) continue;
+                        Part Q = make_part(D, nx, ny, nz, J.skin, ixOf, iyOf, izOf, acc);
+                        if (Q.empty) continue;
+                        if (Q.maxload < best.maxload ||
+                            (Q.maxload == best.maxload && Q.ghosts < best.ghosts)) best = std::move(Q);
+                    }
+                P = std::move(best);
+                J.gnx = P.nx; J.gny = P.ny; J.gnz = P.nz;
+            }
+            J.owner = P.owner;
+        }
+        else
         {
-            // re-search the grid with the current positions
-            Part best = P;
-            for (int nx = 1; nx <= J.K; ++nx)
-                for (int ny = 1; ny <= J.K / nx; ++ny)
+            // keep J.owner, refresh the boxes from the live positions
+            std::vector<double> box((size_t)6 * J.K);
+            for (int r = 0; r < J.K; ++r)
+            {
+                box[6 * r + 0] = box[6 * r + 2] = box[6 * r + 4] = 1e300;
+                box[6 * r + 1] = box[6 * r + 3] = box[6 * r + 5] = -1e300;
+            }
+            for (int g = 0; g < J.num; ++g)
+            {
+                const int r = J.owner[(size_t)g];
+                for (int c = 0; c < 3; ++c)
                 {
-                    if (J.K % (nx * ny) != 0) continue;
-                    const int nz = J.K / (nx * ny);
-                    if (nx == J.gnx && ny == J.gny && nz == J.gnz) continue;
-                    Part Q = make_part(D, nx, ny, nz, J.skin, ixOf, iyOf, izOf, acc);
-                    if (Q.empty) continue;
-                    if (Q.maxload < best.maxload ||
-                        (Q.maxload == best.maxload && Q.ghosts < best.ghosts)) best = std::move(Q);
+                    const double v = J.pos[(size_t)g * 3 + c];
+                    if (v < box[6 * r + 2 * c])     box[6 * r + 2 * c] = v;
+                    if (v > box[6 * r + 2 * c + 1]) box[6 * r + 2 * c + 1] = v;
                 }
-            P = std::move(best);
-            J.gnx = P.nx; J.gny = P.ny; J.gnz = P.nz;
-        }
-        J.owner = P.owner;
-        J.box = P.box;
-        // C10: the new ghost set and every rank's neighbour grid must come from
-        // the *current* positions.  J.deckRows is the deck as it was read at
-        // start-up, so passing it here selected ghosts by their t = 0 position
-        // and handed finish_deck() a grid computed from it: a rank's particles
-        // could end up outside its own grid (the C7 cliff) even though the
-        // boxes were cut from the live coordinates.
-        std::vector<double> cur = J.deckRows;
-        for (int g = 0; g < J.num; ++g)
-        {
-            const size_t r = (size_t)g * 14, m = (size_t)g * MIG_N, p3 = (size_t)3 * g;
-            cur[r + 0] = J.pos[p3 + 0];      // x
-            cur[r + 1] = J.pos[p3 + 1];
-            cur[r + 2] = J.pos[p3 + 2];
-            cur[r + 4] = J.mig[m + 3];       // vx
-            cur[r + 5] = J.mig[m + 4];
-            cur[r + 6] = J.mig[m + 5];
-            cur[r + 7] = J.mig[m + 6];       // rho
-        }
-        build_ranks(J, cur, J.owner, J.box);
-        std::printf("[D1] repartition at step %d (%s): grid %dx%dx%d, ghosts %lld (+%.1f%%), "
-                    "max load %.0f\n", itime, why, J.gnx, J.gny, J.gnz,
-                    J.ghost_total, 100.0 * (double)J.ghost_total / (double)J.num,
-                    P.maxload);
+            }
+            J.box = std::move(box);
+                }
+        // C10: the ghost selection tests the *current* positions (J.pos), not the
+        // t = 0 deck -- that is now a parameter, so the whole-deck copy the C10 fix
+        // needed is gone as well.
+        if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] before build_ranks (recut %d, pos %p)\n", (int)recut, (const void*)J.pos.data());
+        build_ranks(J, J.deckRows, J.owner, J.box, J.pos.data());
+        if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] after build_ranks\n");
+        std::printf("[D1] %s at step %d (%s): grid %dx%dx%d, ghosts %lld (+%.1f%%)%s\n",
+                    recut ? "repartition" : "halo refresh", itime, why,
+                    J.gnx, J.gny, J.gnz, J.ghost_total,
+                    100.0 * (double)J.ghost_total / (double)J.num,
+                    recut ? "" : ", ownership kept");
     }
     J.bar.wait();
 
     // 3) rebuild this rank: deck statics + migrated dynamics + ghost statics
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: repartition stage 3 (rows %zu, numP %d)\n", R.id, R.rows.size(), R.numP);
     xch_free(R);
     R.S.free_state();
     if (!R.S.finish_deck(R.rows, R.label.c_str(), R.ownNum, &J.cellgrid, R.ngs1))
@@ -2271,15 +2296,16 @@ static void repartition(Job& J, Rank& R, int itime, const char* why)
     CUDA_CHECK(cudaMalloc((void**)&R.S.g.gid, R.gid.size() * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(R.S.g.gid, R.gid.data(), R.gid.size() * sizeof(int),
                           cudaMemcpyHostToDevice));
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: finish_deck ok (numP %d ngs1 %d)\n", R.id, R.S.g.d.numP, R.S.g.d.ngs1);
     mig_restore(J, R);
     monitor_init(R);                      // C9: the new reference for the trigger
     R.rebuild_due = false;
-    R.next_disp = itime + 8;
-    R.last_check_step = itime;
-    R.last_dm = 0.0;
+    R.disp = 0.0;
     build_send_lists(J, R);
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: send lists ok (nSendE1 %zu)\n", R.id, R.nSendE1);
     launch_copy_xf(R.S.g, 0);
-    xch_static(J, R);                     // ghost A/vecn/p/irho/SurFD
+    xch_static(J, R);
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: static exchange ok\n", R.id);                     // ghost A/vecn/p/irho/SurFD
     launch_build_solid_pack(R.S.g, 0);
     if (sph_use_static_solid) R.S.build_solid_lists();
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -2310,7 +2336,7 @@ static void repartition(Job& J, Rank& R, int itime, const char* why)
 static void build_send_lists(Job& J, Rank& R)
 {
     CUDA_CHECK(cudaSetDevice(R.gpu));
-    const size_t sbytes = std::max<size_t>(R.sendCap, 1) * sizeof(double);
+    const size_t sbytes = (std::max<size_t>(R.sendCap, 1) + 1) * sizeof(double);   // +1: P17 tail
     const size_t rbytes = std::max<size_t>(R.recvCap, 1) * sizeof(double);
     void* p = nullptr;
     for (int s = 0; s < 2; ++s)
@@ -2402,16 +2428,20 @@ static void rank_main(Job* Jp, int r)
                           cudaMemcpyHostToDevice));
 
     launch_copy_xf(R.S.g, 0);
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: deck loaded, numP=%d\n", r, R.S.g.d.numP);
     monitor_init(R);                  // C9: the reference for the displacement trigger
     R.S.build_cells();
     R.S.init_reference_state();
     CUDA_CHECK(cudaDeviceSynchronize());
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: reference state ok\n", r);
     J.bar.wait();
 
     // the ghost block's static fields, then the solid pack/list that needs them
     xch_static(J, R);
     launch_build_solid_pack(R.S.g, 0);
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: static exchange + pack ok\n", r);
     if (sph_use_static_solid) R.S.build_solid_lists();
+    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: solid lists ok (npair %d, nsolC %d)\n", r, R.S.g.npair, R.S.g.d.nsolC);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     {
@@ -2457,7 +2487,8 @@ static void rank_main(Job* Jp, int r)
             // P14: hand the file to a writer thread and keep stepping.  Two stages
             // are enough: a stage is only reused two results later, and rank 0
             // waits for that writer before the barrier that releases it.
-            const int s = J.outStage;
+            // C20: derived, not stored -- every rank computes the same value
+            const int s = (itime / 500) & 1;
             if (r == 0 && J.outBusy[s])
             {
                 J.outFut[s].wait();
@@ -2474,7 +2505,6 @@ static void rank_main(Job* Jp, int r)
                                          [&J, &O, idx] { write_global_result(J, O, idx); });
                 J.outBusy[s] = true;
             }
-            J.outStage = 1 - s;
         }
 
         // repartition at a step boundary, after the result write, so the file
@@ -2492,7 +2522,7 @@ static void rank_main(Job* Jp, int r)
                          1000.0 * R.last_disp, 1000.0 * J.skin);
             else
                 snprintf(why, sizeof(why), "SPH_D1_REPART");
-            repartition(J, R, itime, why);
+            repartition(J, R, itime, why, due);
         }
     }
     if (r == 0)                       // P14: let the last writers finish
@@ -2639,13 +2669,14 @@ static int run_auto(const char* deck, int maxStep)
     Deck D;
     D.num = num;
     D.x.resize(num); D.y.resize(num); D.z.resize(num); D.w.resize(num);
-    D.x0.resize(num); D.y0.resize(num); D.z0.resize(num);
+    D.x0.resize(num); D.y0.resize(num); D.z0.resize(num); D.solid.resize(num);
     for (int i = 0; i < num; ++i)
     {
         const double* r = &rows[(size_t)i * 14];
         D.x[i] = r[0]; D.y[i] = r[1]; D.z[i] = r[2];
         const double t = r[9];
         D.w[i] = (t > 0.0) ? 1.0 : ((t < -10.0) ? g_w_solid : 0.0);
+        D.solid[i] = (t < -10.0) ? 1 : 0;
         D.x0[i] = r[10]; D.y0[i] = r[11]; D.z0[i] = r[12];
     }
     auto sort_axis = [&](const std::vector<double>& c)
@@ -2760,7 +2791,6 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
     {
         J.pos.assign((size_t)3 * J.num, 0.0);
         J.mig.assign((size_t)MIG_N * J.num, 0.0);
-        J.disp.assign((size_t)2 * J.K, 0.0);
     }
     if (J.repart > 0)
         std::printf("[D1] repartition every %d steps%s\n", J.repart,
@@ -2826,12 +2856,20 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
     for (int r = 0; r < K; ++r)
     {
         const Rank& R = J.ranks[r];
-        std::printf("[D1] rank %d: %d steps, %.3f s, %.3f ms/step (%.3f s parked on "
-                    "the exchange barriers)\n",
-                    r, maxStep, R.step_s, 1000.0 * R.step_s / steps, R.x_bar);
+        // P19: the wall clock, not just the sum of the step kernels -- the previous
+        // figure excluded the halo rebuilds and the result writes, which are a large
+        // part of a long run.
+        const double wall_r = R.t_end - R.t_start;
+        std::printf("[D1] rank %d: %d steps, %.3f s wall (%.3f ms/step), %.3f s in %lld "
+                    "halo rebuild(s), %.3f s parked on the exchange barrier\n",
+                    r, maxStep, wall_r, 1000.0 * wall_r / steps,
+                    R.repart_s, R.reparts, R.x_bar);
     }
-    std::printf("[D1] %d step(s), %.3f s wall, %.3f ms/step (slowest rank)\n",
+    std::printf("[D1] %d step(s), %.3f s wall, %.3f ms/step (slowest rank, wall clock)\n",
                 maxStep, wall, 1000.0 * wall / steps);
+    if (K > 0 && !J.ranks.empty())
+        std::printf("[D1] halo rebuilds: %lld, %.3f s of rank 0's wall clock\n",
+                    J.ranks[0].reparts, J.ranks[0].repart_s);
     if (J.prof)
     {
         static const char* nm[14] = { "disp", "prepare", "E1", "memset", "cell_hist", "cell_scan",
@@ -3012,11 +3050,11 @@ static int run_case(const char* input_path, int iMaxStep, int profile, const cha
             CUDA_CHECK(cudaEventRecord(ev[0], 0));
             launch_prepare(S.g, 0);
             CUDA_CHECK(cudaEventRecord(ev[1], 0));
-        CUDA_CHECK(cudaMemsetAsync(S.g.cellCur, 0, S.g.d.ncell * sizeof(int), 0));
+        CUDA_CHECK(cudaMemsetAsync(S.g.cellCur, 0, (size_t)(S.g.d.ncell + 1) * sizeof(int), 0));
         CUDA_CHECK(cudaMemsetAsync(S.g.cellSolid, 0, S.g.d.ncell * sizeof(int), 0));
         CUDA_CHECK(cudaMemsetAsync(S.g.cellFluid, 0, S.g.d.ncell * sizeof(int), 0));
             launch_cell_hist(S.g, S.g.cellCur, S.g.cellSolid, S.g.cellFluid, 0);
-            launch_cell_scan(S.g.cellStart, S.g.cellCur, S.g.d.ncell, 0);
+            launch_cell_scan(S.g.cellStart, S.g.cellCur, S.g.d.ncell, S.d_scan_tmp, S.d_scan_bytes, 0);
             launch_cell_scatter(S.g, S.g.cellCur, 0);
         launch_cell_sort(S.g.cellStart, S.g.sorted, S.g.d.ncell, S.g.gid, 0);
             CUDA_CHECK(cudaEventRecord(ev[2], 0));

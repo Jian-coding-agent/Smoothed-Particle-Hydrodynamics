@@ -15,6 +15,28 @@
 //      one quantity that is NOT symmetric -- eta -- are documented inline).
 // ============================================================================
 #include "sph.h"
+#include <cub/cub.cuh>
+
+// errors in this file are fatal: the host driver's CUDA_CHECK is not visible here
+#define CUDA_CHECK(x)                                                          \
+    do {                                                                       \
+        cudaError_t err_ = (x);                                                 \
+        if (err_ != cudaSuccess) {                                              \
+            fprintf(stderr, "CUDA error: %s (%s:%d)\n",                         \
+                    cudaGetErrorString(err_), __FILE__, __LINE__);              \
+            exit(1);                                                            \
+        }                                                                       \
+    } while (0)
+#define CUB_CHECK(x)                                                           \
+    do {                                                                       \
+        cudaError_t err_ = (x);                                                 \
+        if (err_ != cudaSuccess) {                                              \
+            fprintf(stderr, "CUB error: %s (%s:%d)\n",                          \
+                    cudaGetErrorString(err_), __FILE__, __LINE__);              \
+            exit(1);                                                            \
+        }                                                                       \
+    } while (0)
+#define CUDA_FREE(p) do { cudaFree(p); (p) = nullptr; } while (0)
 
 #define N (s.d.numP)
 
@@ -299,57 +321,6 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
         ++j;
     });
     cur[k] = j;
-}
-
-// exclusive scan over s.d.ncell, then re-arm the cursor array for the scatter
-// pass.  One 512-thread block walks the cells in chunks of 512*32 and carries
-// the running total across chunks, so the grid may be any size (the new deck
-// needs 188552 cells; the old case needed 32076, hence the old static_assert).
-__global__ void k_cell_scan(int* __restrict__ start, int* __restrict__ cnt, int ncell)
-{
-    const int T = 512;
-    const int C = 32;                       // cells per thread per chunk
-    __shared__ int sh[512];
-    __shared__ int carry_sh;
-    const int t = threadIdx.x;
-    int carry = 0;
-    for (int base = 0; base < ncell; base += T * C)
-    {
-        int own = 0;
-        for (int k = 0; k < C; ++k)
-        {
-            const int c = base + t * C + k;
-            if (c < ncell) own += cnt[c];
-        }
-        sh[t] = own;
-        __syncthreads();
-
-        for (int off = 1; off < T; off <<= 1)
-        {
-            const int v = (t >= off) ? sh[t - off] : 0;
-            __syncthreads();
-            sh[t] += v;
-            __syncthreads();
-        }
-
-        int run = carry + sh[t] - own;
-        for (int k = 0; k < C; ++k)
-        {
-            const int c = base + t * C + k;
-            if (c < ncell)
-            {
-                const int v = cnt[c];
-                start[c] = run;
-                cnt[c] = run;
-                run += v;
-            }
-        }
-        __syncthreads();
-        if (t == T - 1) carry_sh = carry + sh[T - 1];
-        __syncthreads();
-        carry = carry_sh;
-    }
-    if (t == 0) start[ncell] = carry;
 }
 
 // deterministic order inside each cell (insertion sort by particle index).
@@ -1854,6 +1825,15 @@ __global__ void k_disp_max(const SphPtrsD s, const double* __restrict__ xb,
         atomicMax(out, (unsigned long long)__double_as_longlong(smax[0]));
 }
 
+// P17: copy the reduced maximum down to a double slot at the tail of the E1 send
+// block, so the value rides along with the records instead of costing its own
+// readback.  The bit pattern is the value (both are positive doubles).
+__global__ void k_disp_store(const unsigned long long* __restrict__ in,
+                             double* __restrict__ out)
+{
+    *out = __longlong_as_double((long long)*in);
+}
+
 // ---------------------------------------------------------------------------
 // launch wrappers
 // ---------------------------------------------------------------------------
@@ -1946,9 +1926,34 @@ void launch_cell_sort(const int* d_cellStart, int* d_sorted, int ncell,
     k_cell_sort<<<(ncell + BLK - 1) / BLK, BLK, 0, st>>>(d_cellStart, d_sorted, ncell, d_gid);
 }
 
-void launch_cell_scan(int* d_cellStart, int* d_count, int ncell, cudaStream_t st)
+// P15: the exclusive scan over the cells used to be a single 512-thread block,
+// which is fine for a per-rank grid but not for the *global* grid V2 hands every
+// rank: at 19.3 M particles (3.1 M cells) that kernel costs 6.5 ms per rank per
+// step, about +20 % on the K=8 step.  cub::DeviceScan does the same integer scan
+// across the whole device in 0.012-0.030 ms, with identical output (an integer
+// prefix sum is exact), so the cell lists and V2's byte-identity are unchanged.
+//
+// The input has ncell + 1 entries: the caller keeps a trailing zero, so the sum
+// of all counts lands in start[ncell] exactly as the old kernel wrote it.  The
+// scatter pass then wants the cursor array re-armed with the start offsets, which
+// is one device-to-device copy.
+void launch_cell_scan(int* d_cellStart, int* d_count, int ncell, int*& d_tmp,
+                      size_t& tmp_bytes, cudaStream_t st)
 {
-    k_cell_scan<<<1, 512, 0, st>>>(d_cellStart, d_count, ncell);
+    const int n = ncell + 1;
+    size_t need = 0;
+    CUB_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, need, d_count, d_cellStart, n, st));
+    if (need > tmp_bytes)
+    {
+        if (d_tmp) CUDA_FREE(d_tmp);
+        CUB_CHECK(cudaMalloc(&d_tmp, need));
+        tmp_bytes = need;
+    }
+    CUB_CHECK(cub::DeviceScan::ExclusiveSum(d_tmp, tmp_bytes, d_count, d_cellStart, n, st));
+    // re-arm the cursor (count[] becomes start[])
+    if (ncell > 0)
+        CUDA_CHECK(cudaMemcpyAsync(d_count, d_cellStart, (size_t)ncell * sizeof(int),
+                                   cudaMemcpyDeviceToDevice, st));
 }
 
 template <class Real>
@@ -2024,7 +2029,7 @@ void launch_pass1_fluid(SphPtrsT<Real> s, cudaStream_t st)
 template <class Real>
 void launch_pass1_solid(SphPtrsT<Real> s, cudaStream_t st)
 {
-    if (sph_use_static_solid && s.npair > 0)
+    if (sph_use_static_solid)   // C19: one path for the whole run, even with no pair
     {
         if (sph_a3_lean)
             k_pass1_solid_static<Real, true><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s);
@@ -2044,7 +2049,7 @@ void launch_pass2_fluid(SphPtrsT<Real> s, cudaStream_t st)
 template <class Real>
 void launch_pass2_solid(SphPtrsT<Real> s, cudaStream_t st)
 {
-    if (sph_use_static_solid && s.npair > 0)
+    if (sph_use_static_solid)   // C19: one path for the whole run, even with no pair
     {
         if (sph_a3_lean)
             k_pass2_solid_static<Real, true><<<nblocks(s.d.solnum), BLK, 0, st>>>(s);
@@ -2169,6 +2174,13 @@ void launch_disp_max(const SphPtrsD s, const double* d_xbuild,
 {
     if (s.d.num <= 0) return;
     k_disp_max<<<nblocks(s.d.num), BLK, 0, st>>>(s, d_xbuild, d_max);
+}
+
+// P17: the reduced value goes into the tail of the E1 staging block, so it is
+// copied to the host with the records and relayed with them.
+void launch_disp_store(const unsigned long long* d_max, double* d_out, cudaStream_t st)
+{
+    k_disp_store<<<1, 1, 0, st>>>(d_max, d_out);
 }
 
 // ---------------------------------------------------------------------------

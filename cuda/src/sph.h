@@ -436,7 +436,9 @@ extern int sph_use_fluid_list;
 int gra_fallback_count();
 
 template <class Real> void launch_cell_hist(SphPtrsT<Real> s, int* d_count, int* d_solid, int* d_fluid, cudaStream_t st);
-void launch_cell_scan(int* d_cellStart, int* d_count, int ncell, cudaStream_t st);
+// P15: device-wide CUB scan; d_tmp/	mp_bytes are the caller's scratch
+void launch_cell_scan(int* d_cellStart, int* d_count, int ncell, int*& d_tmp,
+                      size_t& tmp_bytes, cudaStream_t st);
 void launch_cell_sort(const int* d_cellStart, int* d_sorted, int ncell,
                       const int* d_gid, cudaStream_t st);
 template <class Real> void launch_cell_scatter(SphPtrsT<Real> s, int* d_cursor, cudaStream_t st);
@@ -490,3 +492,5 @@ void launch_xch_fixup(SphPtrsD s, cudaStream_t st);
 // non-negative double so it can be reduced with atomicMax
 void launch_disp_max(const SphPtrsD s, const double* d_xbuild,
                      unsigned long long* d_max, cudaStream_t st);
+// P17: drop the reduced maximum into a double slot (the tail of the E1 block)
+void launch_disp_store(const unsigned long long* d_max, double* d_out, cudaStream_t st);

@@ -96,7 +96,9 @@ decks pay the surcharge.
 `SPH_RANKS=K` runs the same deck on K devices in one process (one host thread
 per rank).  The deck is cut into an `nx*ny*nz` block grid whose compute weight is
 balanced, every rank also keeps copies of its neighbours' boundary particles
-("ghosts"), and the fields those copies need are exchanged twice per step.
+("ghosts"), and the fields those copies need are exchanged **once per step**: E1
+carries x, vx, rho and SurFD, and the layer-1 ghost solids run their own
+constitution instead of receiving its result (P11).
 
 ```bat
 set SPH_RANKS=8
@@ -120,10 +122,13 @@ sph_cuda.exe input.sphbin
 
 The ghost set is only complete at the instant it is selected, so the skin is not
 optional book-keeping: `step_d1()` measures `max |x - x_build|` over the owned
-particles of every rank, and when it passes half the skin the ranks rebuild the
-decomposition together.  The reduce runs every step but the 8-byte readback is
-scheduled from the measured rate (10 % of the skin is the most it may grow
-unseen), because a synchronous readback costs ~0.6 ms on Windows/WDDM.
+particles of every rank, and when it passes half the skin the ranks refresh the
+halo together.  The maximum is reduced every step and rides in the tail of the
+exchange block (P17), so the check is exact and costs no readback; the trigger
+sits one `MaxV*dt` below half the skin, because the step that detects a crossing
+still runs on the old halo.  A skin-triggered refresh keeps the ownership and
+only re-selects the ghosts (P16); the cut is re-done by `SPH_D1_REPART` or
+`SPH_D1_REGRID`.
 `SPH_D1_SKIN=0` restores the old behaviour (ghosts chosen once, never
 revalidated) and prints a warning, because a long run then silently drops
 interactions: at K=8 on `input.dat` that is 2.0e-6 m and 1.7 Pa away from the
@@ -172,6 +177,12 @@ remaining fp32 error is the quantisation of `p = c0^2(rho-1000)` with `rho` near
 1000 (0.14 Pa per step).
 
 ## Validation
+
+> The comparison against `1.cpp` needs one caveat since M8: the port now reflects
+> only *outward* motion at `z = 1` by default, while the reference flips `v_z`
+> unconditionally.  On `input.dat` the fluid stays below 0.45 m, so the two agree
+> exactly; a deck that reaches `z = 1` must be compared with `SPH_REFLECT=flip`
+> until the physics owner settles the case definition.
 
 > The numbers below were obtained with the previous fixed-case build and its
 > text output.  The current build uses the new-case boundary conditions (no
