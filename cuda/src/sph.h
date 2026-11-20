@@ -73,6 +73,33 @@ struct SphDims
 #define SPH_CS    (3.0 * SPH_HSML)
 #define SPH_PIA_STRIDE 12
 
+// ---------------------------------------------------------------------------
+// D1: the domain decomposition keeps a rank's ghost set complete by selecting
+// every particle within 3h of its box, plus a skin (C9).  The skin is what the
+// displacement trigger spends before a rebuild, so it is in metres; the default
+// is one and a half smoothing lengths.
+// ---------------------------------------------------------------------------
+#define SPH_D1_SKIN_DEFAULT (1.5 * SPH_HSML)
+
+// ---------------------------------------------------------------------------
+// D1 exchange records (doubles per particle).  One record per exchange point,
+// holding only the fields the receiving kernels actually read (P9):
+//
+//   E1  fluid  x, vx, rho, SurFD                                    (8)
+//   E1  solid  x, vx, rho                                           (7)
+//   E2  solid  rho, Pia[12]                                         (13)
+//   init solid/wall  A[9], vecn[3]                                  (12)
+//
+// p and irho are pure functions of rho, so the receiving side rebuilds them
+// with the identical expressions instead of paying two doubles per particle
+// (launch_xch_fixup).  PIJW is never written for a fluid (see DESIGN 2.5) and
+// never read for a ghost solid, so it is not exchanged at all: E3 is gone (P8).
+// ---------------------------------------------------------------------------
+#define SPH_XCH_REC_F   8
+#define SPH_XCH_REC_S   7
+#define SPH_XCH_REC_E2  13
+#define SPH_XCH_REC_ST  12
+
 // P1: slots per fluid particle in the neighbour list.  This deck's worst fluid
 // particle has 115 neighbours (mean 104); the build kernel counts what does not
 // fit and the body kernel falls back to the fused traversal for that particle,
@@ -317,7 +344,8 @@ __device__ __forceinline__ void sph_matvec(const SphPtrsT<Real>& s, const Real* 
                                            Real v0, Real v1, Real v2,
                                            Real& y0, Real& y1, Real& y2)
 {
-    const int N = s.d.num;
+    // C15: the tensors are numP-strided (owned + ghosts), not num-strided
+    const int N = s.d.numP;
     y0 = M[0 * N + i] * v0 + M[1 * N + i] * v1 + M[2 * N + i] * v2;
     y1 = M[3 * N + i] * v0 + M[4 * N + i] * v1 + M[5 * N + i] * v2;
     y2 = M[6 * N + i] * v0 + M[7 * N + i] * v1 + M[8 * N + i] * v2;
@@ -337,6 +365,11 @@ extern int sph_use_static_solid;
 // Both modes are bit-identical: the lean path evaluates the same expressions,
 // in the same order, as k_solid_pair_fill did when it filled the arrays.
 extern int sph_a3_lean;
+// C12: the auto lean/fat decision must be the same on every rank of a D1 run,
+// so the decomposed driver installs this hook.  build_solid_lists() offers its
+// own fat size and gets back the agreed maximum (all ranks meet at the rank
+// barrier); a null hook means "single rank, decide locally".
+extern double (*sph_a3_fat_hook)(double fat_mb);
 // A5 switch: 1 = factored inner loop of pass1_fluid (default), 0 = the literal
 // transcription of 1.cpp (kept for verification; SPH_LITERALFLUID=1).
 extern int sph_fast_fluid_loop;
@@ -385,14 +418,19 @@ template <class Real> void launch_gra_correc(SphPtrsT<Real> s, Real* d_a, cudaSt
 template <class Real> void launch_gra_invert(SphPtrsT<Real> s, Real* d_a, cudaStream_t st);
 
 // ---------------------------------------------------------------------------
-// D1: exchange kernels (fp64 only).  All records of all peers live in one
-// pinned arena per rank at host-computed offsets; the gather kernel writes
-// them into the mapped arena, the scatter kernel reads the peers' arenas
-// directly (see the layout comment in sph_kernels.cu).
+// D1: exchange kernels (fp64 only).  One gather kernel per record type packs
+// the owned particles of a link into a device staging block, the host copies
+// the whole block once, relays the peers' blocks with plain memcpy, and one
+// scatter kernel per record type writes the ghost slots.  See sph_kernels.cu.
 // ---------------------------------------------------------------------------
 void launch_xch_gather(const SphPtrsD s, int mode, const int* d_idx, const int* d_off,
-                       int n, double* d_arena, cudaStream_t st);
+                       int n, double* d_stage, cudaStream_t st);
 void launch_xch_scatter(SphPtrsD s, int mode, const int* d_idx, const int* d_off,
                         int n, const double* d_base, cudaStream_t st);
-// TASK 2: rebuild 1/rho for the ghost block after E1 instead of sending it
-void launch_xch_irho(SphPtrsD s, cudaStream_t st);
+// TASK 2 / P9: rebuild 1/rho (and, for the ghost fluid block, p) after E1
+// instead of sending either of them
+void launch_xch_fixup(SphPtrsD s, cudaStream_t st);
+// C9: max |x - x_build| over the owned particles, as the IEEE bit pattern of a
+// non-negative double so it can be reduced with atomicMax
+void launch_disp_max(const SphPtrsD s, const double* d_xbuild,
+                     unsigned long long* d_max, cudaStream_t st);

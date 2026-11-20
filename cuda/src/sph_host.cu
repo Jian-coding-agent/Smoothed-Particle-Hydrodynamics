@@ -52,6 +52,70 @@ enum { PREC_FP64 = 0, PREC_FP32 = 1 };
 enum { HX0 = 0, HX1, HX2, HP, HVX0, HVX1, HVX2, HRHO, HMASS, HITYPE,
        HX00, HX01, HX02, HRHO0, HPIA11, HPIA22, HPIA33, HSURFD, HNARR };
 
+// ---------------------------------------------------------------------------
+// Deck container checks shared by both drivers.
+//
+// M2: the header records the smoothing length and the time step the deck was
+// converted for, but the solver's h and dt are compile-time constants, so a
+// deck made with --hsml 0.005 would otherwise run silently with 0.01 -- every
+// kernel distance wrong by a factor of two.  Refuse the mismatch instead.
+// M3: the single-GPU loader validates the fluid|solid|wall block order; the
+// decomposed one only looked at each rank's own rows, so it trusted the header
+// counts.  Both use these helpers now.
+// ---------------------------------------------------------------------------
+static int deck_class_of(double itype)
+{
+    return (itype > 0.0) ? 0 : ((itype < -10.0) ? 1 : 2);
+}
+
+static bool header_metrics_ok(const unsigned char* hdr, const char* path)
+{
+    double hsml = 0.0, dt = 0.0;
+    memcpy(&hsml, hdr + 40, 8);
+    memcpy(&dt, hdr + 48, 8);
+    if (hsml == 0.0 && dt == 0.0) return true;     // writer had no metrics
+    const double hrel = std::fabs(hsml - SPH_HSML) / SPH_HSML;
+    const double drel = std::fabs(dt - SPH_DT) / SPH_DT;
+    if (hrel > 1e-9 || drel > 1e-9)
+    {
+        fprintf(stderr, "[input] %s: deck was written for hsml=%g dt=%g, this build "
+                        "uses hsml=%g dt=%g (compile-time constants); rebuild the deck "
+                        "with --hsml %g --dt %g or recompile\n",
+                path, hsml, dt, (double)SPH_HSML, (double)SPH_DT,
+                (double)SPH_HSML, (double)SPH_DT);
+        return false;
+    }
+    return true;
+}
+
+// Validates the global block layout ([fluid][solid][wall]) of the first `num`
+// records and returns the per-block counts.
+static bool deck_blocks_ok(const std::vector<double>& rows, int num, const char* path,
+                           int& nfl, int& ns, int& nw)
+{
+    const int nf = 14;
+    nfl = ns = nw = 0;
+    for (int i = 0; i < num; ++i)
+    {
+        const int c = deck_class_of(rows[(size_t)i * nf + 9]);
+        if (c == 0) ++nfl; else if (c == 1) ++ns; else ++nw;
+    }
+    for (int i = 0; i < num; ++i)
+    {
+        const double t = rows[(size_t)i * nf + 9];
+        const int c = deck_class_of(t);
+        const int want = (i < nfl) ? 0 : ((i < nfl + ns) ? 1 : 2);
+        if (c != want)
+        {
+            fprintf(stderr, "[input] %s: particle %d: itype %g is outside its block "
+                            "(fluid=%d solid=%d wall=%d); the deck must be ordered "
+                            "fluid|solid|wall\n", path, i, t, nfl, ns, nw);
+            return false;
+        }
+    }
+    return true;
+}
+
 template <class Real>
 struct Solver
 {
@@ -209,6 +273,7 @@ struct Solver
                                 "nfields=%u)\n", path, ver, hs, nf);
                 fclose(f); return false;
             }
+            if (!header_metrics_ok(hdr, path)) { fclose(f); return false; }
             g.d.num = (int)num; g.d.ntotal = (int)ntotal; g.d.solnum = (int)solnum;
             rows.resize((size_t)num * 14);
             if (fread(rows.data(), sizeof(double), rows.size(), f) != rows.size())
@@ -262,34 +327,16 @@ struct Solver
             return false;
         }
         int nfl = 0, ns = 0, nw = 0;
-        for (int i = 0; i < num; ++i)
-        {
-            const double t = rows[(size_t)i * nf + 9];
-            if (t > 0.0) ++nfl;
-            else if (t < -10.0) ++ns;
-            else ++nw;
-        }
-        // layout: [0,ntotal) fluid, [ntotal,nall) solid, [nall,num) wall
-        for (int i = 0; i < num; ++i)
-        {
-            const double t = rows[(size_t)i * nf + 9];
-            const bool ok = (i < nfl)      ? (t > 0.0)
-                          : (i < nfl + ns) ? (t < -10.0)
-                                           : (t >= -10.0 && t <= 0.0);
-            if (!ok)
-            {
-                fprintf(stderr, "[input] %s: particle %d: itype %g is outside its block "
-                                "(fluid=%d solid=%d wall=%d); the deck must be ordered "
-                                "fluid|solid|wall\n", path, i, t, nfl, ns, nw);
-                return false;
-            }
-        }
+        if (!deck_blocks_ok(rows, num, path, nfl, ns, nw)) return false;
         if (g.d.num != 0 && g.d.num != num)
         {
             fprintf(stderr, "[input] %s: header says %d records, file holds %d\n",
                     path, g.d.num, num);
             return false;
         }
+        // M2/M3: for a subdivided deck the header counts describe the *whole*
+        // deck; each rank's own block is checked here, the global order and the
+        // header counts by the driver (d1::read_deck).
         g.d.num = num; g.d.ntotal = nfl; g.d.solnum = ns;
         // D1: single-rank decks have no ghosts, so numP == num and every stride
         // and loop bound is exactly what it was before the decomposition work.
@@ -411,7 +458,22 @@ struct Solver
         if (g.sD)   { cudaFree(g.sD);   g.sD   = nullptr; }
         g.npair = 0; g.swidth = 0; g.sw = 0;
         const int n = g.d.solnum;
-        if (n <= 0) return;
+
+        // C12: the A6 layout is a global and every rank has to choose the same
+        // one, so a rank that owns no solid at all still has to take part in the
+        // decision (contributing a fat size of 0) -- otherwise it walks past the
+        // barrier the other ranks are waiting at and the whole run desyncs.
+        if (n <= 0)
+        {
+            if (sph_a3_lean < 0)
+            {
+                double limit_mb = 4096.0;
+                if (const char* e = getenv("SPH_A3_LIMIT_MB")) limit_mb = atof(e);
+                const double fat_mb = sph_a3_fat_hook ? sph_a3_fat_hook(0.0) : 0.0;
+                sph_a3_lean = (fat_mb > limit_mb) ? 1 : 0;
+            }
+            return;
+        }
 
         {
             SphPtrsT<Real> ref = g;
@@ -447,7 +509,10 @@ struct Solver
         {
             double limit_mb = 4096.0;
             if (const char* e = getenv("SPH_A3_LIMIT_MB")) limit_mb = atof(e);
-            const double fat_mb = (double)g.sw * 9.0 * (double)sizeof(Real) / 1048576.0;
+            double fat_mb = (double)g.sw * 9.0 * (double)sizeof(Real) / 1048576.0;
+            // C12: with more than one rank the choice has to be the agreed
+            // maximum, not whichever rank thread got here first
+            if (sph_a3_fat_hook) fat_mb = sph_a3_fat_hook(fat_mb);
             sph_a3_lean = (fat_mb > limit_mb) ? 1 : 0;
             printf("[A3] list mode: %s (fat would be %.0f MB, limit %.0f MB)\n",
                    sph_a3_lean ? "lean" : "fat", fat_mb, limit_mb);
@@ -498,11 +563,14 @@ struct Solver
 
     void init_reference_state()
     {
-        CUDA_CHECK(cudaMemset(d_sumvecn, 0, 3 * g.d.num * sizeof(Real)));
+        // C15: the arrays are numP-strided (owned + ghosts), so the clear has to
+        // cover numP slots.  Harmless before only because dev_alloc() zeroes the
+        // whole allocation already.
+        CUDA_CHECK(cudaMemset(d_sumvecn, 0, 3 * g.d.numP * sizeof(Real)));
         launch_nor_sumvecn(g, d_sumvecn, 0);
         launch_nor_normalize(g, d_sumvecn, 0);
 
-        CUDA_CHECK(cudaMemset(d_a, 0, 9 * g.d.num * sizeof(Real)));
+        CUDA_CHECK(cudaMemset(d_a, 0, 9 * g.d.numP * sizeof(Real)));
         launch_gra_correc(g, d_a, 0);
         launch_gra_invert(g, d_a, 0);
     }
@@ -759,24 +827,25 @@ struct Solver
 //  D1: multi-GPU driver
 //
 //  One process, K host threads, one CUDA device per thread.  The deck is read
-//  once, cut into K x-slabs whose *compute* weight is balanced (fluid 1.0,
-//  solid 0.5, wall 0.0 -- a wall costs no per-step kernel work, it only takes
-//  memory), and every rank then runs the ordinary Solver on
+//  once and cut into an nx*ny*nz block grid whose *compute* weight is balanced
+//  (fluid 1.0, solid 0.5, wall 0.0 -- a wall costs no per-step kernel work, it
+//  only takes memory), and every rank then runs the ordinary Solver on
 //
 //      rows_r = [ own particles (deck order) | ghost copies (deck order) ]
 //
-//  Ghosts are the neighbours' particles within 3*hsml of the slab, so every
-//  interaction the physics kernels can see is present.  Owned particles keep
-//  the deck's fluid|solid|wall order, so every `p < s.d.ntotal` style bound in
-//  the kernels still means "my fluid" and ghost slots are only ever read.
+//  Ghosts are the neighbours' particles within 3*hsml + skin of the block, plus
+//  (C14) the solids whose *reference* position is in the reference shell, so
+//  the A3 pairs of the static solid list survive too.  Owned particles keep the
+//  deck's fluid|solid|wall order, so every `p < s.d.ntotal` style bound in the
+//  kernels still means "my fluid" and ghost slots are only ever read.
 //
-//  Per step a rank exchanges three record blocks with each of its (at most
-//  two) peers; see sph_kernels.cu for the layouts.  Packing is a gather kernel
-//  into a device staging block, one cudaMemcpyAsync per link per group into a
-//  pinned host block, a barrier over all K threads, then a pinned -> device
-//  copy and a scatter kernel into the ghost slots on the receiving side.  A
-//  second barrier closes the exchange, because the sender reuses the same
-//  pinned block at the next exchange point.
+//  Per step a rank exchanges two record blocks (E1 fluid+solid, E2 solid) with
+//  each of its up to 26 peers; see sph_kernels.cu for the layouts.  Packing is
+//  a gather kernel into a device staging block, ONE cudaMemcpyAsync of the whole
+//  block into a pinned host block, a barrier over all K threads, then a pinned
+//  -> device copy and a scatter kernel into the ghost slots on the receiving
+//  side.  A second barrier closes the exchange, because the sender reuses the
+//  same pinned block at the next exchange point.
 //
 //  The single-GPU path above (run_case) is untouched: it never allocates a
 //  gid table, never sets numP != num and never enters this namespace.
@@ -896,6 +965,14 @@ struct Rank
     double step_s = 0.0, xch_s = 0.0, t_start = 0.0, t_end = 0.0;
     long long reparts = 0;         // repartition events this rank took part in
     double repart_s = 0.0;         // wall spent in them
+    // C9: the ghost set is only complete at the instant it is chosen, so every
+    // rank tracks how far its owned particles have moved since then and rebuilds
+    // before a pair can be lost.  dXBuild is [3*num], component-major; dMaxDisp
+    // is the reduced Chebyshev distance as a positive double bit pattern.
+    double* dXBuild = nullptr;
+    unsigned long long* dMaxDisp = nullptr;
+    bool rebuild_due = false;      // agreed across ranks, set by the step
+    double last_disp = 0.0;        // C9: what triggered the pending rebuild
     // exchange breakdown (profiling only)
     double x_bar = 0.0;      // time parked on the exchange barriers
     double x_g = 0.0, x_c = 0.0, x_r = 0.0, x_h = 0.0;   // gather / copy / relay / copy-back
@@ -926,7 +1003,37 @@ struct Job
     bool regrid = false;                // re-search the candidate grids too
     long long repart_count = 0;
     double repart_s = 0.0;              // wall spent in repartition (rank 0)
+
+    // ---- C9: skin + displacement trigger -----------------------------
+    // skin   = how far the ghost shell is widened past 3h (metres, 0 = the old
+    //          behaviour: ghosts chosen once, never revalidated).
+    // disp   = [2*K] per-rank max displacement, double buffered by step parity
+    //          so a rank can never overwrite a slot a slower rank still reads.
+    double skin = 0.0;
+    std::vector<double> disp;
+    std::vector<double> a3_fat;         // [K] C12: per-rank fat list size (MB)
 };
+
+// ---------------------------------------------------------------------------
+// C12: the A6 lean/fat layout flag is a global (the kernels read it), so every
+// rank must reach the same answer or the ranks disagree on what sG/sB/sD mean.
+// The rank thread announces its own fat size, the ranks meet at the barrier,
+// and each of them gets the maximum back -- the same decision everywhere.
+// ---------------------------------------------------------------------------
+static thread_local Job* tl_job = nullptr;
+static thread_local int  tl_rank = -1;
+
+static double a3_fat_agreed(double mb)
+{
+    Job* J = tl_job;
+    if (!J || J->K <= 1 || tl_rank < 0) return mb;
+    J->a3_fat[(size_t)tl_rank] = mb;
+    J->bar.wait();
+    double mx = mb;
+    for (int r = 0; r < J->K; ++r) mx = std::max(mx, J->a3_fat[(size_t)r]);
+    J->bar.wait();
+    return mx;
+}
 
 // ---------------------------------------------------------------------------
 // deck reader for the driver (the full file, all particles)
@@ -950,6 +1057,7 @@ static bool read_deck(const char* path, std::vector<double>& rows,
             fprintf(stderr, "[D1] %s: unsupported container\n", path);
             fclose(f); return false;
         }
+        if (!header_metrics_ok(hdr, path)) { fclose(f); return false; }
         num = (int)n;
         rows.resize((size_t)num * 14);
         if (fread(rows.data(), sizeof(double), rows.size(), f) != rows.size())
@@ -991,7 +1099,23 @@ static bool read_deck(const char* path, std::vector<double>& rows,
         }
     }
     fclose(f);
-    return num > 0 && (size_t)num * 14 == rows.size();
+    if (!(num > 0 && (size_t)num * 14 == rows.size())) return false;
+
+    // M3: validate the *whole* deck once, here.  The single-GPU loader has always
+    // done this; the decomposed one only checked each rank's own rows and took
+    // the header counts on trust, so a hand-made deck with a misplaced record
+    // could still be cut up and run.
+    int nfl = 0, ns = 0, nw = 0;
+    if (!deck_blocks_ok(rows, num, path, nfl, ns, nw)) return false;
+    if (binary && (ntotal != nfl || solnum != ns))
+    {
+        fprintf(stderr, "[D1] %s: header counts do not match the records "
+                        "(header: %d fluid %d solid; data: %d fluid %d solid)\n",
+                path, ntotal, solnum, nfl, ns);
+        return false;
+    }
+    ntotal = nfl; solnum = ns;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,10 +1132,12 @@ static bool read_deck(const char* path, std::vector<double>& rows,
 // of equal coordinate.  The y cuts are computed inside each x slab, the z cuts
 // inside each (x,y) column, so every rank owns a rectangular box.
 //
-// A rank's ghost set is every particle inside that box expanded by 3*hsml on
-// every face that it does not own.  This is complete by construction: for an
-// owned p and any q with |x_q-x_p| < 3h the x coordinate alone puts q inside
-// the expanded box, and the same holds for y and z.
+// A rank's ghost set is every particle inside that box expanded by 3*hsml plus
+// the skin (C9) on every face.  The expanded box is complete at the instant it
+// is built: for an owned p and any q with |x_q-x_p| < 3h the x coordinate alone
+// puts q inside the expanded box, and the same holds for y and z.  The skin is
+// what the displacement trigger in step_d1() spends before the next rebuild --
+// without it, and without a rebuild, the set silently decays.
 //
 // (nx,ny,nz) is chosen by evaluating the real coordinates: for every ordered
 // factorisation of K the ghosts are counted and the winner is the one with the
@@ -1022,6 +1148,7 @@ struct Deck
 {
     int num = 0;
     std::vector<double> x, y, z, w;
+    std::vector<double> x0, y0, z0;      // reference positions (C14; solids only)
     std::vector<int> ordX, ordY, ordZ;   // deck sorted along each axis
 };
 
@@ -1086,12 +1213,12 @@ struct Part
     bool empty = false;
 };
 
-static Part make_part(const Deck& D, int nx, int ny, int nz,
+static Part make_part(const Deck& D, int nx, int ny, int nz, double skin,
                       std::vector<int>& ixOf, std::vector<int>& iyOf,
                       std::vector<int>& izOf, std::vector<int>& acc)
 {
     const int num = D.num, K = nx * ny * nz;
-    const double band = 3.0 * SPH_HSML;
+    const double band = 3.0 * SPH_HSML + skin;
     Part P;
     P.nx = nx; P.ny = ny; P.nz = nz;
     P.owner.assign(num, -1);
@@ -1139,18 +1266,49 @@ static Part make_part(const Deck& D, int nx, int ny, int nz,
     P.ownw.assign(K, 0.0); P.ghw.assign(K, 0.0);
     P.ghost.assign(K, 0); P.owncnt.assign(K, 0);
     for (int g = 0; g < num; ++g) { P.ownw[P.owner[g]] += D.w[g]; ++P.owncnt[P.owner[g]]; }
+
+    // C14: reference box of each rank's owned solids, so the ghost estimate
+    // counts the A3 partners the selection below will add (see build_ranks)
+    std::vector<double> rbox((size_t)6 * K);
+    const bool have_ref = !D.x0.empty();
+    for (int r = 0; r < K; ++r)
+    {
+        rbox[6 * r + 0] = rbox[6 * r + 2] = rbox[6 * r + 4] = 1e300;
+        rbox[6 * r + 1] = rbox[6 * r + 3] = rbox[6 * r + 5] = -1e300;
+    }
+    if (have_ref)
+        for (int g = 0; g < num; ++g)
+        {
+            if (D.w[g] != 0.5) continue;               // solids only
+            const int r = P.owner[g];
+            const double v[3] = { D.x0[g], D.y0[g], D.z0[g] };
+            for (int c = 0; c < 3; ++c)
+            {
+                if (v[c] < rbox[6 * r + 2 * c])     rbox[6 * r + 2 * c] = v[c];
+                if (v[c] > rbox[6 * r + 2 * c + 1]) rbox[6 * r + 2 * c + 1] = v[c];
+            }
+        }
+
     for (int r = 0; r < K; ++r)
     {
         const double x0 = P.box[6 * r + 0] - band, x1 = P.box[6 * r + 1] + band;
         const double y0 = P.box[6 * r + 2] - band, y1 = P.box[6 * r + 3] + band;
         const double z0 = P.box[6 * r + 4] - band, z1 = P.box[6 * r + 5] + band;
+        const bool has_solid = have_ref && rbox[6 * r + 1] >= rbox[6 * r + 0];
+        const double rx0 = rbox[6 * r + 0] - band, rx1 = rbox[6 * r + 1] + band;
+        const double ry0 = rbox[6 * r + 2] - band, ry1 = rbox[6 * r + 3] + band;
+        const double rz0 = rbox[6 * r + 4] - band, rz1 = rbox[6 * r + 5] + band;
         long long ng = 0;
         double gw = 0.0;
         for (int g = 0; g < num; ++g)
         {
             if (P.owner[g] == r) continue;
-            if (D.x[g] >= x0 && D.x[g] <= x1 && D.y[g] >= y0 && D.y[g] <= y1 &&
-                D.z[g] >= z0 && D.z[g] <= z1) { ++ng; gw += D.w[g]; }
+            bool in = D.x[g] >= x0 && D.x[g] <= x1 && D.y[g] >= y0 && D.y[g] <= y1 &&
+                      D.z[g] >= z0 && D.z[g] <= z1;
+            if (!in && has_solid && D.w[g] == 0.5)
+                in = D.x0[g] >= rx0 && D.x0[g] <= rx1 && D.y0[g] >= ry0 &&
+                     D.y0[g] <= ry1 && D.z0[g] >= rz0 && D.z0[g] <= rz1;
+            if (in) { ++ng; gw += D.w[g]; }
         }
         P.ghost[r] = (int)ng;
         P.ghw[r] = gw;
@@ -1175,6 +1333,7 @@ static bool build_job(Job& J, const std::vector<double>& rows)
     Deck D;
     D.num = num;
     D.x.resize(num); D.y.resize(num); D.z.resize(num); D.w.resize(num);
+    D.x0.resize(num); D.y0.resize(num); D.z0.resize(num);
     double total = 0.0;
     for (int i = 0; i < num; ++i)
     {
@@ -1182,6 +1341,7 @@ static bool build_job(Job& J, const std::vector<double>& rows)
         D.x[i] = r[0]; D.y[i] = r[1]; D.z[i] = r[2];
         const double t = r[9];
         D.w[i] = (t > 0.0) ? 1.0 : ((t < -10.0) ? 0.5 : 0.0);
+        D.x0[i] = r[10]; D.y0[i] = r[11]; D.z0[i] = r[12];
         total += D.w[i];
     }
     if (!(total > 0.0)) { fprintf(stderr, "[D1] the deck has no weighted particle\n"); return false; }
@@ -1221,7 +1381,7 @@ static bool build_job(Job& J, const std::vector<double>& rows)
     bool have = false;
     for (const Cand& c : cand)
     {
-        Part P = make_part(D, c.nx, c.ny, c.nz, ixOf, iyOf, izOf, acc);
+        Part P = make_part(D, c.nx, c.ny, c.nz, J.skin, ixOf, iyOf, izOf, acc);
         const double dup = (double)P.ghosts / (double)num;
         std::printf("[D1] split (%d,%d,%d): max load %.0f of %.0f weight, "
                     "ghosts %lld (+%.1f%% of the deck)%s\n",
@@ -1256,7 +1416,10 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
 {
     const int nf = 14;
     const int num = J.num, K = J.K;
-    const double band = 3.0 * SPH_HSML;
+    // C9: the ghost band is 3h plus the skin; the displacement trigger rebuilds
+    // before any particle can spend more than half of the skin, so a particle
+    // that was not selected is still more than 3h away when it is needed.
+    const double band = 3.0 * SPH_HSML + J.skin;
 
     // ownership, then the owned lists in *deck* order (so every rank's own
     // block comes out fluid|solid|wall and the local index is the deck order)
@@ -1268,17 +1431,50 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
         ownerLocal[g] = (int)ownGids[r].size();
         ownGids[r].push_back(g);
     }
+
+    // C14: the solid-solid pairs come from the *reference* configuration (A3),
+    // so a partner can be inside the reference shell of a rank's solids while
+    // being outside the shell of its current box.  The reference box of a
+    // rank's owned solids is static, and under small strain it is close to the
+    // current box, so testing against it adds only a few particles.
+    std::vector<double> rbox((size_t)6 * K);
+    for (int r = 0; r < K; ++r)
+    {
+        rbox[6 * r + 0] = rbox[6 * r + 2] = rbox[6 * r + 4] = 1e300;
+        rbox[6 * r + 1] = rbox[6 * r + 3] = rbox[6 * r + 5] = -1e300;
+    }
+    for (int g = 0; g < num; ++g)
+    {
+        const double* rw = &rows[(size_t)g * nf];
+        if (rw[9] >= -10.0) continue;                  // not a solid
+        const int r = ownerRank[g];
+        for (int c = 0; c < 3; ++c)
+        {
+            const double v = rw[10 + c];
+            if (v < rbox[6 * r + 2 * c])     rbox[6 * r + 2 * c] = v;
+            if (v > rbox[6 * r + 2 * c + 1]) rbox[6 * r + 2 * c + 1] = v;
+        }
+    }
+
     for (int r = 0; r < K; ++r)
     {
         const double x0 = box[6 * r + 0] - band, x1 = box[6 * r + 1] + band;
         const double y0 = box[6 * r + 2] - band, y1 = box[6 * r + 3] + band;
         const double z0 = box[6 * r + 4] - band, z1 = box[6 * r + 5] + band;
+        const bool has_solid = rbox[6 * r + 1] >= rbox[6 * r + 0];
+        const double rx0 = rbox[6 * r + 0] - band, rx1 = rbox[6 * r + 1] + band;
+        const double ry0 = rbox[6 * r + 2] - band, ry1 = rbox[6 * r + 3] + band;
+        const double rz0 = rbox[6 * r + 4] - band, rz1 = rbox[6 * r + 5] + band;
         for (int g = 0; g < num; ++g)
         {
             if (ownerRank[g] == r) continue;
             const double* rw = &rows[(size_t)g * nf];
-            if (rw[0] >= x0 && rw[0] <= x1 && rw[1] >= y0 && rw[1] <= y1 &&
-                rw[2] >= z0 && rw[2] <= z1) ghostGids[r].push_back(g);
+            bool in = rw[0] >= x0 && rw[0] <= x1 && rw[1] >= y0 && rw[1] <= y1 &&
+                      rw[2] >= z0 && rw[2] <= z1;
+            if (!in && has_solid && rw[9] < -10.0)
+                in = rw[10] >= rx0 && rw[10] <= rx1 && rw[11] >= ry0 &&
+                     rw[11] <= ry1 && rw[12] >= rz0 && rw[12] <= rz1;
+            if (in) ghostGids[r].push_back(g);
         }
     }
 
@@ -1342,8 +1538,10 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
     // Block layout.  Four exchange blocks per rank, each holding every peer's
     // records side by side in link order, so a whole exchange point is ONE
     // host<->device copy:
-    //   E1  [fluid 12 | solid 24] per link (off[0] = link base, off[1] = solids)
-    //   E2  [solid 13] per link, E3 [fluid 3] per link, static [12] per link
+    //   E1  [fluid 8 | solid 7] per link (off[0] = link base, off[1] = solids)
+    //   E2  [solid 13] per link, static [12] per link
+    // E3 (fluid PIJW) is gone: it shipped zeros (P8), so o[3] stays 0 and no
+    // buffer is reserved for it.
     for (int r = 0; r < K; ++r)
     {
         Rank& R = J.ranks[r];
@@ -1352,15 +1550,14 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
         {
             const int nf = (int)L.sendF.size(), ns = (int)L.sendS.size();
             const int nw = (int)L.sendW.size();
-            L.off[0] = o[0];                 // E1 block base for this link
-            L.off[1] = o[0] + 12 * nf;       // its first solid record
+            L.off[0] = o[0];                                  // E1 block base
+            L.off[1] = o[0] + SPH_XCH_REC_F * nf;             // its first solid
             L.off[2] = o[2];
-            L.off[3] = o[3];
+            L.off[3] = 0;
             L.off[4] = o[4];
-            o[0] += 12 * nf + 24 * ns;
-            o[2] += 13 * ns;
-            o[3] += 3 * nf;
-            o[4] += 12 * (ns + nw);
+            o[0] += SPH_XCH_REC_F * nf + SPH_XCH_REC_S * ns;
+            o[2] += SPH_XCH_REC_E2 * ns;
+            o[4] += SPH_XCH_REC_ST * (ns + nw);
         }
         R.sendCap = 0;
         for (int k = 0; k < 5; ++k)
@@ -1372,14 +1569,13 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
             const int nf = (int)L.recvF.size(), ns = (int)L.recvS.size();
             const int nw = (int)L.recvW.size();
             L.recvOff[0] = q[0];
-            L.recvOff[1] = q[0] + 12 * nf;
+            L.recvOff[1] = q[0] + SPH_XCH_REC_F * nf;
             L.recvOff[2] = q[2];
-            L.recvOff[3] = q[3];
+            L.recvOff[3] = 0;
             L.recvOff[4] = q[4];
-            q[0] += 12 * nf + 24 * ns;
-            q[2] += 13 * ns;
-            q[3] += 3 * nf;
-            q[4] += 12 * (ns + nw);
+            q[0] += SPH_XCH_REC_F * nf + SPH_XCH_REC_S * ns;
+            q[2] += SPH_XCH_REC_E2 * ns;
+            q[4] += SPH_XCH_REC_ST * (ns + nw);
         }
         R.recvCap = 0;
         for (int k = 0; k < 5; ++k)
@@ -1433,19 +1629,15 @@ static void xch_pack(Job& J, Rank& R, int mode)
     size_t bytes = 0;
     if (mode == 0)
     {
-        bytes = ((size_t)12 * R.nSend[0] + (size_t)24 * R.nSend[1]) * sizeof(double);
+        bytes = ((size_t)SPH_XCH_REC_F * R.nSend[0] +
+                 (size_t)SPH_XCH_REC_S * R.nSend[1]) * sizeof(double);
         launch_xch_gather(S.g, 0, R.dSendIdx[0], R.dSendOff[0], R.nSend[0], R.dStage, 0);
         launch_xch_gather(S.g, 1, R.dSendIdx[1], R.dSendOff[1], R.nSend[1], R.dStage, 0);
     }
-    else if (mode == 1)
-    {
-        bytes = (size_t)13 * R.nSend[2] * sizeof(double);
-        launch_xch_gather(S.g, 2, R.dSendIdx[2], R.dSendOff[2], R.nSend[2], R.dStage, 0);
-    }
     else
     {
-        bytes = (size_t)3 * R.nSend[3] * sizeof(double);
-        launch_xch_gather(S.g, 3, R.dSendIdx[3], R.dSendOff[3], R.nSend[3], R.dStage, 0);
+        bytes = (size_t)SPH_XCH_REC_E2 * R.nSend[2] * sizeof(double);
+        launch_xch_gather(S.g, 2, R.dSendIdx[2], R.dSendOff[2], R.nSend[2], R.dStage, 0);
     }
     const double tg = now_s();
     R.x_g += tg - t0;
@@ -1471,30 +1663,21 @@ static void xch_unpack(Job& J, Rank& R, int mode)
     {
         for (const DLink& L : R.links)
         {
-            const size_t n = (size_t)12 * L.recvF.size() + (size_t)24 * L.recvS.size();
+            const size_t n = (size_t)SPH_XCH_REC_F * L.recvF.size() +
+                             (size_t)SPH_XCH_REC_S * L.recvS.size();
             if (!n) continue;
             memcpy(R.hRecv + L.recvOff[0],
                    J.ranks[L.peer].hSend + L.peerOff[0], n * sizeof(double));
-        }
-    }
-    else if (mode == 1)
-    {
-        for (const DLink& L : R.links)
-        {
-            const size_t n = (size_t)13 * L.recvS.size();
-            if (!n) continue;
-            memcpy(R.hRecv + L.recvOff[2],
-                   J.ranks[L.peer].hSend + L.peerOff[2], n * sizeof(double));
         }
     }
     else
     {
         for (const DLink& L : R.links)
         {
-            const size_t n = (size_t)3 * L.recvF.size();
+            const size_t n = (size_t)SPH_XCH_REC_E2 * L.recvS.size();
             if (!n) continue;
-            memcpy(R.hRecv + L.recvOff[3],
-                   J.ranks[L.peer].hSend + L.peerOff[3], n * sizeof(double));
+            memcpy(R.hRecv + L.recvOff[2],
+                   J.ranks[L.peer].hSend + L.peerOff[2], n * sizeof(double));
         }
     }
 
@@ -1503,26 +1686,25 @@ static void xch_unpack(Job& J, Rank& R, int mode)
     // 2) one host-to-device copy of the whole block, then one scatter kernel
     //    per record type
     size_t bytes = 0;
-    if (mode == 0)      bytes = ((size_t)12 * R.nRecv[0] + (size_t)24 * R.nRecv[1]) * sizeof(double);
-    else if (mode == 1) bytes = (size_t)13 * R.nRecv[2] * sizeof(double);
-    else                bytes = (size_t)3 * R.nRecv[3] * sizeof(double);
+    if (mode == 0)
+        bytes = ((size_t)SPH_XCH_REC_F * R.nRecv[0] +
+                 (size_t)SPH_XCH_REC_S * R.nRecv[1]) * sizeof(double);
+    else
+        bytes = (size_t)SPH_XCH_REC_E2 * R.nRecv[2] * sizeof(double);
     if (bytes)
         CUDA_CHECK(cudaMemcpyAsync(R.dStage, R.hRecv, bytes, cudaMemcpyHostToDevice, 0));
     if (mode == 0)
     {
         launch_xch_scatter(S.g, 0, R.dRecvIdx[0], R.dRecvOff[0], R.nRecv[0], R.dStage, 0);
         launch_xch_scatter(S.g, 1, R.dRecvIdx[1], R.dRecvOff[1], R.nRecv[1], R.dStage, 0);
-        // TASK 2: irho travels for free -- rebuild it for the ghost block with
-        // the same expression k_prepare uses on the owner (rho arrived exact).
-        launch_xch_irho(S.g, 0);
-    }
-    else if (mode == 1)
-    {
-        launch_xch_scatter(S.g, 2, R.dRecvIdx[2], R.dRecvOff[2], R.nRecv[2], R.dStage, 0);
+        // TASK 2 / P9: p and irho travel for free -- rebuild them for the ghost
+        // block with the same expressions k_prepare uses on the owner (rho
+        // arrived exact, so the bits match).
+        launch_xch_fixup(S.g, 0);
     }
     else
     {
-        launch_xch_scatter(S.g, 3, R.dRecvIdx[3], R.dRecvOff[3], R.nRecv[3], R.dStage, 0);
+        launch_xch_scatter(S.g, 2, R.dRecvIdx[2], R.dRecvOff[2], R.nRecv[2], R.dStage, 0);
     }
     CUDA_CHECK(cudaStreamSynchronize(0));
     const double t_sync = now_s();
@@ -1535,6 +1717,11 @@ static void xch_unpack(Job& J, Rank& R, int mode)
 
 static void xch(Job& J, Rank& R, int mode) { xch_pack(J, R, mode); xch_unpack(J, R, mode); }
 
+// C9 helpers (defined with the repartition code below)
+static void monitor_init(Rank& R);
+static void disp_publish(Job& J, Rank& R, int itime);
+static double disp_max(const Job& J, int itime);
+
 // one-off: the static fields of the ghost block.  A and vecn only a rank's
 // owner can produce (they depend on that rank's own neighbour set), and
 // k_prepare never runs over ghosts.
@@ -1543,8 +1730,8 @@ static void xch_static(Job& J, Rank& R)
     if (J.K == 1) return;
     const double t0 = now_s();
     Solver<double>& S = R.S;
-    const size_t sbytes = (size_t)12 * R.nSend[4] * sizeof(double);
-    const size_t rbytes = (size_t)12 * R.nRecv[4] * sizeof(double);
+    const size_t sbytes = (size_t)SPH_XCH_REC_ST * R.nSend[4] * sizeof(double);
+    const size_t rbytes = (size_t)SPH_XCH_REC_ST * R.nRecv[4] * sizeof(double);
     launch_xch_gather(S.g, 4, R.dSendIdx[4], R.dSendOff[4], R.nSend[4], R.dStage, 0);
     if (sbytes)
         CUDA_CHECK(cudaMemcpyAsync(R.hSend, R.dStage, sbytes, cudaMemcpyDeviceToHost, 0));
@@ -1555,7 +1742,7 @@ static void xch_static(Job& J, Rank& R)
     const double t1 = now_s();
     for (const DLink& L : R.links)
     {
-        const size_t n = (size_t)12 * (L.recvS.size() + L.recvW.size());
+        const size_t n = (size_t)SPH_XCH_REC_ST * (L.recvS.size() + L.recvW.size());
         if (!n) continue;
         memcpy(R.hRecv + L.recvOff[4],
                J.ranks[L.peer].hSend + L.peerOff[4], n * sizeof(double));
@@ -1584,42 +1771,54 @@ static void step_d1(Job& J, Rank& R, int itime)
     };
     if (prof) R.ph_t = now_s();
 
-    launch_prepare(S.g, 0);
+    // C9: publish how far the owned particles have moved since the ghost set
+    // was chosen.  The value is a plain store into this rank's slot of a
+    // double-buffered array, released by the E1 barrier below; every rank then
+    // reads the same maximum, so they all decide to rebuild together.
+    if (J.skin > 0.0) disp_publish(J, R, itime);
     lap(0);
 
-    xch(J, R, 0);                    // E1: x vx rho irho p SurFD PIJW (+Pia)
+    launch_prepare(S.g, 0);
     lap(1);
+
+    xch(J, R, 0);                    // E1: x vx rho (+SurFD for fluids)
+    lap(2);
+    if (J.skin > 0.0)
+    {
+        const double dm = disp_max(J, itime);
+        R.rebuild_due = (dm > 0.5 * J.skin);
+        R.last_disp = dm;
+    }
     launch_copy_xf(S.g, 0);          // ghosts moved: refresh the float copy
 
     CUDA_CHECK(cudaMemsetAsync(S.g.cellCur, 0, S.g.d.ncell * sizeof(int), 0));
     CUDA_CHECK(cudaMemsetAsync(S.g.cellSolid, 0, S.g.d.ncell * sizeof(int), 0));
     CUDA_CHECK(cudaMemsetAsync(S.g.cellFluid, 0, S.g.d.ncell * sizeof(int), 0));
-    lap(2);
-    launch_cell_hist(S.g, S.g.cellCur, S.g.cellSolid, S.g.cellFluid, 0);
     lap(3);
-    launch_cell_scan(S.g.cellStart, S.g.cellCur, S.g.d.ncell, 0);
+    launch_cell_hist(S.g, S.g.cellCur, S.g.cellSolid, S.g.cellFluid, 0);
     lap(4);
-    launch_cell_scatter(S.g, S.g.cellCur, 0);
+    launch_cell_scan(S.g.cellStart, S.g.cellCur, S.g.d.ncell, 0);
     lap(5);
-    launch_cell_sort(S.g.cellStart, S.g.sorted, S.g.d.ncell, 0);
+    launch_cell_scatter(S.g, S.g.cellCur, 0);
     lap(6);
+    launch_cell_sort(S.g.cellStart, S.g.sorted, S.g.d.ncell, 0);
+    lap(7);
 
     launch_pass1_fluid(S.g, 0);
-    lap(7);
-    launch_pass1_solid(S.g, 0);
     lap(8);
-    launch_constitution(S.g, 0);
+    launch_pass1_solid(S.g, 0);
     lap(9);
-
-    xch(J, R, 1);                    // E2: solid rho + Pia
+    launch_constitution(S.g, 0);
     lap(10);
 
-    launch_pass2_fluid(S.g, 0);
+    xch(J, R, 1);                    // E2: solid rho + Pia
     lap(11);
 
-    xch(J, R, 2);                    // E3: fluid PIJW
+    launch_pass2_fluid(S.g, 0);
     lap(12);
 
+    // E3 used to ship the fluid PIJW here -- three doubles that are identically
+    // zero every step, since no kernel writes PIJW for a fluid particle (P8).
     launch_pass2_solid(S.g, 0);
     lap(13);
 
@@ -1748,6 +1947,73 @@ static void xch_free(Rank& R)
     if (R.hSend)  { cudaFreeHost(R.hSend); R.hSend = nullptr; }
     if (R.hRecv)  { cudaFreeHost(R.hRecv); R.hRecv = nullptr; }
     if (R.dStage) { cudaFree(R.dStage);    R.dStage = nullptr; }
+    // C11: build_send_lists() allocates 20 index/offset arrays per rank, and on
+    // a repartition the old ones were simply overwritten -- about 0.65 MiB per
+    // event on this deck, ~5 MB per event on the 1203k one.  Free them here and
+    // let the next build_send_lists() allocate the new set.
+    for (int g = 0; g < 5; ++g)
+    {
+        if (R.dSendIdx[g]) { cudaFree(R.dSendIdx[g]); R.dSendIdx[g] = nullptr; }
+        if (R.dSendOff[g]) { cudaFree(R.dSendOff[g]); R.dSendOff[g] = nullptr; }
+        if (R.dRecvIdx[g]) { cudaFree(R.dRecvIdx[g]); R.dRecvIdx[g] = nullptr; }
+        if (R.dRecvOff[g]) { cudaFree(R.dRecvOff[g]); R.dRecvOff[g] = nullptr; }
+        R.nSend[g] = 0;
+        R.nRecv[g] = 0;
+    }
+    if (R.dXBuild)  { cudaFree(R.dXBuild);  R.dXBuild = nullptr; }
+    if (R.dMaxDisp) { cudaFree(R.dMaxDisp); R.dMaxDisp = nullptr; }
+}
+
+// ---------------------------------------------------------------------------
+// C9: snapshot of the positions the ghost set was chosen from, plus the device
+// scalar the displacement reduce lands in.  Called after every (re)build.
+// ---------------------------------------------------------------------------
+static void monitor_init(Rank& R)
+{
+    if (R.dXBuild)  { cudaFree(R.dXBuild);  R.dXBuild = nullptr; }
+    if (R.dMaxDisp) { cudaFree(R.dMaxDisp); R.dMaxDisp = nullptr; }
+    const int n = R.S.g.d.num, N = R.S.g.d.numP;
+    if (n <= 0) return;
+    CUDA_CHECK(cudaMalloc((void**)&R.dXBuild, (size_t)3 * n * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void**)&R.dMaxDisp, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(R.dMaxDisp, 0, sizeof(unsigned long long)));
+    for (int c = 0; c < 3; ++c)
+        CUDA_CHECK(cudaMemcpy(R.dXBuild + (size_t)c * n, R.S.g.x + (size_t)c * N,
+                              (size_t)n * sizeof(double), cudaMemcpyDeviceToDevice));
+}
+
+// Publish this rank's max displacement into the parity-buffered slot the other
+// ranks read after the *next* barrier (E1's).  Writing before the barrier and
+// reading after it is what makes every rank agree on the rebuild decision
+// without spending a barrier of its own: the barrier in xch_pack() releases
+// these stores to the other rank threads, and the two slots are written two
+// steps apart, so a slow rank always finds its peer's value intact.
+static void disp_publish(Job& J, Rank& R, int itime)
+{
+    if (!R.dXBuild || !R.dMaxDisp) return;
+    CUDA_CHECK(cudaMemsetAsync(R.dMaxDisp, 0, sizeof(unsigned long long), 0));
+    launch_disp_max(R.S.g, R.dXBuild, R.dMaxDisp, 0);
+    unsigned long long bits = 0;
+    CUDA_CHECK(cudaMemcpy(&bits, R.dMaxDisp, sizeof(bits), cudaMemcpyDeviceToHost));
+    double d = 0.0;
+    memcpy(&d, &bits, sizeof(d));
+    if (getenv("SPH_D1_DBG"))
+    {
+        double hx = 0.0, hb = 0.0;
+        CUDA_CHECK(cudaMemcpy(&hx, R.S.g.x, sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&hb, R.dXBuild, sizeof(double), cudaMemcpyDeviceToHost));
+        printf("[dbg] step %d rank %d: disp=%g x0=%g xb0=%g num=%d numP=%d\n",
+               itime, R.id, d, hx, hb, R.S.g.d.num, R.S.g.d.numP);
+    }
+    J.disp[(size_t)(itime & 1) * J.K + R.id] = d;
+}
+
+static double disp_max(const Job& J, int itime)
+{
+    double mx = 0.0;
+    for (int r = 0; r < J.K; ++r)
+        mx = std::max(mx, J.disp[(size_t)(itime & 1) * J.K + r]);
+    return mx;
 }
 
 static void mig_snapshot(Job& J, Rank& R)
@@ -1796,7 +2062,7 @@ static void mig_restore(Job& J, Rank& R)
     }
 }
 
-static void repartition(Job& J, Rank& R, int itime)
+static void repartition(Job& J, Rank& R, int itime, const char* why)
 {
     const double t0 = now_s();
     const int n = R.S.g.d.num, N = R.S.g.d.numP;
@@ -1822,6 +2088,7 @@ static void repartition(Job& J, Rank& R, int itime)
         Deck D;
         D.num = J.num;
         D.x.resize(J.num); D.y.resize(J.num); D.z.resize(J.num); D.w.resize(J.num);
+        D.x0.resize(J.num); D.y0.resize(J.num); D.z0.resize(J.num);
         for (int g = 0; g < J.num; ++g)
         {
             D.x[g] = J.pos[(size_t)g * 3 + 0];
@@ -1829,6 +2096,9 @@ static void repartition(Job& J, Rank& R, int itime)
             D.z[g] = J.pos[(size_t)g * 3 + 2];
             const double t = J.deckRows[(size_t)g * 14 + 9];
             D.w[g] = (t > 0.0) ? 1.0 : ((t < -10.0) ? 0.5 : 0.0);
+            D.x0[g] = J.deckRows[(size_t)g * 14 + 10];
+            D.y0[g] = J.deckRows[(size_t)g * 14 + 11];
+            D.z0[g] = J.deckRows[(size_t)g * 14 + 12];
         }
         auto sort_axis = [&](const std::vector<double>& c)
         {
@@ -1843,7 +2113,7 @@ static void repartition(Job& J, Rank& R, int itime)
         D.ordZ = sort_axis(D.z);
 
         std::vector<int> ixOf(J.num), iyOf(J.num), izOf(J.num), acc;
-        Part P = make_part(D, J.gnx, J.gny, J.gnz, ixOf, iyOf, izOf, acc);
+        Part P = make_part(D, J.gnx, J.gny, J.gnz, J.skin, ixOf, iyOf, izOf, acc);
         if (J.regrid)
         {
             // re-search the grid with the current positions
@@ -1854,7 +2124,7 @@ static void repartition(Job& J, Rank& R, int itime)
                     if (J.K % (nx * ny) != 0) continue;
                     const int nz = J.K / (nx * ny);
                     if (nx == J.gnx && ny == J.gny && nz == J.gnz) continue;
-                    Part Q = make_part(D, nx, ny, nz, ixOf, iyOf, izOf, acc);
+                    Part Q = make_part(D, nx, ny, nz, J.skin, ixOf, iyOf, izOf, acc);
                     if (Q.empty) continue;
                     if (Q.maxload < best.maxload ||
                         (Q.maxload == best.maxload && Q.ghosts < best.ghosts)) best = std::move(Q);
@@ -1864,9 +2134,27 @@ static void repartition(Job& J, Rank& R, int itime)
         }
         J.owner = P.owner;
         J.box = P.box;
-        build_ranks(J, J.deckRows, J.owner, J.box);
-        std::printf("[D1] repartition at step %d: grid %dx%dx%d, ghosts %lld (+%.1f%%), "
-                    "max load %.0f\n", itime, J.gnx, J.gny, J.gnz,
+        // C10: the new ghost set and every rank's neighbour grid must come from
+        // the *current* positions.  J.deckRows is the deck as it was read at
+        // start-up, so passing it here selected ghosts by their t = 0 position
+        // and handed finish_deck() a grid computed from it: a rank's particles
+        // could end up outside its own grid (the C7 cliff) even though the
+        // boxes were cut from the live coordinates.
+        std::vector<double> cur = J.deckRows;
+        for (int g = 0; g < J.num; ++g)
+        {
+            const size_t r = (size_t)g * 14, m = (size_t)g * MIG_N, p3 = (size_t)3 * g;
+            cur[r + 0] = J.pos[p3 + 0];      // x
+            cur[r + 1] = J.pos[p3 + 1];
+            cur[r + 2] = J.pos[p3 + 2];
+            cur[r + 4] = J.mig[m + 3];       // vx
+            cur[r + 5] = J.mig[m + 4];
+            cur[r + 6] = J.mig[m + 5];
+            cur[r + 7] = J.mig[m + 6];       // rho
+        }
+        build_ranks(J, cur, J.owner, J.box);
+        std::printf("[D1] repartition at step %d (%s): grid %dx%dx%d, ghosts %lld (+%.1f%%), "
+                    "max load %.0f\n", itime, why, J.gnx, J.gny, J.gnz,
                     J.ghost_total, 100.0 * (double)J.ghost_total / (double)J.num,
                     P.maxload);
     }
@@ -1884,6 +2172,8 @@ static void repartition(Job& J, Rank& R, int itime)
     CUDA_CHECK(cudaMemcpy(R.S.g.gid, R.gid.data(), R.gid.size() * sizeof(int),
                           cudaMemcpyHostToDevice));
     mig_restore(J, R);
+    monitor_init(R);                      // C9: the new reference for the trigger
+    R.rebuild_due = false;
     build_send_lists(J, R);
     launch_copy_xf(R.S.g, 0);
     xch_static(J, R);                     // ghost A/vecn/p/irho/SurFD
@@ -1893,6 +2183,14 @@ static void repartition(Job& J, Rank& R, int itime)
 
     R.reparts++;
     R.repart_s += now_s() - t0;
+    if (getenv("SPH_D1_DBG"))
+    {
+        // C11: with the exchange arrays freed, this must not grow across events
+        size_t freem = 0, totm = 0;
+        cudaMemGetInfo(&freem, &totm);
+        std::printf("[D1] rank %d: %.0f MB of %.0f MB in use after event %lld\n",
+                    R.id, (totm - freem) / 1048576.0, totm / 1048576.0, R.reparts);
+    }
     if (R.id == 0)
         std::printf("[D1] repartition done: %.1f ms (rank 0 wall), %lld event(s)\n",
                     1000.0 * (now_s() - t0), R.reparts);
@@ -1926,69 +2224,67 @@ static void build_send_lists(Job& J, Rank& R)
         CUDA_CHECK(cudaMemcpy(d, v.data(), v.size() * sizeof(int), cudaMemcpyHostToDevice));
     };
     std::vector<int> idx, off;
+    std::vector<int> idx2, off2;
     for (int g = 0; g < 5; ++g)
     {
         idx.clear(); off.clear();
-        for (const DLink& L : R.links)
-        {
-            if (g == 0)
-                for (int i = 0; i < (int)L.sendF.size(); ++i)
-                { idx.push_back(L.sendF[i]); off.push_back(L.off[0] + 12 * i); }
-            else if (g == 1)
-                for (int i = 0; i < (int)L.sendS.size(); ++i)
-                { idx.push_back(L.sendS[i]); off.push_back(L.off[1] + 24 * i); }
-            else if (g == 2)
-                for (int i = 0; i < (int)L.sendS.size(); ++i)
-                { idx.push_back(L.sendS[i]); off.push_back(L.off[2] + 13 * i); }
-            else if (g == 3)
-                for (int i = 0; i < (int)L.sendF.size(); ++i)
-                { idx.push_back(L.sendF[i]); off.push_back(L.off[3] + 3 * i); }
-            else
+        if (g != 3)                          // group 3 was E3, removed by P8
+            for (const DLink& L : R.links)
             {
-                int i = 0;
-                for (int v : L.sendS) { idx.push_back(v); off.push_back(L.off[4] + 12 * i); ++i; }
-                for (int v : L.sendW) { idx.push_back(v); off.push_back(L.off[4] + 12 * i); ++i; }
+                if (g == 0)
+                    for (int i = 0; i < (int)L.sendF.size(); ++i)
+                    { idx.push_back(L.sendF[i]); off.push_back(L.off[0] + SPH_XCH_REC_F * i); }
+                else if (g == 1)
+                    for (int i = 0; i < (int)L.sendS.size(); ++i)
+                    { idx.push_back(L.sendS[i]); off.push_back(L.off[1] + SPH_XCH_REC_S * i); }
+                else if (g == 2)
+                    for (int i = 0; i < (int)L.sendS.size(); ++i)
+                    { idx.push_back(L.sendS[i]); off.push_back(L.off[2] + SPH_XCH_REC_E2 * i); }
+                else
+                {
+                    int i = 0;
+                    for (int v : L.sendS) { idx.push_back(v); off.push_back(L.off[4] + SPH_XCH_REC_ST * i); ++i; }
+                    for (int v : L.sendW) { idx.push_back(v); off.push_back(L.off[4] + SPH_XCH_REC_ST * i); ++i; }
+                }
             }
-        }
         R.nSend[g] = (int)idx.size();
         up_i(idx, R.dSendIdx[g]);
         up_i(off, R.dSendOff[g]);
     }
 
-    idx.clear(); off.clear();
     for (int g = 0; g < 5; ++g)
     {
-        idx.clear(); off.clear();
-        for (const DLink& L : R.links)
-        {
-            if (g == 0)
-                for (int i = 0; i < (int)L.recvF.size(); ++i)
-                { idx.push_back(L.recvF[i]); off.push_back(L.recvOff[0] + 12 * i); }
-            else if (g == 1)
-                for (int i = 0; i < (int)L.recvS.size(); ++i)
-                { idx.push_back(L.recvS[i]); off.push_back(L.recvOff[1] + 24 * i); }
-            else if (g == 2)
-                for (int i = 0; i < (int)L.recvS.size(); ++i)
-                { idx.push_back(L.recvS[i]); off.push_back(L.recvOff[2] + 13 * i); }
-            else if (g == 3)
-                for (int i = 0; i < (int)L.recvF.size(); ++i)
-                { idx.push_back(L.recvF[i]); off.push_back(L.recvOff[3] + 3 * i); }
-            else
+        idx2.clear(); off2.clear();
+        if (g != 3)
+            for (const DLink& L : R.links)
             {
-                int i = 0;
-                for (int v : L.recvS) { idx.push_back(v); off.push_back(L.recvOff[4] + 12 * i); ++i; }
-                for (int v : L.recvW) { idx.push_back(v); off.push_back(L.recvOff[4] + 12 * i); ++i; }
+                if (g == 0)
+                    for (int i = 0; i < (int)L.recvF.size(); ++i)
+                    { idx2.push_back(L.recvF[i]); off2.push_back(L.recvOff[0] + SPH_XCH_REC_F * i); }
+                else if (g == 1)
+                    for (int i = 0; i < (int)L.recvS.size(); ++i)
+                    { idx2.push_back(L.recvS[i]); off2.push_back(L.recvOff[1] + SPH_XCH_REC_S * i); }
+                else if (g == 2)
+                    for (int i = 0; i < (int)L.recvS.size(); ++i)
+                    { idx2.push_back(L.recvS[i]); off2.push_back(L.recvOff[2] + SPH_XCH_REC_E2 * i); }
+                else
+                {
+                    int i = 0;
+                    for (int v : L.recvS) { idx2.push_back(v); off2.push_back(L.recvOff[4] + SPH_XCH_REC_ST * i); ++i; }
+                    for (int v : L.recvW) { idx2.push_back(v); off2.push_back(L.recvOff[4] + SPH_XCH_REC_ST * i); ++i; }
+                }
             }
-        }
-        R.nRecv[g] = (int)idx.size();
-        up_i(idx, R.dRecvIdx[g]);
-        up_i(off, R.dRecvOff[g]);
+        R.nRecv[g] = (int)idx2.size();
+        up_i(idx2, R.dRecvIdx[g]);
+        up_i(off2, R.dRecvOff[g]);
     }
 }
 static void rank_main(Job* Jp, int r)
 {
     Job& J = *Jp;
     Rank& R = J.ranks[r];
+    tl_job = &J;
+    tl_rank = r;
     CUDA_CHECK(cudaSetDevice(R.gpu));
 
     // exchange buffers and both halves of the lists, once
@@ -2005,6 +2301,7 @@ static void rank_main(Job* Jp, int r)
                           cudaMemcpyHostToDevice));
 
     launch_copy_xf(R.S.g, 0);
+    monitor_init(R);                  // C9: the reference for the displacement trigger
     R.S.build_cells();
     R.S.init_reference_state();
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -2064,8 +2361,21 @@ static void rank_main(Job* Jp, int r)
 
         // repartition at a step boundary, after the result write, so the file
         // still carries the decomposition it was fetched with
-        if (J.repart > 0 && itime > 0 && (itime % J.repart) == 0 && itime < J.maxStep - 1)
-            repartition(J, R, itime);
+        bool due = false;
+        if (J.repart > 0 && itime > 0 && (itime % J.repart) == 0) due = true;
+        // C9: the skin has been spent -- rebuild before a pair can be lost.  The
+        // decision is identical on every rank (same maximum, same threshold).
+        const bool skin_due = R.rebuild_due;
+        if ((due || skin_due) && itime < J.maxStep - 1)
+        {
+            char why[128];
+            if (skin_due)
+                snprintf(why, sizeof(why), "skin spent: %.3f mm moved, skin %.2f mm",
+                         1000.0 * R.last_disp, 1000.0 * J.skin);
+            else
+                snprintf(why, sizeof(why), "SPH_D1_REPART");
+            repartition(J, R, itime, why);
+        }
     }
     R.t_end = now_s();
 }
@@ -2081,6 +2391,8 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
     J.maxStep = maxStep;
     J.deck = deck;
     J.prof = (getenv("SPH_D1PROF") != nullptr);
+    // C12: from here on build_solid_lists() decides the A6 layout collectively
+    sph_a3_fat_hook = &a3_fat_agreed;
     if (const char* b = getenv("SPH_BARRIER"))
         g_barrier_mode = (!strcmp(b, "spin")) ? 1 : (!strcmp(b, "block")) ? 2 : 0;
     if (const char* e = getenv("SPH_D1_REPART")) J.repart = atoi(e);
@@ -2088,9 +2400,34 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
         const char* e = getenv("SPH_D1_REGRID");
         J.regrid = (e != nullptr) && atoi(e) != 0;
     }
+    // C9: the ghost shell is widened by a skin and re-chosen whenever a particle
+    // has spent half of it.  SPH_D1_SKIN=0 restores the old behaviour (ghosts
+    // picked once, never revalidated) and is only useful for A/B testing.
+    J.skin = SPH_D1_SKIN_DEFAULT;
+    if (const char* e = getenv("SPH_D1_SKIN")) J.skin = atof(e);
+    if (J.skin < 0.0) J.skin = 0.0;
 
     std::vector<double> rows;
     if (!read_deck(deck, rows, J.num, J.ntotal, J.solnum)) return 1;
+
+    // C13: E1 carries only the fluid and solid groups, so a wall ghost would
+    // never see its owner's velocity.  Every wall of this deck is static (and a
+    // static wall cannot start moving: no kernel writes SForce or PIJW for it),
+    // so refuse the decomposition instead of running wrong.
+    for (int i = 0; i < J.num; ++i)
+    {
+        const double* rw = &rows[(size_t)i * 14];
+        const double t = rw[9];
+        if (t > 0.0 || t < -10.0) continue;            // fluid or solid
+        if (rw[4] != 0.0 || rw[5] != 0.0 || rw[6] != 0.0)
+        {
+            fprintf(stderr, "[D1] particle %d is a wall with velocity (%g, %g, %g); "
+                            "the decomposition does not exchange wall ghosts, so a "
+                            "moving wall needs a single rank (SPH_RANKS unset)\n",
+                    i, rw[4], rw[5], rw[6]);
+            return 2;
+        }
+    }
     std::printf("[D1] %s: num=%d fluid=%d solid=%d wall=%d, %d rank(s) on gpu",
                 deck, J.num, J.ntotal, J.solnum, J.num - J.ntotal - J.solnum, K);
     if (const char* s = getenv("SPH_D1_SPLIT")) std::printf(" (forced split %s)", s);
@@ -2122,13 +2459,25 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
     if (!build_job(J, rows)) return 1;
     // the full deck is kept: a repartition rebuilds the per-rank rows from it
     J.deckRows = std::move(rows);
-    if (J.repart > 0)
+    // C12 needs one slot per rank whatever the trigger configuration is
+    J.a3_fat.assign((size_t)J.K, 0.0);
+    if (J.repart > 0 || J.skin > 0.0)
     {
         J.pos.assign((size_t)3 * J.num, 0.0);
         J.mig.assign((size_t)MIG_N * J.num, 0.0);
+        J.disp.assign((size_t)2 * J.K, 0.0);
+    }
+    if (J.repart > 0)
         std::printf("[D1] repartition every %d steps%s\n", J.repart,
                     J.regrid ? " (re-searching the block grid)" : "");
-    }
+    if (J.skin > 0.0)
+        std::printf("[D1] ghost skin %.2f mm (%.2f h): rebuild when a particle has "
+                    "moved %.2f mm\n", 1000.0 * J.skin, J.skin / SPH_HSML,
+                    500.0 * J.skin);
+    else
+        fprintf(stderr, "[D1] WARNING: SPH_D1_SKIN=0 -- the ghost set is chosen once "
+                        "and never revalidated, so long runs silently drop "
+                        "interactions (C9, see review/Claude)\n");
     for (int r = 0; r < K; ++r) J.ranks[r].gpu = gpus[r];
 
     J.gx.assign(J.num, 0.0); J.gy.assign(J.num, 0.0);
@@ -2187,17 +2536,17 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
                 maxStep, wall, 1000.0 * wall / steps);
     if (J.prof)
     {
-        static const char* nm[15] = { "prepare", "E1", "memset", "cell_hist", "cell_scan",
+        static const char* nm[15] = { "disp", "prepare", "E1", "memset", "cell_hist", "cell_scan",
                                       "cell_scatter", "cell_sort", "pass1_fluid",
                                       "pass1_solid", "constitution", "E2",
-                                      "pass2_fluid", "E3", "pass2_solid", "update" };
+                                      "pass2_fluid", "pass2_solid", "update" };
         for (int r = 0; r < K; ++r)
         {
             const Rank& R = J.ranks[r];
             std::printf("[D1] rank %d phases (ms/step):", r);
             for (int k = 0; k < 15; ++k) std::printf(" %s=%.3f", nm[k], 1000.0 * R.ph[k] / steps);
-            std::printf("\n[D1] rank %d exchange split (ms/step): gather=%.3f copyD2H+sync=%.3f "
-                        "relay=%.3f copyH2D+scatter=%.3f barriers=%.3f\n",
+            std::printf("\n[D1] rank %d exchange split (ms/step): gather-launch=%.3f "
+                        "copyD2H+sync=%.3f relay=%.3f copyH2D+scatter=%.3f barriers=%.3f\n",
                         r, 1000.0 * R.x_g / steps, 1000.0 * R.x_c / steps,
                         1000.0 * R.x_r / steps, 1000.0 * R.x_h / steps,
                         1000.0 * R.x_bar / steps);

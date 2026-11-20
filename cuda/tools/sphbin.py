@@ -10,16 +10,22 @@ Format (little endian, 128-byte header, then num*nfields float64, row-major):
      16     4  num
      20     4  ntotal   (itype > 0)
      24     4  solnum   (itype < -10)
-     28     4  nfields  (14 = input, 5 = output: x,y,z,p,itype)
+     28     4  nfields  (14 = input deck, 4 = result: x,y,z,p)
      32     4  step     (0 for input files)
-     36     4  flags    (bit0: itype present)
-     40     8  hsml
+     36     4  flags    (bit1: itype implied by the block split;
+                          bit2: payload is float32 instead of float64)
+     40     8  hsml     (the solver refuses a deck written for another h)
      48     8  dt
      56    48  gx0,gy0,gz0,gx1,gy1,gz1  (informational; the solver recomputes)
     104    24  reserved (zero)
 
 Input rows: x,y,z,p,vx,vy,vz,rho,mass,itype,X0,X0y,X0z,rho0 (the 14 text columns).
-Output rows: x,y,z,p,itype.
+Result rows: x,y,z,p -- itype is not stored; the block split in the header is
+what says which rows are fluid, solid and wall.
+
+The deck must be ordered fluid|solid|wall.  How many distinct itype values a
+block uses does not matter (a fluid block may carry several), only that the
+class never goes backwards.
 
 Usage:
     python sphbin.py make  <deck.txt> <deck.sphbin> [--hsml 0.01] [--dt 1e-5]
@@ -31,6 +37,10 @@ import numpy as np
 MAGIC = b"SPHBIN\0\0"
 HDR = struct.Struct("<8sIIIIIIII dd 6d 24x")   # 128 bytes
 assert HDR.size == 128
+
+def deck_class(itype):
+    """0 = fluid, 1 = solid, 2 = wall (the block order the solver requires)."""
+    return np.where(itype > 0, 0, np.where(itype < -10, 1, 2))
 
 def write_header(f, num, ntotal, solnum, nfields, step, flags, hsml, dt, g):
     f.write(HDR.pack(MAGIC, 1, 128, num, ntotal, solnum, nfields, step, flags,
@@ -54,20 +64,19 @@ def cmd_make(src, dst, hsml, dt):
         n, nf = a.shape
     assert nf == 14, f"expected 14 columns, got {nf}"
     it = a[:, 9]
-    nf_mask = it > 0
-    ns_mask = it < -10
-    nw_mask = ~(nf_mask | ns_mask)
-    ntotal, solnum, nwall = int(nf_mask.sum()), int(ns_mask.sum()), int(nw_mask.sum())
-    # the kernels require the block layout fluid | solid | wall
-    order = np.concatenate([nf_mask, ns_mask, nw_mask])  # not used; check transitions
-    tr = np.flatnonzero(np.diff(it))
-    types = it[tr]
-    # every transition must be fluid->solid or solid->wall, and only once
-    seq = [it[0]] + [it[i + 1] for i in tr]
-    ok = (len(seq) == 3 and seq[0] > 0 and -10 > seq[1] and seq[2] >= -10)
-    if not ok:
-        raise SystemExit(f"deck is not ordered as fluid|solid|wall; type sequence at "
-                         f"transitions is {seq[:6]} (transitions={len(tr)})")
+    cls = deck_class(it)
+    ntotal = int((cls == 0).sum())
+    solnum = int((cls == 1).sum())
+    nwall  = int((cls == 2).sum())
+    # the kernels require the block layout fluid | solid | wall.  A block may use
+    # several itype values (a fluid block can mix 1 and 2), so the test is on the
+    # *class*, not on the raw type: the class sequence must never decrease.
+    bad = np.flatnonzero(np.diff(cls) < 0)
+    if bad.size:
+        i = int(bad[0])
+        raise SystemExit(f"deck is not ordered as fluid|solid|wall: record {i} has "
+                         f"itype {it[i]:g} (class {cls[i]}) after record {i+1} "
+                         f"with itype {it[i+1]:g} (class {cls[i+1]})")
     x = a[:, 0]; y = a[:, 1]; z = a[:, 2]
     gx0, gx1 = float(x.min()) - 0.05, float(x.max()) + 0.05
     gy0, gy1 = float(y.min()) - 0.05, float(y.max()) + 0.05

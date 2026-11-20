@@ -90,6 +90,45 @@ slot-major and coalesced).  Auto mode keeps the fat list while it fits under
 `SPH_A3_LIMIT_MB`, so the current cases keep full speed and only the very large
 decks pay the surcharge.
 
+## Multiple GPUs (D1)
+
+`SPH_RANKS=K` runs the same deck on K devices in one process (one host thread
+per rank).  The deck is cut into an `nx*ny*nz` block grid whose compute weight is
+balanced, every rank also keeps copies of its neighbours' boundary particles
+("ghosts"), and the fields those copies need are exchanged twice per step.
+
+```bat
+set SPH_RANKS=8
+sph_cuda.exe input.sphbin
+```
+
+| variable | effect |
+|---|---|
+| `SPH_RANKS=K` | number of ranks; unset or `1` = the ordinary single-GPU path |
+| `SPH_RANKS_GPUS=0,1,...` | which devices, in rank order (default `0..K-1`) |
+| `SPH_D1_SKIN=<m>` | ghost-shell skin past 3 h (default `1.5*hsml`); the shell is rebuilt when a particle has moved half of it |
+| `SPH_D1_REPART=N` | also rebuild the decomposition every N steps |
+| `SPH_D1_REGRID=1` | re-search the block grid at every rebuild |
+| `SPH_D1_SPLIT=nx,ny,nz` | force one factorisation of K (A/B switch) |
+| `SPH_D1PROF=1` | per-phase and per-exchange-point timings |
+| `SPH_BARRIER=spin\|block` | rank-barrier implementation (default adaptive) |
+| `SPH_D1_DBG=1` | extra stderr: displacements and device memory after a rebuild |
+
+The ghost set is only complete at the instant it is selected, so the skin is not
+optional book-keeping: `step_d1()` measures `max |x - x_build|` over the owned
+particles of every rank, and when it passes half the skin the ranks rebuild the
+decomposition together.  `SPH_D1_SKIN=0` restores the old behaviour (ghosts
+chosen once, never revalidated) and prints a warning, because a long run then
+silently drops interactions: at K=8 on `input.dat` that is 1.9e-6 m and 1.6 Pa
+away from the single-GPU answer after 3001 steps, against 1.2e-15 m with the
+skin.  A rebuild costs ~175 ms for 237 k particles, so a 1.5 h skin pays about
+0.3 ms/step; a wider skin trades ghost memory for fewer rebuilds.
+
+Two constraints: the decomposition is fp64 only (`SPH_RANKS` + `--fp32` is
+refused), and a deck whose walls have a non-zero velocity is refused too -- E1
+exchanges the fluid and solid groups only, so a moving wall would not reach its
+ghosts.
+
 ## Precision
 
 Both instantiations are compiled in by default; CMake can trim the build:

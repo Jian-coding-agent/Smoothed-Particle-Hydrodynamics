@@ -298,7 +298,7 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
 }
 
 // exclusive scan over s.d.ncell, then re-arm the cursor array for the scatter
-// pass.  One 1024-thread block walks the cells in chunks of 1024*32 and carries
+// pass.  One 512-thread block walks the cells in chunks of 512*32 and carries
 // the running total across chunks, so the grid may be any size (the new deck
 // needs 188552 cells; the old case needed 32076, hence the old static_assert).
 __global__ void k_cell_scan(int* __restrict__ start, int* __restrict__ cnt, int ncell)
@@ -1669,45 +1669,68 @@ __global__ void k_gra_invert(SphPtrsT<Real> s, const Real* __restrict__ a, int b
 // hold copies of the particles it owns, and pulls the fields of the copies it
 // holds.  Records are plain double arrays in pinned host memory:
 //
-//   E1 (after k_prepare)  fluid 12 doubles
-//        x0,x1,x2, vx0,vx1,vx2, rho, p, SurFD, PIJW0,PIJW1,PIJW2
-//                         solid 24 doubles
-//        the same 12 followed by Pia[0..11]
-//   E2 (after k_constitution)  solid 13 doubles  rho, Pia[0..11]
-//   E3 (after pass2_fluid)     fluid  3 doubles  PIJW0..2
-//   one-off init               solid/wall 12 doubles  A[0..8], vecn0..2
+//   E1 (after k_prepare)  fluid 8 doubles    x0..2, vx0..2, rho, SurFD
+//   E1 (after k_prepare)  solid 7 doubles    x0..2, vx0..2, rho
+//   E2 (after k_constitution) solid 13       rho, Pia[0..11]
+//   one-off init          solid/wall 12      A[0..8], vecn0..2
 //
-// irho is NOT in the record: it is just 1/rho from k_prepare, so the receiving
-// side recomputes it for its ghost block with the identical expression (see
-// k_xch_irho) and the bits match.  SurFD, by contrast, is the accumulated
-// surface field produced by pass1_fluid -- history, not a function of the deck
-// -- so it has to be sent.  (A ghost *solid*'s SurFD is always 0, but the
-// record is shared with the fluid ghosts and one double is cheaper than a
-// second layout.)
+// What is *not* sent, on purpose (P9):
+//   p, irho   pure functions of rho -- the receiving side evaluates exactly the
+//             expressions k_prepare uses (k_xch_fixup), so the bits match;
+//   Pia (E1)  only pass2_solid reads a ghost solid's Pia, and E2 has already
+//             overwritten it by then;
+//   PIJW      never written for a fluid, never read for a ghost solid: E3 would
+//             ship three zeros per ghost fluid every step (P8).
+// SurFD is the accumulated surface field produced by pass1_fluid -- history,
+// not a function of the deck -- so it is sent for fluids.  A ghost *solid*'s
+// SurFD is always 0 (no kernel writes it), so the solid record leaves it out
+// and the slot keeps the 0 the allocation was cleared to.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void sph_xch_read12(const SphPtrsD& s, int q, double* o)
+__device__ __forceinline__ void sph_xch_read_f(const SphPtrsD& s, int q, double* o)
 {
-    o[0] = s.x[q];      o[1] = s.x[N + q];      o[2]  = s.x[2 * N + q];
-    o[3] = s.vx[q];     o[4] = s.vx[N + q];     o[5]  = s.vx[2 * N + q];
-    o[6] = s.rho[q];    o[7] = s.p[q];          o[8]  = s.SurFD[q];
-    o[9] = s.PIJW[q];   o[10] = s.PIJW[N + q];  o[11] = s.PIJW[2 * N + q];
+    o[0] = s.x[q];   o[1] = s.x[N + q];   o[2] = s.x[2 * N + q];
+    o[3] = s.vx[q];  o[4] = s.vx[N + q];  o[5] = s.vx[2 * N + q];
+    o[6] = s.rho[q]; o[7] = s.SurFD[q];
 }
 
-__device__ __forceinline__ void sph_xch_write12(SphPtrsD& s, int g, const double* o)
+__device__ __forceinline__ void sph_xch_write_f(SphPtrsD& s, int g, const double* o)
 {
-    s.x[g]       = o[0];  s.x[N + g]      = o[1];  s.x[2 * N + g]  = o[2];
-    s.vx[g]      = o[3];  s.vx[N + g]     = o[4];  s.vx[2 * N + g] = o[5];
-    s.rho[g]     = o[6];  s.p[g]          = o[7];  s.SurFD[g]      = o[8];
-    s.PIJW[g]    = o[9];  s.PIJW[N + g]   = o[10]; s.PIJW[2 * N + g] = o[11];
+    s.x[g]   = o[0]; s.x[N + g]   = o[1]; s.x[2 * N + g]   = o[2];
+    s.vx[g]  = o[3]; s.vx[N + g]  = o[4]; s.vx[2 * N + g]  = o[5];
+    s.rho[g] = o[6]; s.SurFD[g]   = o[7];
 }
 
-// irho of the ghost block: exactly the expression k_prepare uses on the owner,
-// applied to the rho that just arrived bit-exactly through E1.
-__global__ void k_xch_irho(SphPtrsD s, int base)
+__device__ __forceinline__ void sph_xch_read_s(const SphPtrsD& s, int q, double* o)
+{
+    o[0] = s.x[q];  o[1] = s.x[N + q];  o[2] = s.x[2 * N + q];
+    o[3] = s.vx[q]; o[4] = s.vx[N + q]; o[5] = s.vx[2 * N + q];
+    o[6] = s.rho[q];
+}
+
+__device__ __forceinline__ void sph_xch_write_s(SphPtrsD& s, int g, const double* o)
+{
+    s.x[g]  = o[0]; s.x[N + g]  = o[1]; s.x[2 * N + g]  = o[2];
+    s.vx[g] = o[3]; s.vx[N + g] = o[4]; s.vx[2 * N + g] = o[5];
+    s.rho[g] = o[6];
+}
+
+// irho of the ghost block, and p of the ghost *fluid* block: exactly the
+// expressions k_prepare applies on the owner, applied to the rho that just
+// arrived bit-exactly through E1.  Ghosts run no physics kernel of their own,
+// so this is the whole of their "prepare".
+__global__ void k_xch_fixup(SphPtrsD s, int base, int nfluid_ghost)
 {
     const int i = base + blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= s.d.numP) return;
-    s.irho[i] = 1.0 / s.rho[i];
+    const double rho = s.rho[i];
+    s.irho[i] = 1.0 / rho;
+    if (i - base < nfluid_ghost)
+    {
+        const double C0 = SPH_C0;
+        double pv = C0 * C0 * (rho - 1000.0);
+        if (rho < 1000.0) pv = 0.0;
+        s.p[i] = pv;
+    }
 }
 
 template <int MODE>
@@ -1718,25 +1741,19 @@ __global__ void k_xch_gather(const SphPtrsD s, const int* __restrict__ idx,
     if (i >= n) return;
     const int q = idx[i];
     double* o = arena + off[i];
-    if (MODE == 0)                                  // E1 fluid, 12
+    if (MODE == 0)                                  // E1 fluid, 8
     {
-        sph_xch_read12(s, q, o);
+        sph_xch_read_f(s, q, o);
     }
-    else if (MODE == 1)                             // E1 solid, 24
+    else if (MODE == 1)                             // E1 solid, 7
     {
-        sph_xch_read12(s, q, o);
-        const double* pb = s.Pia + (size_t)(q - s.d.ntotal) * SPH_PIA_STRIDE;
-        for (int c = 0; c < SPH_PIA_STRIDE; ++c) o[12 + c] = pb[c];
+        sph_xch_read_s(s, q, o);
     }
     else if (MODE == 2)                             // E2 solid, 13
     {
         o[0] = s.rho[q];
         const double* pb = s.Pia + (size_t)(q - s.d.ntotal) * SPH_PIA_STRIDE;
         for (int c = 0; c < SPH_PIA_STRIDE; ++c) o[1 + c] = pb[c];
-    }
-    else if (MODE == 3)                             // E3 fluid, 3
-    {
-        o[0] = s.PIJW[q]; o[1] = s.PIJW[N + q]; o[2] = s.PIJW[2 * N + q];
     }
     else                                            // one-off init, 12
     {
@@ -1753,15 +1770,13 @@ __global__ void k_xch_scatter(SphPtrsD s, const int* __restrict__ idx,
     if (i >= n) return;
     const int g = idx[i];
     const double* o = base + off[i];
-    if (MODE == 0)                                  // E1 fluid, 12
+    if (MODE == 0)                                  // E1 fluid, 8
     {
-        sph_xch_write12(s, g, o);
+        sph_xch_write_f(s, g, o);
     }
-    else if (MODE == 1)                             // E1 solid, 24
+    else if (MODE == 1)                             // E1 solid, 7
     {
-        sph_xch_write12(s, g, o);
-        double* pb = s.Pia + (size_t)(g - s.d.ntotal) * SPH_PIA_STRIDE;
-        for (int c = 0; c < SPH_PIA_STRIDE; ++c) pb[c] = o[12 + c];
+        sph_xch_write_s(s, g, o);
     }
     else if (MODE == 2)                             // E2 solid, 13
     {
@@ -1771,10 +1786,6 @@ __global__ void k_xch_scatter(SphPtrsD s, const int* __restrict__ idx,
         s.irho[g] = 1.0 / o[0];
         double* pb = s.Pia + (size_t)(g - s.d.ntotal) * SPH_PIA_STRIDE;
         for (int c = 0; c < SPH_PIA_STRIDE; ++c) pb[c] = o[1 + c];
-    }
-    else if (MODE == 3)                             // E3 fluid, 3
-    {
-        s.PIJW[g] = o[0]; s.PIJW[N + g] = o[1]; s.PIJW[2 * N + g] = o[2];
     }
     else                                            // one-off init, 12
     {
@@ -1791,6 +1802,44 @@ __global__ void k_xch_scatter(SphPtrsD s, const int* __restrict__ idx,
         s.irho[g] = 1.0 / s.rho[g];
         s.SurFD[g] = 0.0;
     }
+}
+
+// ---------------------------------------------------------------------------
+// C9: how far the owned particles have moved since the ghost set was chosen.
+// The ghost test is a per-axis box test, so the Chebyshev distance is the right
+// metric: a particle that moved at most s/2 on every axis can only bring a
+// pair s closer.  Reduced within the block, then one atomicMax per block; the
+// value is a non-negative double, so its IEEE bit pattern orders like the value
+// and an unsigned 64-bit atomicMax works.
+// ---------------------------------------------------------------------------
+__global__ void k_disp_max(const SphPtrsD s, const double* __restrict__ xb,
+                           unsigned long long* __restrict__ out)
+{
+    __shared__ double smax[256];
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    double d = 0.0;
+    if (i < s.d.num)
+    {
+        const int n = s.d.num;
+        d = fabs(s.x[i] - xb[i]);
+        const double dy = fabs(s.x[N + i] - xb[n + i]);
+        const double dz = fabs(s.x[2 * N + i] - xb[2 * n + i]);
+        if (dy > d) d = dy;
+        if (dz > d) d = dz;
+    }
+    smax[threadIdx.x] = d;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1)
+    {
+        if (threadIdx.x < st)
+        {
+            const double o = smax[threadIdx.x + st];
+            if (o > smax[threadIdx.x]) smax[threadIdx.x] = o;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0 && smax[0] > 0.0)
+        atomicMax(out, (unsigned long long)__double_as_longlong(smax[0]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1812,6 +1861,9 @@ int sph_fast_fluid_loop = 1;
 int sph_use_fluid_list = 1;
 // A6 switch: 1 = store only sQ (4 B/pair) and recompute the weights per step
 int sph_a3_lean = 1;
+// C12: installed by the decomposed driver so that every rank picks the same A6
+// layout (see sph.h)
+double (*sph_a3_fat_hook)(double fat_mb) = nullptr;
 
 int gra_fallback_count()
 {
@@ -2048,24 +2100,24 @@ void launch_gra_invert(SphPtrsT<Real> s, Real* d_a, cudaStream_t st)
 // ---------------------------------------------------------------------------
 // D1 exchange launchers (fp64 records, see k_xch_gather above)
 //
-// The records of ALL peers live in one pinned arena per rank, at offsets the
-// host computed once; the gather kernel writes them straight into the mapped
-// arena and the scatter kernel reads the peers' arenas directly, so one step
-// costs two kernel launches per group instead of two DMA copies per peer.
+// The records of ALL peers live in one pinned block per rank, at offsets the
+// host computed once; the gather kernel writes them into a device staging
+// block that is copied to host memory in one call, and the scatter kernel reads
+// the relayed block after a single copy back.  One step therefore costs two
+// kernel launches and two copies per exchange point, not two copies per peer.
 // (With 8 ranks a 3-D block has up to 26 peers: per-peer cudaMemcpyAsync on
 // Windows/WDDM is ~150 us even for 30 kB, which used to dominate the step.)
 // ---------------------------------------------------------------------------
 void launch_xch_gather(const SphPtrsD s, int mode, const int* d_idx, const int* d_off,
-                       int n, double* d_arena, cudaStream_t st)
+                       int n, double* d_stage, cudaStream_t st)
 {
     if (n <= 0) return;
     switch (mode)
     {
-        case 0: k_xch_gather<0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_arena); break;
-        case 1: k_xch_gather<1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_arena); break;
-        case 2: k_xch_gather<2><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_arena); break;
-        case 3: k_xch_gather<3><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_arena); break;
-        default: k_xch_gather<4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_arena); break;
+        case 0: k_xch_gather<0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
+        case 1: k_xch_gather<1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
+        case 2: k_xch_gather<2><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
+        default: k_xch_gather<4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
     }
 }
 
@@ -2078,16 +2130,26 @@ void launch_xch_scatter(SphPtrsD s, int mode, const int* d_idx, const int* d_off
         case 0: k_xch_scatter<0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
         case 1: k_xch_scatter<1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
         case 2: k_xch_scatter<2><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
-        case 3: k_xch_scatter<3><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
         default: k_xch_scatter<4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
     }
 }
 
-// TASK 2: irho is 1/rho, so the ghost block rebuilds it instead of receiving it
-void launch_xch_irho(SphPtrsD s, cudaStream_t st)
+// TASK 2 / P9: irho is 1/rho and p is a function of rho, so the ghost block
+// rebuilds both instead of receiving them.  gs0 is the first ghost-solid slot,
+// so [num, gs0) is the ghost *fluid* block -- the only block whose p is read.
+void launch_xch_fixup(SphPtrsD s, cudaStream_t st)
 {
     const int n = s.d.numP - s.d.num;
-    if (n > 0) k_xch_irho<<<nblocks(n), BLK, 0, st>>>(s, s.d.num);
+    if (n <= 0) return;
+    const int nfluid = s.d.gs0 - s.d.num;
+    k_xch_fixup<<<nblocks(n), BLK, 0, st>>>(s, s.d.num, nfluid);
+}
+
+void launch_disp_max(const SphPtrsD s, const double* d_xbuild,
+                     unsigned long long* d_max, cudaStream_t st)
+{
+    if (s.d.num <= 0) return;
+    k_disp_max<<<nblocks(s.d.num), BLK, 0, st>>>(s, d_xbuild, d_max);
 }
 
 // ---------------------------------------------------------------------------

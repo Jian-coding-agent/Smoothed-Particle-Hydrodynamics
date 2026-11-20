@@ -16,8 +16,9 @@ mirror-Riemann fluid–structure coupling.  It comes in two forms:
   that one binary runs in **fp64** (default) or **fp32**, selected at run time.
 
 Both read the same `input.dat` (237,298 particles: 101,250 fluid, 60,320 solid
-and 75,728 wall particles; 11.1 M neighbour pairs at t = 0) and write
-`result<N>.dat` every 50 steps, with a fixed `dt = 1e-5`.
+and 75,728 wall particles; 11.1 M neighbour pairs at t = 0) and step with a
+fixed `dt = 1e-5`.  The CPU reference writes `result<N>.dat` every 50 steps; the
+CUDA port writes the self-describing `result<N>.sphbin` every 500 steps.
 
 ## Performance
 
@@ -103,8 +104,10 @@ cuda\build\sph_cuda.exe          :: fp64
 cuda\build\sph_cuda.exe --fp32   :: single precision
 ```
 
-This writes `result0.dat` … `result9.dat` (one file every 50 steps) into the
-current directory.  `cuda\build\sph_cuda.exe --help` lists the other options.
+This writes `result0.sphbin` … (one file every 500 steps) into the current
+directory.  `cuda\build\sph_cuda.exe --help` lists the other options, and
+`cuda\README.md` documents the environment switches, including `SPH_RANKS=K` for
+the multi-GPU (D1) driver.
 
 ### CPU reference
 
@@ -146,9 +149,15 @@ docs/
 
 ## Notes
 
-* `result*.dat` column 4 (the pressure) is the value the step *used*, i.e. it is
-  one update older than `x`, `vx` and `rho` in the same row.  `p` is therefore
-  not `c0^2 (rho - 1000)`; this reproduces the reference solver exactly.
+* **The CUDA port follows a newer version of the case than `cpu/1.cpp`.**  The
+  port has no solid clamp and reflects a fluid particle at `z > 1.0`; `1.cpp`
+  is still the old case (it clamps the solid at step 193 and writes text every
+  50 steps).  The port's correctness baseline is therefore the *physics*, not a
+  byte-for-byte match with the committed `1.cpp` past the first 500 steps; the
+  diff that defines the new case should be committed with it.
+* `result*.sphbin` column 4 (the pressure) is the value the step *used*, i.e. it
+  is one update older than `x`, `vx` and `rho` in the same record.  `p` is
+  therefore not `c0^2 (rho - 1000)`; this reproduces the reference solver exactly.
 * The 500-step reference results (`result0..9.dat`, ~200 MB) are **not** stored
   in the repository.  Regenerate them with the CPU solver and compare with
   `cpu\tools\CompareResults.exe <workdir> <reference-dir>`.
@@ -156,6 +165,8 @@ docs/
   ordinary CUDA C++.
 * `input.dat` is a 14-column text deck; the solver reads and writes it relative
   to the working directory.
+* Reviews of the port live in `review/Claude/`; the findings they raise are
+  tracked there (and, once fixed, in `cuda/docs/DESIGN.md`).
 
 ## License
 

@@ -943,3 +943,120 @@ With C2 applied as well the width is 92 (padding 14.6 %) and fp64 memory 402 MB.
   bit reproducibility through the scatter; a deterministic alternative (per-pair
   buffer + reverse CSR) costs ~0.7 ms of traffic.
 * **C7**, above.
+
+---
+
+## 14. The second review: the domain decomposition (C9-C15, P8, P9)
+
+[`review/Claude/REVIEW-2026-11-19-multi-gpu.md`](../../review/Claude/REVIEW-2026-11-19-multi-gpu.md)
+reviewed the decomposition (D1), the lean solid list (A6) and the binary I/O.  It
+found that the decomposition is correct only while particles stay near where they
+were when the ghosts were chosen, and that repartition -- the remedy -- was itself
+wrong.  Both are fixed here, together with the smaller findings, and the exchange
+records are slimmer.  All numbers below were re-measured on 8 x RTX 5090 D
+(`sm_120`), CUDA 13.5, fp64, one rank per card, `input.dat` (237 298 particles)
+unless the row says otherwise.
+
+### 14.1 C9: the ghost set was chosen once and never revalidated
+
+`build_ranks()` selects the ghosts of a rank as the particles inside its block
+grown by 3 h, which is complete only at that instant.  There was no skin and no
+check, and `SPH_D1_REPART` defaults to 0, so the default decomposed run silently
+lost interactions as soon as the fluid started to move: the review measured the
+first missing fluid pair at step ~1750 (K = 8) and 4.4e-3 m / 1.9e4 Pa of
+deviation from one GPU at step 6000.
+
+**Fix.**  Three parts, all in `step_d1()` and `build_ranks()`:
+
+1. the ghost shell is `3h + s` with `s = SPH_D1_SKIN` (default 1.5 h);
+2. every step each rank reduces `max |x - x_build|` over its owned particles (a
+   Chebyshev distance, matching the per-axis box test) into a parity-buffered
+   host slot, and reads all ranks' values back after E1's barrier -- the values
+   are published *before* the barrier and read after it, so the K ranks agree on
+   the maximum without spending a barrier of their own;
+3. when the maximum passes `s/2` they rebuild the decomposition together, reuse
+   the repartition path, and reset `x_build`.
+
+The argument is the standard Verlet one: a particle that was not selected was
+more than `3h + s` from the block on some axis, and if both ends of a pair move at
+most `s/2` on every axis, they are still more than 3 h apart.
+
+`SPH_D1_SKIN=0` restores the old behaviour for A/B runs and prints a warning.
+
+### 14.2 C10: repartition selected ghosts and grids from t = 0
+
+`repartition()` cut the new boxes from the current positions but called
+`build_ranks(J, J.deckRows, ...)`, i.e. the deck as read at start-up.  So the new
+ghost set and every rank's neighbour grid (`finish_deck()` derives it from the row
+extremes) came from t = 0 coordinates: a rank's particles could lie outside its
+own grid (the C7 cliff), and turning repartition on made a correct run wrong
+(5.0e-3 m / 643 Pa at step 6000 in the review).
+
+**Fix.**  Rank 0 builds a copy of the deck with `x`, `vx` and `rho` overwritten
+from the live state and passes that to `build_ranks()`.
+
+### 14.3 The smaller findings
+
+| id | what was done |
+|---|---|
+| C11 | `xch_free()` frees the 20 index/offset arrays `build_send_lists()` allocates, and zeroes the counts; device memory is now flat across rebuilds (1781 / 2171 MB per rank over 19 events). |
+| C12 | the A6 lean/fat choice is taken by all ranks together: `sph_a3_fat_hook` publishes each rank's fat size, meets at the rank barrier, and hands back the maximum.  A rank that owns no solid still joins the barrier (with a fat size of 0) -- otherwise it walks past the barrier the others are waiting at and the run desyncs.  With `SPH_A3_LIMIT_MB=100`, three runs in a row now all choose lean; before, six identical runs split 3/3. |
+| C13 | the decomposed driver refuses a deck whose walls have a non-zero velocity: E1 carries the fluid and solid groups only, so a moving wall would never reach its ghosts.  Every wall in this deck is static, and a static wall cannot start moving (no kernel writes `SForce` or `PIJW` for it). |
+| C14 | solid ghosts are selected by current *or* reference position.  The A3 pairs are evaluated in the reference configuration, so a partner can be inside the reference shell of a rank's solids while being outside the shell of its current block.  The reference box of a rank's own solids is static, so this adds only a few particles; `make_part()` counts them the same way. |
+| C15 | `sph_matvec()` strides by `numP` (the tensors are ghost-strided); `init_reference_state()` clears `numP`-strided arrays; the profiler's gather column is labelled as a launch time; `gs0` is now read (it bounds the ghost-fluid block of the p rebuild). |
+
+### 14.4 P8 and P9: the exchange carries only what is read
+
+E3 shipped the fluid `PIJW` after `pass2_fluid`, and no kernel ever writes `PIJW`
+for a fluid particle -- it is three zeros per ghost fluid per step.  E1 shipped
+`p`, `PIJW` and (for solids) `Pia`, none of which the receiving side needs:
+`p` and `irho` are functions of `rho`, and `Pia` is overwritten by E2 before
+`pass2_solid` reads it.
+
+The records are now 8 doubles for a fluid (x, vx, rho, SurFD) and 7 for a solid
+(x, vx, rho), against 12 and 24; E3 is gone; `launch_xch_fixup()` rebuilds `p`
+and `irho` for the ghost block with the expressions `k_prepare()` uses, so the
+bits are unchanged.
+
+### 14.5 Measurements
+
+Validation (all against the same binary's single-GPU run; `max|dx|` is the
+worst position difference, `max|dp|` the worst pressure difference):
+
+| run (3001 steps) | max abs dx | max abs dp |
+|---|---:|---:|
+| K = 1, old binary vs new binary (501 steps) | 0 (byte-identical) | 0 |
+| K = 8, 501 steps, new vs single GPU | 3.3e-16 m | 2.4e-7 Pa |
+| K = 8, **skin trigger**, 3001 steps | **1.2e-15 m** | 3.1e-7 Pa |
+| K = 8, `SPH_D1_SKIN=0` (old behaviour), 3001 steps | **1.9e-6 m** | 1.6 Pa |
+| K = 8, `SPH_D1_REPART=1000` (C10 fixed), 3001 steps | 1.7e-15 m | 2.3e-7 Pa |
+
+The skin costs what it costs: 68 411 -> 102 602 ghost slots (+50 %) on this deck,
+six rebuilds in 3001 steps at 175 ms each, i.e. ~0.3 ms/step.  It pays for
+itself because P8/P9 bought back more than that:
+
+| K = 8, 501 steps | ms/step |
+|---|---:|
+| old exchange (E1 12/24, E3 on) | 2.396 |
+| new exchange (E1 8/7, no E3), no skin | **2.134** (-11 %) |
+| new exchange with the 1.5 h skin | 2.388 |
+
+### 14.6 What is still open
+
+* **P10** (double-buffer the send block: one barrier per exchange point), **P11**
+  (a two-layer solid halo to remove E2), **P12** (overlap the exchange with the
+  interior work), **P13** (compact solid slots) and **P14** (asynchronous output)
+  are not implemented; the review's estimates for them are 2.7-3.3 ms/step at
+  K = 8 against 3.4-4.7 today.
+* **L1/L2**: the code balances the work over the K cards it is given; it does not
+  choose K or which cards, and the weights (fluid 1.0, solid 0.5, wall 0) are
+  calibrated for the fat list while auto mode goes lean at 10^7 particles, where a
+  solid particle costs 0.97 of a fluid one rather than 0.41.
+* **V2**: K > 1 still differs from K = 1 at the 1e-16 level because the
+  summation order differs.  Making every rank use the global grid and ordering
+  cells by `gid` would make K > 1 byte-identical, and then a halo bug could never
+  hide under rounding noise again.
+* **M8** is a question for the physics owner: `k_update_fluid()` reflects `v_z`
+  whenever `z > 1.0`, including for a particle already moving down.  The fluid in
+  `input.dat` stays below 0.45 m, so nothing here exercises it.
+
