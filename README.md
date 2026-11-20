@@ -106,8 +106,10 @@ cuda\build\sph_cuda.exe --fp32   :: single precision
 
 This writes `result0.sphbin` … (one file every 500 steps) into the current
 directory.  `cuda\build\sph_cuda.exe --help` lists the other options, and
-`cuda\README.md` documents the environment switches, including `SPH_RANKS=K` for
-the multi-GPU (D1) driver.
+`cuda\README.md` documents the environment switches, including `SPH_RANKS=K` (or
+`SPH_RANKS=auto`) for the multi-GPU driver.  With more than one rank the results
+are **byte-identical** to the single-GPU run -- that is the validation standard
+the driver is tested against.
 
 ### CPU reference
 

@@ -149,15 +149,16 @@ __global__ void k_cell_hist(SphPtrsT<Real> s, int* __restrict__ cnt,
 
 // ---------------------------------------------------------------------------
 // static pack for the solid kernels: {X0[3], A[9], rho0, mass} per solid
-// particle, contiguous.  Built once (after GraCorrec), never updated.
+// particle, contiguous in *slot* order (P13): owned solids first, then the ghost
+// solids.  Built once (after GraCorrec), never updated.
 // ---------------------------------------------------------------------------
 template <class Real>
-__global__ void k_build_solid_pack(SphPtrsT<Real> s, int base)
+__global__ void k_build_solid_pack(SphPtrsT<Real> s, int pbase, int slotbase, int n)
 {
-    const int p = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= s.d.numP) return;                // D1: also fills the ghost slots
-    const int k = p - s.d.ntotal;
-    Real* d = s.solidPack + (size_t)k * 14;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int p = pbase + i;
+    Real* d = s.solidPack + (size_t)(slotbase + i) * 14;
     d[0] = s.X0[p]; d[1] = s.X0[N + p]; d[2] = s.X0[2 * N + p];
     for (int c = 0; c < 9; ++c) d[3 + c] = s.A[(size_t)c * N + p];
     d[12] = s.rho0[p];
@@ -231,8 +232,11 @@ __device__ __forceinline__ void solid_pair_G_lean(const Real* pk,
 template <class Real>
 __global__ void k_solid_pair_count(SphPtrsT<Real> s, int* __restrict__ cnt)
 {
-    const int p = s.d.ntotal + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= s.d.nall) return;
+    // P11: launched over *slots*, so the owned solids and the layer-1 ghost solids
+    // form one contiguous range; a ghost builds exactly the list its owner builds.
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= s.d.nsolC) return;
+    const int p = sph_sol_particle(s, k);
 
     const Real Xp0 = s.X0[p], Xp1 = s.X0[N + p], Xp2 = s.X0[2 * N + p];
     int n = 0;
@@ -242,7 +246,7 @@ __global__ void k_solid_pair_count(SphPtrsT<Real> s, int* __restrict__ cnt)
         Real g0x, g0y, g0z;
         if (solid_pair_geom(s, q, Xp0, Xp1, Xp2, g0x, g0y, g0z)) ++n;
     });
-    cnt[p - s.d.ntotal] = n;
+    cnt[k] = n;
 }
 
 // pass 2 of 2: write the per-pair constants at slot j*SOLNUM + k (ELL, P2).
@@ -253,10 +257,10 @@ __global__ void k_solid_pair_count(SphPtrsT<Real> s, int* __restrict__ cnt)
 template <class Real, bool LEAN>
 __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
 {
-    const int p = s.d.ntotal + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= s.d.nall) return;
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= s.d.nsolC) return;
+    const int p = sph_sol_particle(s, k);
 
-    const int k = p - s.d.ntotal;
     const Real Xp0 = s.X0[p], Xp1 = s.X0[N + p], Xp2 = s.X0[2 * N + p];
     const Real Ap0 = s.A[p],         Ap1 = s.A[N + p],     Ap2 = s.A[2 * N + p];
     const Real Ap3 = s.A[3 * N + p], Ap4 = s.A[4 * N + p], Ap5 = s.A[5 * N + p];
@@ -283,7 +287,7 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
         const Real Dy = -(Aq3 * Gx + Aq4 * Gy + Aq5 * Gz);
         const Real Dz = -(Aq6 * Gx + Aq7 * Gy + Aq8 * Gz);
 
-        const size_t e = (size_t)j * s.d.solnum + k;
+        const size_t e = (size_t)j * s.d.nsolC + k;
         s.sQ[e]      = q;
         if constexpr (!LEAN)
         {
@@ -351,7 +355,13 @@ __global__ void k_cell_scan(int* __restrict__ start, int* __restrict__ cnt, int 
 // deterministic order inside each cell (insertion sort by particle index).
 // Without it the neighbour sum order follows the atomic scatter arrival order,
 // so runs are not bit-identical and an optimisation cannot be verified by bits.
-__global__ void k_cell_sort(const int* __restrict__ start, int* __restrict__ sorted, int ncell)
+//
+// V2: with ghosts (gid != null) the key is the *global* id, so a rank visits the
+// particles of a cell in exactly the order the single-GPU run does.  On one rank
+// gid is null and the local index is the global one, which is why K > 1 can now be
+// byte-identical to K = 1.
+__global__ void k_cell_sort(const int* __restrict__ start, int* __restrict__ sorted,
+                            int ncell, const int* __restrict__ gid)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ncell) return;
@@ -359,8 +369,13 @@ __global__ void k_cell_sort(const int* __restrict__ start, int* __restrict__ sor
     for (int a = a0 + 1; a < a1; ++a)
     {
         const int v = sorted[a];
+        const int kv = gid ? gid[v] : v;
         int b = a - 1;
-        while (b >= a0 && sorted[b] > v) { sorted[b + 1] = sorted[b]; --b; }
+        while (b >= a0 && (gid ? gid[sorted[b]] : sorted[b]) > kv)
+        {
+            sorted[b + 1] = sorted[b];
+            --b;
+        }
         sorted[b + 1] = v;
     }
 }
@@ -788,12 +803,14 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid_body(SphPtrsT<Real> s)
 // step 2.1 : solid side of pass 1  (deformation gradient + friction rate)
 // ---------------------------------------------------------------------------
 template <class Real>
-__global__ void k_pass1_solid(SphPtrsT<Real> s, int base)
+__global__ void k_pass1_solid(SphPtrsT<Real> s)
 {
     const Real invh = sph_inv_h<Real>();
 
-    const int p = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= s.d.nall) return;
+    // P11: over slots (owned solids + layer-1 ghost solids)
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= s.d.nsolC) return;
+    const int p = sph_sol_particle(s, k);
 
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
     const Real vi0 = s.vx[p], vi1 = s.vx[N + p], vi2 = s.vx[2 * N + p];
@@ -824,11 +841,10 @@ __global__ void k_pass1_solid(SphPtrsT<Real> s, int base)
     {
         if (s.itype[q] >= Real(-10.0)) return;              // solid/solid only
 
-        // solidPack only covers [NTOTAL, NALL); particles outside that range can
-        // still carry itype < -10 (they then have A = 0, exactly as in 1.cpp)
-        const int kq = q - s.d.ntotal;
-        const bool inpack = (kq >= 0) && (kq < s.d.numP - s.d.ntotal);
-        const Real* pk = s.solidPack + (size_t)(inpack ? kq : 0) * 14;
+        // P13: only solid particles have a pack slot
+        const bool inpack = sph_has_sol_slot(s, q);
+        const int kq = inpack ? sph_sol_slot(s, q) : 0;
+        const Real* pk = s.solidPack + (size_t)kq * 14;
         const Real qX0 = inpack ? pk[0] : s.X0[q];
         const Real qX1 = inpack ? pk[1] : s.X0[N + q];
         const Real qX2 = inpack ? pk[2] : s.X0[2 * N + q];
@@ -885,8 +901,11 @@ __global__ void k_pass1_solid(SphPtrsT<Real> s, int base)
 template <class Real, bool LEAN>
 __global__ void k_pass1_solid_static(SphPtrsT<Real> s)
 {
-    const int p = s.d.ntotal + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= s.d.nall) return;
+    // P11: over slots -- owned solids plus the layer-1 ghost solids, which have to
+    // produce their own F/DFdt (and hence their own Pia) so that E2 can go away.
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= s.d.nsolC) return;
+    const int p = sph_sol_particle(s, k);
 
     const bool lowp = (sizeof(Real) < sizeof(double));
     const Real xp0 = s.x[p], xp1 = s.x[N + p], xp2 = s.x[2 * N + p];
@@ -916,18 +935,17 @@ __global__ void k_pass1_solid_static(SphPtrsT<Real> s)
     Real D21 = Real(0.0), D22 = Real(0.0), D23 = Real(0.0);
     Real D31 = Real(0.0), D32 = Real(0.0), D33 = Real(0.0);
 
-    const int k = p - s.d.ntotal;
     const int n = s.sCnt[k];
     for (int j = 0; j < n; ++j)
     {
-        const size_t e = (size_t)j * s.d.solnum + k;
+        const size_t e = (size_t)j * s.d.nsolC + k;
         const int q = s.sQ[e];
 
         Real bx, by, bz, gx, gy, gz;
         if constexpr (LEAN)
         {
-            const int kq = q - s.d.ntotal;
-            if (kq < 0 || kq >= s.d.numP - s.d.ntotal) continue;
+            const int kq = sph_has_sol_slot(s, q) ? sph_sol_slot(s, q) : -1;
+            if (kq < 0) continue;
             solid_pair_G_lean(s.solidPack + (size_t)kq * 14, Xp0, Xp1, Xp2, gx, gy, gz);
             bx = Ap0 * gx + Ap1 * gy + Ap2 * gz;
             by = Ap3 * gx + Ap4 * gy + Ap5 * gz;
@@ -969,10 +987,13 @@ __global__ void k_pass1_solid_static(SphPtrsT<Real> s)
 // step 2.3 : solid constitution (needs the freshly reduced F / DFdt)
 // ---------------------------------------------------------------------------
 template <class Real>
-__global__ void k_constitution(SphPtrsT<Real> s, int base)
+__global__ void k_constitution(SphPtrsT<Real> s)
 {
-    const int p = base + blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= s.d.nall) return;
+    // P11: over slots -- a layer-1 ghost solid runs the same law as its owner, with
+    // the same A3 partner list, so its rho/Pia are bit-identical and E2 is gone.
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= s.d.nsolC) return;
+    const int p = sph_sol_particle(s, k);
 
     // Evaluated in double for BOTH precisions (C = calculation type).  For Real =
     // double nothing changes.  For Real = float: the law is ill conditioned
@@ -1059,7 +1080,7 @@ __global__ void k_constitution(SphPtrsT<Real> s, int base)
     const C t31 = n13, t32 = n23, t33 = n33;
 
     const C lg = log10(Jacb);
-    Real* pb = s.Pia + (size_t)(p - s.d.ntotal) * SPH_PIA_STRIDE;
+    Real* pb = s.Pia + (size_t)sph_sol_slot(s, p) * SPH_PIA_STRIDE;
     pb[0] = Real(MU * (F11 - t11) + LA * lg * t11 + PD11);
     pb[1] = Real(MU * (F12 - t12) + LA * lg * t12 + PD12);
     pb[2] = Real(MU * (F13 - t13) + LA * lg * t13 + PD13);
@@ -1156,7 +1177,7 @@ __global__ void k_pass2_solid(SphPtrsT<Real> s, int base)
     // compiler cannot hoist the loads (it cannot prove Pia/PIJW do not alias), and
     // the loop ended up issuing 64 scattered 64-bit loads per neighbour.
     typedef typename SphVec2T<Real>::type V2;
-    const Real* pbp = s.Pia + (size_t)(p - s.d.ntotal) * SPH_PIA_STRIDE;
+    const Real* pbp = s.Pia + (size_t)sph_sol_slot(s, p) * SPH_PIA_STRIDE;
     const V2* vp = reinterpret_cast<const V2*>(pbp);
     const Real P00 = vp[0].x, P01 = vp[0].y;
     const Real P02 = vp[1].x, P10 = vp[1].y;
@@ -1175,9 +1196,10 @@ __global__ void k_pass2_solid(SphPtrsT<Real> s, int base)
     {
         const Real mq = s.mass[q], rhoq = s.rho[q];
 
-        const int kq = q - s.d.ntotal;
-        const bool inpack = (kq >= 0) && (kq < s.d.numP - s.d.ntotal);
-        const Real* pk = s.solidPack + (size_t)(inpack ? kq : 0) * 14;
+        // P13: only solid particles have a pack slot
+        const bool inpack = sph_has_sol_slot(s, q);
+        const int kq = inpack ? sph_sol_slot(s, q) : 0;
+        const Real* pk = s.solidPack + (size_t)kq * 14;
         const Real qX0 = inpack ? pk[0] : s.X0[q];
         const Real qX1 = inpack ? pk[1] : s.X0[N + q];
         const Real qX2 = inpack ? pk[2] : s.X0[2 * N + q];
@@ -1293,7 +1315,7 @@ __global__ void k_pass2_solid_static(SphPtrsT<Real> s)
     const Real vn0 = s.vecn[p], vn1 = s.vecn[N + p], vn2 = s.vecn[2 * N + p];
 
     typedef typename SphVec2T<Real>::type V2;
-    const Real* pbp = s.Pia + (size_t)(p - s.d.ntotal) * SPH_PIA_STRIDE;
+    const Real* pbp = s.Pia + (size_t)sph_sol_slot(s, p) * SPH_PIA_STRIDE;
     const V2* vp = reinterpret_cast<const V2*>(pbp);
     const Real P00 = vp[0].x, P01 = vp[0].y;
     const Real P02 = vp[1].x, P10 = vp[1].y;
@@ -1318,16 +1340,15 @@ __global__ void k_pass2_solid_static(SphPtrsT<Real> s)
     }
     for (int j = 0; j < n; ++j)
     {
-        const size_t e = (size_t)j * s.d.solnum + k;
+        const size_t e = (size_t)j * s.d.nsolC + k;
         const int q = s.sQ[e];
         const Real kq3 = s.rho0[q] * s.irho[q];               // rho0_q / rho_q
 
         Real gx, gy, gz;
         if constexpr (LEAN)
         {
-            const int kq0 = q - s.d.ntotal;
-            if (kq0 < 0 || kq0 >= s.d.numP - s.d.ntotal) continue;
-            solid_pair_G_lean(s.solidPack + (size_t)kq0 * 14, Xp0, Xp1, Xp2, gx, gy, gz);
+            if (!sph_has_sol_slot(s, q)) continue;
+            solid_pair_G_lean(s.solidPack + (size_t)sph_sol_slot(s, q) * 14, Xp0, Xp1, Xp2, gx, gy, gz);
         }
         else
         {
@@ -1338,8 +1359,8 @@ __global__ void k_pass2_solid_static(SphPtrsT<Real> s)
         u11 += kq3 * gy;
         u12 += kq3 * gz;
 
-        const int kq = q - s.d.ntotal;
-        if (kq < 0 || kq >= s.d.numP - s.d.ntotal) continue;   // no Pia for those
+        if (!sph_has_sol_slot(s, q)) continue;      // P13: no slot, no Pia
+        const int kq = sph_sol_slot(s, q);
         Real f0, f1, f2;
         if constexpr (LEAN)
         {
@@ -1440,7 +1461,7 @@ __global__ void k_copy_xf(SphPtrsT<Real> s)
 // step 3 : time integration
 // ---------------------------------------------------------------------------
 template <class Real>
-__global__ void k_update_fluid(SphPtrsT<Real> s)
+__global__ void k_update_fluid(SphPtrsT<Real> s, int reflect_guard)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= s.d.ntotal) return;
@@ -1479,7 +1500,13 @@ __global__ void k_update_fluid(SphPtrsT<Real> s)
     }
     // 1.cpp:186 -- reflect the vertical velocity at the free surface.
     // Same place in the sequence: after the MaxV clamp, before the store.
-    if (s.x[2 * N + i] > Real(1.0)) v2 = -v2;
+    //
+    // M8: 1.cpp flips v_z unconditionally above the plane, which also flips a
+    // particle that is already moving *down* and can leave it oscillating just
+    // above z = 1.  The standard reflection only mirrors outward motion, and that
+    // is the default here (SPH_REFLECT=flip restores the literal form).  No
+    // particle of this deck reaches z = 1, so the two agree on it.
+    if (s.x[2 * N + i] > Real(1.0) && (!reflect_guard || v2 > Real(0.0))) v2 = -v2;
     s.vx[i] = v0; s.vx[N + i] = v1; s.vx[2 * N + i] = v2;
 }
 
@@ -1749,12 +1776,6 @@ __global__ void k_xch_gather(const SphPtrsD s, const int* __restrict__ idx,
     {
         sph_xch_read_s(s, q, o);
     }
-    else if (MODE == 2)                             // E2 solid, 13
-    {
-        o[0] = s.rho[q];
-        const double* pb = s.Pia + (size_t)(q - s.d.ntotal) * SPH_PIA_STRIDE;
-        for (int c = 0; c < SPH_PIA_STRIDE; ++c) o[1 + c] = pb[c];
-    }
     else                                            // one-off init, 12
     {
         for (int c = 0; c < 9; ++c) o[c] = s.A[(size_t)c * N + q];
@@ -1777,15 +1798,6 @@ __global__ void k_xch_scatter(SphPtrsD s, const int* __restrict__ idx,
     else if (MODE == 1)                             // E1 solid, 7
     {
         sph_xch_write_s(s, g, o);
-    }
-    else if (MODE == 2)                             // E2 solid, 13
-    {
-        s.rho[g] = o[0];
-        // k_constitution computes irho as 1/rho on the owner; reproduce that
-        // exactly here so the copy carries the same bits.
-        s.irho[g] = 1.0 / o[0];
-        double* pb = s.Pia + (size_t)(g - s.d.ntotal) * SPH_PIA_STRIDE;
-        for (int c = 0; c < SPH_PIA_STRIDE; ++c) pb[c] = o[1 + c];
     }
     else                                            // one-off init, 12
     {
@@ -1861,6 +1873,9 @@ int sph_fast_fluid_loop = 1;
 int sph_use_fluid_list = 1;
 // A6 switch: 1 = store only sQ (4 B/pair) and recompute the weights per step
 int sph_a3_lean = 1;
+// M8: 1 = reflect only outward motion at z > 1.0 (default), 0 = flip v_z
+// unconditionally, which is what 1.cpp does (SPH_REFLECT=flip)
+int sph_reflect_guard = 1;
 // C12: installed by the decomposed driver so that every rank picks the same A6
 // layout (see sph.h)
 double (*sph_a3_fat_hook)(double fat_mb) = nullptr;
@@ -1884,7 +1899,12 @@ void launch_build_solid_pack(SphPtrsT<Real> s, cudaStream_t st)
     // the pack covers every slot from ntotal to numP: the owned solids, then
     // the owned walls (unused, but Pia/solidPack are indexed by q - ntotal) and
     // finally the ghost solids, whose A arrives through the one-off exchange.
-    k_build_solid_pack<Real><<<nblocks(s.d.numP - s.d.ntotal), BLK, 0, st>>>(s, s.d.ntotal);
+    // P13: owned solids first, then the ghost solids; walls and ghost fluids have
+    // no slot at all
+    if (s.d.solnum > 0)
+        k_build_solid_pack<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal, 0, s.d.solnum);
+    if (s.d.ngs > 0)
+        k_build_solid_pack<Real><<<nblocks(s.d.ngs), BLK, 0, st>>>(s, s.d.gs0, s.d.solnum, s.d.ngs);
 }
 
 template <class Real>
@@ -1896,16 +1916,16 @@ void launch_copy_xf(SphPtrsT<Real> s, cudaStream_t st)
 template <class Real>
 void launch_solid_pair_count(SphPtrsT<Real> s, int* d_cnt, cudaStream_t st)
 {
-    k_solid_pair_count<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, d_cnt);
+    k_solid_pair_count<Real><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s, d_cnt);
 }
 
 template <class Real>
 void launch_solid_pair_fill(SphPtrsT<Real> s, int* d_cur, cudaStream_t st)
 {
     if (sph_a3_lean)
-        k_solid_pair_fill<Real, true><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, d_cur);
+        k_solid_pair_fill<Real, true><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s, d_cur);
     else
-        k_solid_pair_fill<Real, false><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, d_cur);
+        k_solid_pair_fill<Real, false><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s, d_cur);
 }
 
 template <class Real>
@@ -1920,9 +1940,10 @@ void launch_pass1_fluid_over_list(SphPtrsT<Real> s, cudaStream_t st)
     k_pass1_fluid_body<Real, true><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
 }
 
-void launch_cell_sort(const int* d_cellStart, int* d_sorted, int ncell, cudaStream_t st)
+void launch_cell_sort(const int* d_cellStart, int* d_sorted, int ncell,
+                      const int* d_gid, cudaStream_t st)
 {
-    k_cell_sort<<<(ncell + BLK - 1) / BLK, BLK, 0, st>>>(d_cellStart, d_sorted, ncell);
+    k_cell_sort<<<(ncell + BLK - 1) / BLK, BLK, 0, st>>>(d_cellStart, d_sorted, ncell, d_gid);
 }
 
 void launch_cell_scan(int* d_cellStart, int* d_count, int ncell, cudaStream_t st)
@@ -2006,12 +2027,12 @@ void launch_pass1_solid(SphPtrsT<Real> s, cudaStream_t st)
     if (sph_use_static_solid && s.npair > 0)
     {
         if (sph_a3_lean)
-            k_pass1_solid_static<Real, true><<<nblocks(s.d.solnum), BLK, 0, st>>>(s);
+            k_pass1_solid_static<Real, true><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s);
         else
-            k_pass1_solid_static<Real, false><<<nblocks(s.d.solnum), BLK, 0, st>>>(s);
+            k_pass1_solid_static<Real, false><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s);
     }
     else
-        k_pass1_solid<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
+        k_pass1_solid<Real><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s);
 }
 
 template <class Real>
@@ -2037,7 +2058,7 @@ void launch_pass2_solid(SphPtrsT<Real> s, cudaStream_t st)
 template <class Real>
 void launch_update_fluid(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_update_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
+    k_update_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s, sph_reflect_guard);
 }
 
 template <class Real>
@@ -2055,7 +2076,7 @@ void launch_update_pos(SphPtrsT<Real> s, cudaStream_t st)
 template <class Real>
 void launch_constitution(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_constitution<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
+    k_constitution<Real><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s);
 }
 
 template <class Real>
@@ -2068,7 +2089,7 @@ void launch_pass2(SphPtrsT<Real> s, cudaStream_t st)
 template <class Real>
 void launch_update(SphPtrsT<Real> s, cudaStream_t st)
 {
-    k_update_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
+    k_update_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s, sph_reflect_guard);
     k_update_solid<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
     k_update_pos<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s);
 }
@@ -2116,7 +2137,6 @@ void launch_xch_gather(const SphPtrsD s, int mode, const int* d_idx, const int* 
     {
         case 0: k_xch_gather<0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
         case 1: k_xch_gather<1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
-        case 2: k_xch_gather<2><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
         default: k_xch_gather<4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
     }
 }
@@ -2129,7 +2149,6 @@ void launch_xch_scatter(SphPtrsD s, int mode, const int* d_idx, const int* d_off
     {
         case 0: k_xch_scatter<0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
         case 1: k_xch_scatter<1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
-        case 2: k_xch_scatter<2><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
         default: k_xch_scatter<4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
     }
 }

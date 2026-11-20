@@ -70,6 +70,7 @@ Environment variables:
 | `SPH_OUT_F32=1` | write results as float32 (half the size) |
 | `SPH_PROFILE` | per-phase timing (prepare / cell / pass1 / constitution / pass2 / update) |
 | `SPH_SOLDDYN=1` | walk the grid in the solid kernels instead of the static pair list |
+| `SPH_REFLECT=flip` | flip `v_z` unconditionally above `z = 1` (1.cpp's form); the default only reflects outward motion (M8) |
 | `SPH_LITERALFLUID=1` | literal `pass1_fluid` body instead of the factored one |
 | `SPH_FLUIDLIST=0` | fused fp64 `pass1_fluid` instead of the two-phase list version |
 | `SPH_A3_FULL=1` / `=0` | force the fat (stored `sG/sB/sD`) / lean (index-only) solid pair list; unset = auto |
@@ -105,6 +106,7 @@ sph_cuda.exe input.sphbin
 | variable | effect |
 |---|---|
 | `SPH_RANKS=K` | number of ranks; unset or `1` = the ordinary single-GPU path |
+| `SPH_RANKS=auto` | rank the devices (bandwidth probe, free memory, display flag) and choose K from the partition model |
 | `SPH_RANKS_GPUS=0,1,...` | which devices, in rank order (default `0..K-1`) |
 | `SPH_D1_SKIN=<m>` | ghost-shell skin past 3 h (default `1.5*hsml`); the shell is rebuilt when a particle has moved half of it |
 | `SPH_D1_REPART=N` | also rebuild the decomposition every N steps |
@@ -112,22 +114,31 @@ sph_cuda.exe input.sphbin
 | `SPH_D1_SPLIT=nx,ny,nz` | force one factorisation of K (A/B switch) |
 | `SPH_D1PROF=1` | per-phase and per-exchange-point timings |
 | `SPH_BARRIER=spin\|block` | rank-barrier implementation (default adaptive) |
+| `SPH_D1_W_SOLID` / `SPH_D1_W_GHOST` | partition weights of a solid particle (default 0.45) and of a ghost (default 0.06) |
+| `SPH_D1_XCH_UNITS` / `SPH_D1_AUTO_SLACK` | exchange floor (default 4000 load units) and how far from the best prediction the auto-K choice may sit (default 10%) |
 | `SPH_D1_DBG=1` | extra stderr: displacements and device memory after a rebuild |
 
 The ghost set is only complete at the instant it is selected, so the skin is not
 optional book-keeping: `step_d1()` measures `max |x - x_build|` over the owned
 particles of every rank, and when it passes half the skin the ranks rebuild the
-decomposition together.  `SPH_D1_SKIN=0` restores the old behaviour (ghosts
-chosen once, never revalidated) and prints a warning, because a long run then
-silently drops interactions: at K=8 on `input.dat` that is 1.9e-6 m and 1.6 Pa
-away from the single-GPU answer after 3001 steps, against 1.2e-15 m with the
-skin.  A rebuild costs ~175 ms for 237 k particles, so a 1.5 h skin pays about
-0.3 ms/step; a wider skin trades ghost memory for fewer rebuilds.
+decomposition together.  The reduce runs every step but the 8-byte readback is
+scheduled from the measured rate (10 % of the skin is the most it may grow
+unseen), because a synchronous readback costs ~0.6 ms on Windows/WDDM.
+`SPH_D1_SKIN=0` restores the old behaviour (ghosts chosen once, never
+revalidated) and prints a warning, because a long run then silently drops
+interactions: at K=8 on `input.dat` that is 2.0e-6 m and 1.7 Pa away from the
+single-GPU answer after 3001 steps.
+
+**K > 1 is byte-identical to K = 1** (V2): every rank bins into the same global
+neighbour grid and orders a cell by global particle id, so the summation order is
+the one the single-GPU run uses.  A halo or exchange bug can no longer hide under
+1e-16 noise.  Measured: K = 4 and K = 8 over 3001 steps, with automatic rebuilds,
+with `SPH_D1_REPART=1000`, and through `SPH_RANKS=auto` -- zero differing bytes.
 
 Two constraints: the decomposition is fp64 only (`SPH_RANKS` + `--fp32` is
-refused), and a deck whose walls have a non-zero velocity is refused too -- E1
-exchanges the fluid and solid groups only, so a moving wall would not reach its
-ghosts.
+refused), and a deck whose walls have a non-zero velocity is refused too -- the
+exchange carries the fluid and solid groups only, so a moving wall would not
+reach its ghosts.
 
 ## Precision
 

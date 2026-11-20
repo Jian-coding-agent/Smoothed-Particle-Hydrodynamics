@@ -1025,38 +1025,137 @@ worst position difference, `max|dp|` the worst pressure difference):
 
 | run (3001 steps) | max abs dx | max abs dp |
 |---|---:|---:|
-| K = 1, old binary vs new binary (501 steps) | 0 (byte-identical) | 0 |
-| K = 8, 501 steps, new vs single GPU | 3.3e-16 m | 2.4e-7 Pa |
+| K = 8, 501 steps, skin trigger | 3.3e-16 m | 2.4e-7 Pa |
 | K = 8, **skin trigger**, 3001 steps | **1.2e-15 m** | 3.1e-7 Pa |
 | K = 8, `SPH_D1_SKIN=0` (old behaviour), 3001 steps | **1.9e-6 m** | 1.6 Pa |
 | K = 8, `SPH_D1_REPART=1000` (C10 fixed), 3001 steps | 1.7e-15 m | 2.3e-7 Pa |
 
-The skin costs what it costs: 68 411 -> 102 602 ghost slots (+50 %) on this deck,
-six rebuilds in 3001 steps at 175 ms each, i.e. ~0.3 ms/step.  It pays for
-itself because P8/P9 bought back more than that:
+Everything after V2 (sec. 14.5b) is checked with `fc /b` instead -- the
+differences above are only quoted for the runs that predate it.
+
+The skin costs what it costs: 68 411 -> 102 602 ghost slots (+50 %) on this deck
+before P11's second layer, and six rebuilds in 3001 steps at 175 ms each (260 ms
+once the layer-1 ghosts run their own constitution), i.e. ~0.3-0.5 ms/step.  The
+readback of the displacement is scheduled adaptively (10 % of the skin may go
+unseen), so it costs ~0.01 ms/step rather than the 0.6 ms a per-step synchronous
+8-byte read costs on Windows/WDDM.
+
+Exchange and barrier structure, per step:
+
+| | before | after |
+|---|---|---|
+| exchange points | 3 (E1, E2, E3) | **1** (E1) |
+| records | fluid 12, solid 24, E2 13, E3 3 doubles | fluid 8, solid 7 |
+| E1 bytes at K = 8 (this deck) | 8.2 MB | 3.4 MB |
+| rank barriers | 6 | **1** |
+| `Pia` + `solidPack` slots | one per index >= ntotal | one per solid (P13) |
+
+Step-time comparisons were taken on this 8 x 5090 D box at different times and
+the machine is shared, so only same-session pairs are meaningful:
 
 | K = 8, 501 steps | ms/step |
 |---|---:|
 | old exchange (E1 12/24, E3 on) | 2.396 |
 | new exchange (E1 8/7, no E3), no skin | **2.134** (-11 %) |
 | new exchange with the 1.5 h skin | 2.388 |
+| final (skin + P10 + P11 + P14), 3001 steps | ~2.3-3.1 depending on machine state |
+
+### 14.5b V2: K > 1 is byte-identical to K = 1
+
+The decomposition used to differ from the single-GPU run at the 1e-16 level,
+because each rank derived its own neighbour grid and ordered a cell by *local*
+index -- and a local index says nothing about the deck order once ghosts are
+appended.  Two changes make the summation order the one the single-GPU run uses:
+
+* every rank bins into the **global grid** derived once from the whole deck (and
+  the grid no longer drifts when a repartition re-derives it);
+* `k_cell_sort` orders a cell by **global id** (`s.gid`); on one rank `gid` is
+  null and the local index *is* the global one.
+
+The payoff is not cosmetic: a halo or exchange bug can no longer hide under
+rounding noise.  Everything below was verified this way -- `fc /b` on the result
+files, not a tolerance:
+
+| configuration | result |
+|---|---|
+| K = 4 and K = 8, 501 and 3001 steps | byte-identical to K = 1 |
+| K = 8, 3001 steps, six automatic rebuilds | byte-identical |
+| K = 8, 3001 steps, `SPH_D1_REPART=1000` | byte-identical |
+| `SPH_RANKS=auto`, 501 steps | byte-identical |
+| **negative control**: K = 8, `SPH_D1_SKIN=0`, 3001 steps | 2.0e-6 m / 1.7 Pa |
+
+The negative control matters: with the skin disabled the decomposed run still
+decays, which is exactly what V2 is for -- the check is supposed to fail when the
+halo is wrong.
+
+One caveat: the V2/P11/P13 refactor shifted the last bit of *some* solid stresses
+relative to the previous build (<= 1 ulp on 18 % of the solids, deterministic,
+fluids unaffected).  The dumped `F`, `DFdt`, `A` and `rho` arrays are identical,
+so this is instruction scheduling of the constitution kernel, not a change in the
+algorithm; the 501-step drift is 2.2e-16 m, the same rounding floor as before.
+Byte-identity with the *previous build* is therefore not claimed -- byte-identity
+of K > 1 with K = 1 is, and it is what the validation above uses.
+
+### 14.5c P10, P11, P13, P14
+
+| id | what was done | effect |
+|---|---|---|
+| P10 | the send block is double buffered and consecutive exchange points alternate halves, so the trailing barrier is gone (a rank can only rewrite a half after the *next* exchange's barrier, which no rank reaches before finishing its relay) | two barriers per exchange point -> one; six per step -> one |
+| P11 | the ghost solids come in two layers: layer 1 is what the box selects and **runs its own constitution** (pass1_solid + constitution over slots `[0, solnum + ngs1)`), layer 2 is the layer-1 solids' A3 partners, which only ever get read | **E2 is gone**: one exchange point per step.  Costs: +1790-3 300 ghost solids per rank on this deck and ~25 % more solid work in the halo |
+| P13 | `Pia`/`solidPack` hold one slot per *solid* instead of one per index >= ntotal | 92 MiB on the 1203k deck, 1.47 GiB on the 19.3 M one, ~13 MB per rank here |
+| P14 | two result staging buffers and a writer thread on rank 0; a stage is reused two results later, and rank 0 waits for its writer before the barrier that releases it | the 55 ms file write no longer stalls all ranks |
+
+P11 is the one that changes the structure of the step: it is the reason the
+constitution has to be bit-exact on a ghost, and it is why the partner set of a
+layer-1 ghost has to be complete -- the A3 partner scan uses the same global grid
+and the same global-id order for owner and ghost, so the two sums are identical
+by construction.  The build checks that with the byte-identity table above.
+
+### 14.5d L1/L2/L3: choosing K, and what a ghost costs
+
+`SPH_RANKS=auto` ranks the devices (a 64 MB device-to-device bandwidth probe, free
+memory, and the display watchdog flag, which is how a card that drives the desktop
+gets demoted) and then chooses K from the *actual* partition: for every K it runs
+the same search `build_job` runs and predicts
+
+    T(K) = max_r(own weight) + w_ghost * ghosts/K + XCH_UNITS
+
+i.e. the slowest rank's compute plus its share of the ghosts plus one exchange
+point's floor.  On this machine (8 x 5090 D, all of them carrying a display
+flag) it predicts the table in `[D1] K prediction` and picks K = 8, and the
+result is byte-identical to K = 1.  The smallest K within `SPH_D1_AUTO_SLACK`
+(default 10 %) wins, so a batch of cases keeps more cards free.
+
+L2/L3 changed the objective: a solid particle now weighs 0.45 (the measured
+0.41 with the fat list / 0.97 with the lean one, so the default sits between and
+is a knob), and a ghost is charged 0.06 rather than a full particle -- it is a
+cell-list slot plus its share of the exchange, not a particle that computes.  The
+review's point was that charging a ghost at the owned rate turned the ghost term
+into an exchange penalty with an arbitrary scale.
+
+### 14.5e M8: the reflection at z = 1
+
+`k_update_fluid()` flipped `v_z` whenever `z > 1.0`, which also flips a particle
+that is already moving down and can leave it oscillating just above the plane.
+The standard form reflects only outward motion and is now the default; the
+literal 1.cpp behaviour is `SPH_REFLECT=flip`.  The fluid in `input.dat` stays
+below 0.45 m, so the two settings produce identical results on it -- verified,
+not assumed -- and the choice is a knob rather than a silent change.
 
 ### 14.6 What is still open
 
-* **P10** (double-buffer the send block: one barrier per exchange point), **P11**
-  (a two-layer solid halo to remove E2), **P12** (overlap the exchange with the
-  interior work), **P13** (compact solid slots) and **P14** (asynchronous output)
-  are not implemented; the review's estimates for them are 2.7-3.3 ms/step at
-  K = 8 against 3.4-4.7 today.
-* **L1/L2**: the code balances the work over the K cards it is given; it does not
-  choose K or which cards, and the weights (fluid 1.0, solid 0.5, wall 0) are
-  calibrated for the fat list while auto mode goes lean at 10^7 particles, where a
-  solid particle costs 0.97 of a fluid one rather than 0.41.
-* **V2**: K > 1 still differs from K = 1 at the 1e-16 level because the
-  summation order differs.  Making every rank use the global grid and ordering
-  cells by `gid` would make K > 1 byte-identical, and then a halo bug could never
-  hide under rounding noise again.
-* **M8** is a question for the physics owner: `k_update_fluid()` reflects `v_z`
-  whenever `z > 1.0`, including for a particle already moving down.  The fluid in
-  `input.dat` stays below 0.45 m, so nothing here exercises it.
+* **P12, overlap the exchange with the interior work.**  Not done.  It used to
+  overlap E2 (0.2-0.6 ms); with P11 there is one exchange point left, and every
+  kernel of the step reads ghost `x`, so the remaining overlap needs the
+  interior/boundary split the review describes (interior particles have no ghost
+  neighbour and can run on a second stream while the exchange is in flight).
+  That is a redesign of the step scheduling, not a local change, and it should be
+  measured against the byte-identity harness rather than bolted on.
+* **L2 calibration on the target card.**  The weights are the review's RTX 4090
+  numbers; the 1/64-rate fp64 of the 5090 D may move them, and `SPH_BENCH` is
+  the way to re-measure.
+* **C7 / the cell-list cliff** still exists in the single-GPU path (a fixed grid
+  and an insertion sort); the decomposed path now inherits the same grid by
+  design, because V2 requires it.
+
 

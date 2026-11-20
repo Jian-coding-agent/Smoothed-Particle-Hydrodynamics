@@ -56,6 +56,27 @@ struct SphDims
     int numP;       // particles present in the arrays (num + ghosts)
     int gs0;        // first ghost-solid index (numP when there are none)
     int ngs;        // number of ghost solids
+    // P11: the ghost solids come in two layers.  "Layer 1" are the ones the
+    // current/reference box selects; they run their own constitution (so E2 is
+    // gone) and therefore need their A3 partners, "layer 2", which are the solids
+    // within 3h (reference configuration) of a layer-1 solid.  Layer 2 is only
+    // ever read, never computed.  [gs0, gs0+ngs1) and [gs0+ngs1, gs0+ngs).
+    int ngs1;       // layer-1 ghost solids (the ones that compute)
+    int nsolC;      // solid slots that compute: solnum + ngs1
+};
+
+// ---------------------------------------------------------------------------
+// The neighbour grid.  V2: the decomposed driver gives every rank the same grid
+// the single-GPU run derives from the whole deck, so a particle is binned into
+// exactly the same cell on every rank and in the reference run.  Without that,
+// each rank derives its own origin from its own rows and the traversal order --
+// hence the rounding -- depends on K.
+// ---------------------------------------------------------------------------
+struct SphGridBox
+{
+    double org[3] = { 0.0, 0.0, 0.0 };   // gx0, gy0, gz0
+    int nx = 0, ny = 0, nz = 0;
+    bool ok() const { return nx > 0 && ny > 0 && nz > 0; }
 };
 
 // ---------------------------------------------------------------------------
@@ -82,22 +103,23 @@ struct SphDims
 #define SPH_D1_SKIN_DEFAULT (1.5 * SPH_HSML)
 
 // ---------------------------------------------------------------------------
-// D1 exchange records (doubles per particle).  One record per exchange point,
-// holding only the fields the receiving kernels actually read (P9):
+// D1 exchange records (doubles per particle).  One record type per exchange
+// point, holding only the fields the receiving kernels actually read (P9):
 //
 //   E1  fluid  x, vx, rho, SurFD                                    (8)
 //   E1  solid  x, vx, rho                                           (7)
-//   E2  solid  rho, Pia[12]                                         (13)
 //   init solid/wall  A[9], vecn[3]                                  (12)
+//
+// One exchange point per step is all that is left: E3 (fluid PIJW, identically
+// zero) is gone (P8), and E2 is gone because the layer-1 ghost solids run their
+// own constitution (P11) and therefore produce the very rho/Pia E2 used to ship.
 //
 // p and irho are pure functions of rho, so the receiving side rebuilds them
 // with the identical expressions instead of paying two doubles per particle
-// (launch_xch_fixup).  PIJW is never written for a fluid (see DESIGN 2.5) and
-// never read for a ghost solid, so it is not exchanged at all: E3 is gone (P8).
+// (launch_xch_fixup).
 // ---------------------------------------------------------------------------
 #define SPH_XCH_REC_F   8
 #define SPH_XCH_REC_S   7
-#define SPH_XCH_REC_E2  13
 #define SPH_XCH_REC_ST  12
 
 // P1: slots per fluid particle in the neighbour list.  This deck's worst fluid
@@ -229,6 +251,36 @@ __device__ __forceinline__ int sph_pair_hi(const SphPtrsT<Real>& s, int p, int q
     if (s.gid != nullptr)
         return (s.gid[p] > s.gid[q]) ? p : q;
     return (p > q) ? p : q;
+}
+
+// ---------------------------------------------------------------------------
+// P13: Pia and solidPack hold one slot per *solid* particle, not one per index
+// >= ntotal.  Owned solids take [0, solnum), the ghost solids [solnum, solnum +
+// ngs); walls and ghost fluids take no slot at all.  Before this, a slot existed
+// for every wall and every ghost fluid or wall, which is 92 MiB on the 1203k
+// deck and about 1.5 GiB on the 19.3 M one.
+// ---------------------------------------------------------------------------
+template <class Real>
+__device__ __forceinline__ bool sph_has_sol_slot(const SphPtrsT<Real>& s, int q)
+{
+    if (q >= s.d.ntotal && q < s.d.nall) return true;               // owned solid
+    return q >= s.d.gs0 && q < s.d.gs0 + s.d.ngs;                   // ghost solid
+}
+
+template <class Real>
+__device__ __forceinline__ int sph_sol_slot(const SphPtrsT<Real>& s, int q)
+{
+    return (q < s.d.nall) ? (q - s.d.ntotal)
+                          : (s.d.solnum + (q - s.d.gs0));
+}
+
+// inverse of sph_sol_slot: the particle index that owns slot k.  The kernels that
+// compute (A3 pair build, pass1_solid, constitution) are launched over slots so
+// that the owned solids and the layer-1 ghosts are one contiguous range.
+template <class Real>
+__device__ __forceinline__ int sph_sol_particle(const SphPtrsT<Real>& s, int k)
+{
+    return (k < s.d.solnum) ? (s.d.ntotal + k) : (s.d.gs0 + (k - s.d.solnum));
 }
 
 // 2-wide vector type used to pull the Pia block with 16-byte loads
@@ -370,6 +422,9 @@ extern int sph_a3_lean;
 // own fat size and gets back the agreed maximum (all ranks meet at the rank
 // barrier); a null hook means "single rank, decide locally".
 extern double (*sph_a3_fat_hook)(double fat_mb);
+// M8: 1 = reflect only outward motion at the z = 1 plane (default), 0 = 1.cpp's
+// unconditional flip (SPH_REFLECT=flip; the two agree on this deck)
+extern int sph_reflect_guard;
 // A5 switch: 1 = factored inner loop of pass1_fluid (default), 0 = the literal
 // transcription of 1.cpp (kept for verification; SPH_LITERALFLUID=1).
 extern int sph_fast_fluid_loop;
@@ -382,7 +437,8 @@ int gra_fallback_count();
 
 template <class Real> void launch_cell_hist(SphPtrsT<Real> s, int* d_count, int* d_solid, int* d_fluid, cudaStream_t st);
 void launch_cell_scan(int* d_cellStart, int* d_count, int ncell, cudaStream_t st);
-void launch_cell_sort(const int* d_cellStart, int* d_sorted, int ncell, cudaStream_t st);
+void launch_cell_sort(const int* d_cellStart, int* d_sorted, int ncell,
+                      const int* d_gid, cudaStream_t st);
 template <class Real> void launch_cell_scatter(SphPtrsT<Real> s, int* d_cursor, cudaStream_t st);
 template <class Real> void launch_count_pairs(SphPtrsT<Real> s, int* d_niac, cudaStream_t st);
 template <class Real> void launch_nbr_count(SphPtrsT<Real> s, int* d_out, cudaStream_t st);
