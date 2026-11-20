@@ -953,7 +953,9 @@ reviewed the decomposition (D1), the lean solid list (A6) and the binary I/O.  I
 found that the decomposition is correct only while particles stay near where they
 were when the ghosts were chosen, and that repartition -- the remedy -- was itself
 wrong.  Both are fixed here, together with the smaller findings, and the exchange
-records are slimmer.  All numbers below were re-measured on 8 x RTX 5090 D
+records are slimmer.  The second batch of findings (P10-P14, L1-L3, V2, M8) has
+its own work log in [`docs/edit-2026-11-20-11-53.md`](../../docs/edit-2026-11-20-11-53.md);
+sections 14.5b-e summarise it.  All numbers below were re-measured on 8 x RTX 5090 D
 (`sm_120`), CUDA 13.5, fp64, one rank per card, `input.dat` (237 298 particles)
 unless the row says otherwise.
 
