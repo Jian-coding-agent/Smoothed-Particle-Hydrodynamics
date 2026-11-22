@@ -1015,8 +1015,8 @@ for a fluid particle -- it is three zeros per ghost fluid per step.  E1 shipped
 `p` and `irho` are functions of `rho`, and `Pia` is overwritten by E2 before
 `pass2_solid` reads it.
 
-The records are now 8 doubles for a fluid (x, vx, rho, SurFD) and 7 for a solid
-(x, vx, rho), against 12 and 24; E3 is gone; `launch_xch_fixup()` rebuilds `p`
+The records are now 8 doubles for a fluid (x, vx, rho, SurFD) and 10 for a solid
+(x, vx, rho, u; `u` is the fp32 compensated displacement and is unused in fp64), against 12 and 24; E3 is gone; `launch_xch_fixup()` rebuilds `p`
 and `irho` for the ghost block with the expressions `k_prepare()` uses, so the
 bits are unchanged.
 
@@ -1047,7 +1047,7 @@ Exchange and barrier structure, per step:
 | | before | after |
 |---|---|---|
 | exchange points | 3 (E1, E2, E3) | **1** (E1) |
-| records | fluid 12, solid 24, E2 13, E3 3 doubles | fluid 8, solid 7 |
+| records | fluid 12, solid 24, E2 13, E3 3 doubles | fluid 8, solid 10 |
 | E1 bytes at K = 8 (this deck) | 8.2 MB | 3.4 MB |
 | rank barriers | 6 | **1** |
 | `Pia` + `solidPack` slots | one per index >= ntotal | one per solid (P13) |
@@ -1058,7 +1058,7 @@ the machine is shared, so only same-session pairs are meaningful:
 | K = 8, 501 steps | ms/step |
 |---|---:|
 | old exchange (E1 12/24, E3 on) | 2.396 |
-| new exchange (E1 8/7, no E3), no skin | **2.134** (-11 %) |
+| new exchange (E1 8/7 then; 8/10 now), no skin | **2.134** (-11 %) |
 | new exchange with the 1.5 h skin | 2.388 |
 | final (skin + P10 + P11 + P14), 3001 steps | ~2.3-3.1 depending on machine state |
 
@@ -1191,17 +1191,36 @@ K > 1 and K = 1 still agree bit for bit.  The default bounds are the 3.7M case;
 `SPH_SOLDBOX="0.01,0.01,0.49"` (237k), `"0.01,0.00,1.31"` (1.2M) or `off`
 selects the others.
 
-### 15.2 Features that are single-GPU only, by design
+### 15.2 What is still single-GPU only
 
 | feature | why the decomposed path does not have it |
 |---|---|
 | checkpoint / resume | a restart has to save the decomposition, every rank's owned state *and* the ghost halo; doing only the first two silently resumes a different neighbour set |
-| fp32 | the D1 exchange records, `Rank::S` and the migration buffers are `double`; templating the whole decomposed driver is a separate change |
-| S1 sorted threads | `sorted[]` holds `numP` slots including ghosts, so mapping thread `t -> sorted[t]` is not an owned particle |
 
 Everything else is shared: `SPH_OUTCADENCE`, `SPH_OUT_F32` (`=0` is float64, the
 old code tested presence), the checked result writer, `SPH_SOLDBOX`, the
 `itype == 0` rule, and the `k_solid_pair_fill` bound check.
+
+**fp32 on D1.**  The decomposed driver is templated on `Real`, so the same
+physics kernels run in fp32.  The exchange staging block, the relocation lists
+and the repartition migration buffer are still `double`: a float is exact in a
+double, so the value that arrives is the value the owner wrote, and V2's byte
+identity survives.  Two fp32-specific pieces had to be added:
+
+* the solid E1 record carries `u` as well as `x,vx,rho` (10 doubles instead of
+  7).  A layer-1 ghost solid runs its own `pass1_solid`/`constitution`, and the
+  fp32 `F - I` form is built from `u_q - u_p`; reconstructing `u = x - X0` on
+  the ghost rounds differently from the owner's compensated sum.
+* the repartition migration buffer is 27 doubles per particle in fp32 (20 in
+  fp64), adding `u`, `xc` and `rhoc`.  Without them a repartition would drop
+  the sub-ulp motion the fp32 integrator carries.
+
+**S1 on D1.**  `sorted[]` holds `numP` slots, not just the owned ones, but
+`k_pass1_fluid_body` already rejects any `p >= ntotal`, so the ghost fluid,
+solid and wall slots fall out and only the owned fluid particles compute.  The
+per-particle summation order is unchanged, so S1 is used on D1 exactly as on one
+GPU: auto-on in fp32, auto-off in fp64 (where the P1 list is faster).
+`SPH_SORTEDTHREADS=0/1` still forces it.
 
 ### 15.3 Validation of the merged tree
 
@@ -1212,15 +1231,19 @@ RTX 5080, one device; decomposed runs put every rank on GPU 0 with
 |---|---|
 | 237k, 501 steps, `SPH_SOLDBOX=off`, single | byte-identical to the pre-merge build |
 | 237k, 501 steps, `SPH_SOLDBOX=on`, single | clamp changes the trajectory (expected) |
-| 237k, K = 1, 2, 4, 501 steps, clamp on | all byte-identical to the single run |
+| 237k, K = 1, 2, 4, 501 steps, fp64, clamp on | all byte-identical to the single run |
 | 237k, K = 2, 501 steps, clamp off | byte-identical to the single run and to the pre-merge build |
+| 237k, K = 2, 501 steps, **fp32** | byte-identical to the single fp32 run |
+| 237k, K = 2, fp32, 301 steps, `SPH_D1_REPART=100` | byte-identical (two repartitions) |
+| 237k, K = 2, fp32, S1 off vs on | result SHA256 equal (S1 is ~9 % faster) |
 | 3.7M, K = 1 vs K = 2, 501 steps, fp64 | byte-identical (`93F23097...`) |
+| 3.7M, K = 1 vs K = 2, 501 steps, fp32 | byte-identical (`BE3C274C...`) |
 | 3.7M, 1001 steps, fp32, clamp on vs off | floor layer stays at `z = 0.0100` with the clamp, `0.0095` without |
 | 237k, fp64 150 + resume 150 vs 300 | checkpoint SHA256 equal |
 | 237k, fp32 75 + resume 75 vs 150 | checkpoint SHA256 equal |
-| 237k, fp32 200 steps, S1 off vs on | result SHA256 equal |
 | 237k, 301 steps, `SPH_OUTCADENCE=100` | `result0..3`, header steps 0/100/200/300 |
 | `SPH_RANKS=2` + `SPH_CKPT` | refused with a clear message |
+| `SPH_VERIFY=1`, K = 2, fp32 | both ranks: all `numP` slots in their live cell, 0 missing/0 wrong |
 
 The `SPH_SOLDBOX=off` row is the regression guard: the clamp is the only
 intentional change to the single-GPU numeric path, and turning it off reproduces

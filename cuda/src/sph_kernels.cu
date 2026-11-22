@@ -681,8 +681,10 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid_body(SphPtrsT<Real> s)
     // lanes are solid/wall and exit immediately, but the surviving lanes of a
     // warp are one or two cells apart instead of ~30, so the gather addresses
     // are coherent.  Per-particle summation order is unchanged, hence the bits
-    // are unchanged.  Only used when numP == num (no ghosts).
-    const int p = SORTED ? ((t < s.d.num) ? s.sorted[t] : s.d.num) : t;
+    // are unchanged.  sorted[] covers numP slots on a decomposed run too; a
+    // ghost fluid is skipped by the ntotal test below (ghosts are read, never
+    // computed), so this works for K = 1 and K > 1.
+    const int p = SORTED ? ((t < s.d.numP) ? s.sorted[t] : s.d.numP) : t;
     if (p >= s.d.ntotal) return;
 
     const Real C0   = Real(SPH_C0);
@@ -1707,7 +1709,9 @@ __global__ void k_gra_invert(SphPtrsT<Real> s, const Real* __restrict__ a, int b
 }
 
 // ---------------------------------------------------------------------------
-// D1: domain-decomposition exchange (fp64 only)
+// D1: domain-decomposition exchange (both precisions; the record arena is
+// double even for Real = float -- a float is exact in a double, so V2's
+// byte-identity holds for both)
 //
 // A rank owns a block and keeps copies of its neighbours' boundary particles
 // ("ghosts").  Each step it pushes the fields that change to the ranks that
@@ -1731,55 +1735,63 @@ __global__ void k_gra_invert(SphPtrsT<Real> s, const Real* __restrict__ a, int b
 // SurFD is always 0 (no kernel writes it), so the solid record leaves it out
 // and the slot keeps the 0 the allocation was cleared to.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void sph_xch_read_f(const SphPtrsD& s, int q, double* o)
+template <class Real>
+__device__ __forceinline__ void sph_xch_read_f(const SphPtrsT<Real>& s, int q, double* o)
 {
-    o[0] = s.x[q];   o[1] = s.x[N + q];   o[2] = s.x[2 * N + q];
-    o[3] = s.vx[q];  o[4] = s.vx[N + q];  o[5] = s.vx[2 * N + q];
-    o[6] = s.rho[q]; o[7] = s.SurFD[q];
+    o[0] = (double)s.x[q];   o[1] = (double)s.x[N + q];   o[2] = (double)s.x[2 * N + q];
+    o[3] = (double)s.vx[q];  o[4] = (double)s.vx[N + q];  o[5] = (double)s.vx[2 * N + q];
+    o[6] = (double)s.rho[q]; o[7] = (double)s.SurFD[q];
 }
 
-__device__ __forceinline__ void sph_xch_write_f(SphPtrsD& s, int g, const double* o)
+template <class Real>
+__device__ __forceinline__ void sph_xch_write_f(SphPtrsT<Real>& s, int g, const double* o)
 {
-    s.x[g]   = o[0]; s.x[N + g]   = o[1]; s.x[2 * N + g]   = o[2];
-    s.vx[g]  = o[3]; s.vx[N + g]  = o[4]; s.vx[2 * N + g]  = o[5];
-    s.rho[g] = o[6]; s.SurFD[g]   = o[7];
+    s.x[g]   = (Real)o[0]; s.x[N + g]   = (Real)o[1]; s.x[2 * N + g]   = (Real)o[2];
+    s.vx[g]  = (Real)o[3]; s.vx[N + g]  = (Real)o[4]; s.vx[2 * N + g]  = (Real)o[5];
+    s.rho[g] = (Real)o[6]; s.SurFD[g]   = (Real)o[7];
 }
 
-__device__ __forceinline__ void sph_xch_read_s(const SphPtrsD& s, int q, double* o)
+template <class Real>
+__device__ __forceinline__ void sph_xch_read_s(const SphPtrsT<Real>& s, int q, double* o)
 {
-    o[0] = s.x[q];  o[1] = s.x[N + q];  o[2] = s.x[2 * N + q];
-    o[3] = s.vx[q]; o[4] = s.vx[N + q]; o[5] = s.vx[2 * N + q];
-    o[6] = s.rho[q];
+    o[0] = (double)s.x[q];  o[1] = (double)s.x[N + q];  o[2] = (double)s.x[2 * N + q];
+    o[3] = (double)s.vx[q]; o[4] = (double)s.vx[N + q]; o[5] = (double)s.vx[2 * N + q];
+    o[6] = (double)s.rho[q];
+    o[7] = (double)s.u[q];  o[8] = (double)s.u[N + q];  o[9] = (double)s.u[2 * N + q];
 }
 
-__device__ __forceinline__ void sph_xch_write_s(SphPtrsD& s, int g, const double* o)
+template <class Real>
+__device__ __forceinline__ void sph_xch_write_s(SphPtrsT<Real>& s, int g, const double* o)
 {
-    s.x[g]  = o[0]; s.x[N + g]  = o[1]; s.x[2 * N + g]  = o[2];
-    s.vx[g] = o[3]; s.vx[N + g] = o[4]; s.vx[2 * N + g] = o[5];
-    s.rho[g] = o[6];
+    s.x[g]  = (Real)o[0]; s.x[N + g]  = (Real)o[1]; s.x[2 * N + g]  = (Real)o[2];
+    s.vx[g] = (Real)o[3]; s.vx[N + g] = (Real)o[4]; s.vx[2 * N + g] = (Real)o[5];
+    s.rho[g] = (Real)o[6];
+    s.u[g]  = (Real)o[7]; s.u[N + g]  = (Real)o[8]; s.u[2 * N + g]  = (Real)o[9];
 }
 
 // irho of the ghost block, and p of the ghost *fluid* block: exactly the
 // expressions k_prepare applies on the owner, applied to the rho that just
-// arrived bit-exactly through E1.  Ghosts run no physics kernel of their own,
-// so this is the whole of their "prepare".
-__global__ void k_xch_fixup(SphPtrsD s, int base, int nfluid_ghost)
+// arrived exactly through E1 (a float is exact in a double, and the cast back is
+// exact).  Ghosts run no physics kernel of their own, so this is the whole of
+// their "prepare".
+template <class Real>
+__global__ void k_xch_fixup(SphPtrsT<Real> s, int base, int nfluid_ghost)
 {
     const int i = base + blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= s.d.numP) return;
-    const double rho = s.rho[i];
-    s.irho[i] = 1.0 / rho;
+    const Real rho = s.rho[i];
+    s.irho[i] = Real(1.0) / rho;
     if (i - base < nfluid_ghost)
     {
-        const double C0 = SPH_C0;
-        double pv = C0 * C0 * (rho - 1000.0);
-        if (rho < 1000.0) pv = 0.0;
+        const Real C0 = Real(SPH_C0);
+        Real pv = C0 * C0 * (rho - Real(1000.0));
+        if (rho < Real(1000.0)) pv = Real(0.0);
         s.p[i] = pv;
     }
 }
 
-template <int MODE>
-__global__ void k_xch_gather(const SphPtrsD s, const int* __restrict__ idx,
+template <class Real, int MODE>
+__global__ void k_xch_gather(const SphPtrsT<Real> s, const int* __restrict__ idx,
                              const int* __restrict__ off, int n, double* __restrict__ arena)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1788,21 +1800,21 @@ __global__ void k_xch_gather(const SphPtrsD s, const int* __restrict__ idx,
     double* o = arena + off[i];
     if (MODE == 0)                                  // E1 fluid, 8
     {
-        sph_xch_read_f(s, q, o);
+        sph_xch_read_f<Real>(s, q, o);
     }
     else if (MODE == 1)                             // E1 solid, 7
     {
-        sph_xch_read_s(s, q, o);
+        sph_xch_read_s<Real>(s, q, o);
     }
     else                                            // one-off init, 12
     {
-        for (int c = 0; c < 9; ++c) o[c] = s.A[(size_t)c * N + q];
-        o[9] = s.vecn[q]; o[10] = s.vecn[N + q]; o[11] = s.vecn[2 * N + q];
+        for (int c = 0; c < 9; ++c) o[c] = (double)s.A[(size_t)c * N + q];
+        o[9] = (double)s.vecn[q]; o[10] = (double)s.vecn[N + q]; o[11] = (double)s.vecn[2 * N + q];
     }
 }
 
-template <int MODE>
-__global__ void k_xch_scatter(SphPtrsD s, const int* __restrict__ idx,
+template <class Real, int MODE>
+__global__ void k_xch_scatter(SphPtrsT<Real> s, const int* __restrict__ idx,
                               const int* __restrict__ off, int n, const double* __restrict__ base)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1811,26 +1823,26 @@ __global__ void k_xch_scatter(SphPtrsD s, const int* __restrict__ idx,
     const double* o = base + off[i];
     if (MODE == 0)                                  // E1 fluid, 8
     {
-        sph_xch_write_f(s, g, o);
+        sph_xch_write_f<Real>(s, g, o);
     }
     else if (MODE == 1)                             // E1 solid, 7
     {
-        sph_xch_write_s(s, g, o);
+        sph_xch_write_s<Real>(s, g, o);
     }
     else                                            // one-off init, 12
     {
-        for (int c = 0; c < 9; ++c) s.A[(size_t)c * N + g] = o[c];
-        s.vecn[g] = o[9]; s.vecn[N + g] = o[10]; s.vecn[2 * N + g] = o[11];
+        for (int c = 0; c < 9; ++c) s.A[(size_t)c * N + g] = (Real)o[c];
+        s.vecn[g] = (Real)o[9]; s.vecn[N + g] = (Real)o[10]; s.vecn[2 * N + g] = (Real)o[11];
         // Static fields a ghost has to carry on its own: k_prepare only ever
         // runs over the owned block.  A wall's rho and SurFD never change and
-        // a solid's are refreshed by E2/E1 every step, so this is the same
-        // value the owner would have produced at step 0.
-        const double C0 = SPH_C0;
-        double pv = C0 * C0 * (s.rho[g] - 1000.0);
-        if (s.rho[g] < 1000.0) pv = 0.0;
+        // a solid's are refreshed by E1 every step, so this is the same value
+        // the owner would have produced at step 0.
+        const Real C0 = Real(SPH_C0);
+        Real pv = C0 * C0 * (s.rho[g] - Real(1000.0));
+        if (s.rho[g] < Real(1000.0)) pv = Real(0.0);
         s.p[g] = pv;
-        s.irho[g] = 1.0 / s.rho[g];
-        s.SurFD[g] = 0.0;
+        s.irho[g] = Real(1.0) / s.rho[g];
+        s.SurFD[g] = Real(0.0);
     }
 }
 
@@ -1842,7 +1854,8 @@ __global__ void k_xch_scatter(SphPtrsD s, const int* __restrict__ idx,
 // value is a non-negative double, so its IEEE bit pattern orders like the value
 // and an unsigned 64-bit atomicMax works.
 // ---------------------------------------------------------------------------
-__global__ void k_disp_max(const SphPtrsD s, const double* __restrict__ xb,
+template <class Real>
+__global__ void k_disp_max(const SphPtrsT<Real> s, const double* __restrict__ xb,
                            unsigned long long* __restrict__ out)
 {
     __shared__ double smax[256];
@@ -1851,9 +1864,9 @@ __global__ void k_disp_max(const SphPtrsD s, const double* __restrict__ xb,
     if (i < s.d.num)
     {
         const int n = s.d.num;
-        d = fabs(s.x[i] - xb[i]);
-        const double dy = fabs(s.x[N + i] - xb[n + i]);
-        const double dz = fabs(s.x[2 * N + i] - xb[2 * n + i]);
+        d = fabs((double)s.x[i] - xb[i]);
+        const double dy = fabs((double)s.x[N + i] - xb[n + i]);
+        const double dz = fabs((double)s.x[2 * N + i] - xb[2 * n + i]);
         if (dy > d) d = dy;
         if (dz > d) d = dz;
     }
@@ -2085,15 +2098,15 @@ void launch_pass1_fluid(SphPtrsT<Real> s, cudaStream_t st)
         k_pass1_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
         return;
     }
-    // S1: launch over the cell-sorted order.  This is a single-GPU optimisation:
-    // sorted[] covers numP slots and on a decomposed run some of them are ghost
-    // copies, so the mapping t -> sorted[t] would not be an owned particle.
+    // S1: launch over the cell-sorted order.  sorted[] holds numP slots, which
+    // is exactly what a decomposed rank has: the owned particles compute and the
+    // ghost fluid/solid/wall slots fall out at the ntotal test.
     const int sorted = (sph_sorted_threads < 0)
                            ? (sizeof(Real) < sizeof(double) ? 1 : 0)
                            : sph_sorted_threads;
-    if (sorted && s.d.numP == s.d.num)
+    if (sorted)
     {
-        k_pass1_fluid_body<Real, false, true><<<nblocks(s.d.num), BLK, 0, st>>>(s);
+        k_pass1_fluid_body<Real, false, true><<<nblocks(s.d.numP), BLK, 0, st>>>(s);
         return;
     }
     // P1: the list pays off only in fp64; fp32 is traversal bound and the fused
@@ -2222,46 +2235,50 @@ void launch_gra_invert(SphPtrsT<Real> s, Real* d_a, cudaStream_t st)
 // (With 8 ranks a 3-D block has up to 26 peers: per-peer cudaMemcpyAsync on
 // Windows/WDDM is ~150 us even for 30 kB, which used to dominate the step.)
 // ---------------------------------------------------------------------------
-void launch_xch_gather(const SphPtrsD s, int mode, const int* d_idx, const int* d_off,
+template <class Real>
+void launch_xch_gather(SphPtrsT<Real> s, int mode, const int* d_idx, const int* d_off,
                        int n, double* d_stage, cudaStream_t st)
 {
     if (n <= 0) return;
     switch (mode)
     {
-        case 0: k_xch_gather<0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
-        case 1: k_xch_gather<1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
-        default: k_xch_gather<4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
+        case 0: k_xch_gather<Real, 0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
+        case 1: k_xch_gather<Real, 1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
+        default: k_xch_gather<Real, 4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
     }
 }
 
-void launch_xch_scatter(SphPtrsD s, int mode, const int* d_idx, const int* d_off,
+template <class Real>
+void launch_xch_scatter(SphPtrsT<Real> s, int mode, const int* d_idx, const int* d_off,
                         int n, const double* d_base, cudaStream_t st)
 {
     if (n <= 0) return;
     switch (mode)
     {
-        case 0: k_xch_scatter<0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
-        case 1: k_xch_scatter<1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
-        default: k_xch_scatter<4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
+        case 0: k_xch_scatter<Real, 0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
+        case 1: k_xch_scatter<Real, 1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
+        default: k_xch_scatter<Real, 4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
     }
 }
 
 // TASK 2 / P9: irho is 1/rho and p is a function of rho, so the ghost block
 // rebuilds both instead of receiving them.  gs0 is the first ghost-solid slot,
 // so [num, gs0) is the ghost *fluid* block -- the only block whose p is read.
-void launch_xch_fixup(SphPtrsD s, cudaStream_t st)
+template <class Real>
+void launch_xch_fixup(SphPtrsT<Real> s, cudaStream_t st)
 {
     const int n = s.d.numP - s.d.num;
     if (n <= 0) return;
     const int nfluid = s.d.gs0 - s.d.num;
-    k_xch_fixup<<<nblocks(n), BLK, 0, st>>>(s, s.d.num, nfluid);
+    k_xch_fixup<Real><<<nblocks(n), BLK, 0, st>>>(s, s.d.num, nfluid);
 }
 
-void launch_disp_max(const SphPtrsD s, const double* d_xbuild,
+template <class Real>
+void launch_disp_max(const SphPtrsT<Real> s, const double* d_xbuild,
                      unsigned long long* d_max, cudaStream_t st)
 {
     if (s.d.num <= 0) return;
-    k_disp_max<<<nblocks(s.d.num), BLK, 0, st>>>(s, d_xbuild, d_max);
+    k_disp_max<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_xbuild, d_max);
 }
 
 // P17: the reduced value goes into the tail of the E1 staging block, so it is
@@ -2302,7 +2319,14 @@ void launch_disp_store(const unsigned long long* d_max, double* d_out, cudaStrea
     template void launch_nor_sumvecn<Real>(SphPtrsT<Real>, Real*, cudaStream_t);        \
     template void launch_nor_normalize<Real>(SphPtrsT<Real>, Real*, cudaStream_t);      \
     template void launch_gra_correc<Real>(SphPtrsT<Real>, Real*, cudaStream_t);         \
-    template void launch_gra_invert<Real>(SphPtrsT<Real>, Real*, cudaStream_t);
+    template void launch_gra_invert<Real>(SphPtrsT<Real>, Real*, cudaStream_t);         \
+    template void launch_xch_gather<Real>(SphPtrsT<Real>, int, const int*, const int*,   \
+                                          int, double*, cudaStream_t);                  \
+    template void launch_xch_scatter<Real>(SphPtrsT<Real>, int, const int*, const int*,  \
+                                           int, const double*, cudaStream_t);           \
+    template void launch_xch_fixup<Real>(SphPtrsT<Real>, cudaStream_t);                 \
+    template void launch_disp_max<Real>(SphPtrsT<Real>, const double*,                  \
+                                        unsigned long long*, cudaStream_t);
 
 #if SPH_HAVE_FP64
 SPH_INSTANTIATE(double)

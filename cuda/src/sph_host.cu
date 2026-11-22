@@ -762,27 +762,32 @@ struct Solver
 
     void verify_cells()
     {
-        std::vector<int> st(g.d.ncell + 1), so(g.d.num);
-        std::vector<Real> hx(3 * g.d.num);
+        // V2: the same check works on a decomposed rank -- there are numP slots
+        // (owned + ghosts) and every one of them must appear in exactly the cell
+        // its live position maps to.  This is the regression check for the
+        // histogram/scatter pair (the old bug binned x into an X0 histogram).
+        const int nv = g.d.numP;
+        std::vector<int> st(g.d.ncell + 1), so(nv);
+        std::vector<Real> hx(3 * nv);
         CUDA_CHECK(cudaMemcpy(st.data(), g.cellStart, (g.d.ncell + 1) * sizeof(int), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(so.data(), g.sorted, g.d.num * sizeof(int), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(hx.data(), g.x, 3 * g.d.num * sizeof(Real), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(so.data(), g.sorted, (size_t)nv * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hx.data(), g.x, (size_t)3 * nv * sizeof(Real), cudaMemcpyDeviceToHost));
 
-        std::vector<int> seen(g.d.num, 0);
+        std::vector<int> seen(nv, 0);
         int dup = 0, outOfCell = 0, missing = 0;
         for (int c = 0; c < g.d.ncell; ++c)
         {
-            if (st[c] < 0 || st[c] > st[c + 1] || st[c + 1] > g.d.num) { printf("  cellStart bad at %d\n", c); break; }
+            if (st[c] < 0 || st[c] > st[c + 1] || st[c + 1] > nv) { printf("  cellStart bad at %d\n", c); break; }
             for (int a = st[c]; a < st[c + 1]; ++a)
             {
                 const int p = so[a];
-                if (p < 0 || p >= g.d.num) continue;
+                if (p < 0 || p >= nv) continue;
                 seen[p]++;
-                const int cc = host_cell(hx[p], hx[g.d.num + p], hx[2 * g.d.num + p]);
+                const int cc = host_cell(hx[p], hx[nv + p], hx[2 * nv + p]);
                 if (cc != c) outOfCell++;
             }
         }
-        for (int p = 0; p < g.d.num; ++p) { if (seen[p] == 0) missing++; if (seen[p] > 1) dup += seen[p] - 1; }
+        for (int p = 0; p < nv; ++p) { if (seen[p] == 0) missing++; if (seen[p] > 1) dup += seen[p] - 1; }
         printf("[verify] start[0]=%d start[N]=%d dup=%d missing=%d wrongCell=%d\n",
                st[0], st[g.d.ncell], dup, missing, outOfCell);
     }
@@ -1274,18 +1279,19 @@ struct Solver
 //  deck's fluid|solid|wall order, so every `p < s.d.ntotal` style bound in the
 //  kernels still means "my fluid" and ghost slots are only ever read.
 //
-//  Per step a rank exchanges two record blocks (E1 fluid+solid, E2 solid) with
+//  Per step a rank exchanges one E1 record block (fluid 8, solid 10 doubles) with
 //  each of its up to 26 peers; see sph_kernels.cu for the layouts.  Packing is
 //  a gather kernel into a device staging block, ONE cudaMemcpyAsync of the whole
 //  block into a pinned host block, a barrier over all K threads, then a pinned
 //  -> device copy and a scatter kernel into the ghost slots on the receiving
-//  side.  A second barrier closes the exchange, because the sender reuses the
-//  same pinned block at the next exchange point.
+//  side.  The arena is double for both precisions, so a float value is carried
+//  exactly and V2's byte identity holds in fp32 too.
 //
-//  The single-GPU path above (run_case) is untouched: it never allocates a
-//  gid table, never sets numP != num and never enters this namespace.
+//  The single-GPU path above (run_case) is the same Solver template but never
+//  allocates a gid table, never sets numP != num and never enters this
+//  namespace.
 // ===========================================================================
-#if SPH_HAVE_FP64
+#if (SPH_HAVE_FP64 || SPH_HAVE_FP32)
 namespace d1
 {
 
@@ -1371,6 +1377,7 @@ struct DLink
     int peerOff[5] = { 0, 0, 0, 0, 0 };
 };
 
+template <class Real>
 struct Rank
 {
     int id = 0, gpu = 0, ownNum = 0, numP = 0, ngs1 = 0, ngs2 = 0;
@@ -1378,7 +1385,7 @@ struct Rank
     std::vector<double> rows;      // 14 * numP
     std::vector<DLink>  links;
     std::string         label;
-    Solver<double>      S;
+    Solver<Real>        S;
 
     // Exchange buffers, allocated once: two pinned send blocks (P10: consecutive
     // exchange points alternate between them, so a peer can still be relaying
@@ -1425,13 +1432,14 @@ struct Rank
     double ph[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, ph_t = 0.0;
 };
 
+template <class Real>
 struct Job
 {
     int K = 1, maxStep = 0;
     bool prof = false;
     int gnx = 1, gny = 1, gnz = 1;      // chosen block grid
     long long ghost_total = 0;          // sum of ghost slots over the ranks
-    std::vector<Rank> ranks;
+    std::vector<Rank<Real>> ranks;
     Barrier bar;
     // P14: two staging buffers so the ranks can keep stepping while a result file
     // is being written.  outBusy[s] says stage s still has a writer running.
@@ -1474,12 +1482,14 @@ struct Job
 // The rank thread announces its own fat size, the ranks meet at the barrier,
 // and each of them gets the maximum back -- the same decision everywhere.
 // ---------------------------------------------------------------------------
-static thread_local Job* tl_job = nullptr;
+template <class Real>
+static thread_local Job<Real>* tl_job = nullptr;
 static thread_local int  tl_rank = -1;
 
+template <class Real>
 static double a3_fat_agreed(double mb)
 {
-    Job* J = tl_job;
+    Job<Real>* J = tl_job<Real>;
     if (!J || J->K <= 1 || tl_rank < 0) return mb;
     J->a3_fat[(size_t)tl_rank] = mb;
     J->bar.wait();
@@ -1792,12 +1802,14 @@ static Part make_part(const Deck& D, int nx, int ny, int nz, double skin,
     return P;
 }
 
-static bool build_ranks(Job& J, const std::vector<double>& rows,
+template <class Real>
+static bool build_ranks(Job<Real>& J, const std::vector<double>& rows,
                         const std::vector<int>& ownerRank,
                         const std::vector<double>& box,
                         const double* pos = nullptr);
 
-static bool build_job(Job& J, const std::vector<double>& rows)
+template <class Real>
+static bool build_job(Job<Real>& J, const std::vector<double>& rows)
 {
     const int nf = 14;
     const int num = J.num, K = J.K;
@@ -1889,7 +1901,8 @@ static bool build_job(Job& J, const std::vector<double>& rows)
 // block offsets.  Rank 0 runs it at start-up and at every repartition while the
 // other rank threads wait on the barrier.
 // ---------------------------------------------------------------------------
-static bool build_ranks(Job& J, const std::vector<double>& rows,
+template <class Real>
+static bool build_ranks(Job<Real>& J, const std::vector<double>& rows,
                         const std::vector<int>& ownerRank,
                         const std::vector<double>& box,
                         const double* pos)
@@ -2002,7 +2015,7 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
     J.ranks.resize(K);
     for (int r = 0; r < K; ++r)
     {
-        Rank& R = J.ranks[r];
+        Rank<Real>& R = J.ranks[r];
         R.id = r;
         R.links.clear();               // a repartition rebuilds them from scratch
         R.ownNum = (int)ownGids[r].size();
@@ -2046,7 +2059,7 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
     };
     for (int r = 0; r < K; ++r)
     {
-        Rank& R = J.ranks[r];
+        Rank<Real>& R = J.ranks[r];
         for (int si = 0; si < (int)ghostGids[r].size(); ++si)
         {
             const int g = ghostGids[r][si];
@@ -2072,7 +2085,7 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
     // buffer is reserved for it.
     for (int r = 0; r < K; ++r)
     {
-        Rank& R = J.ranks[r];
+        Rank<Real>& R = J.ranks[r];
         int o[5] = { 0, 0, 0, 0, 0 };
         for (DLink& L : R.links)
         {
@@ -2157,13 +2170,15 @@ static bool build_ranks(Job& J, const std::vector<double>& rows,
 // dominated the step (measured 3.9 ms of E1 for 2.2 MB of useful data).  Four
 // copies and four launches per step fix that; the CPU memcpy moves the same
 // bytes at host-memory speed.
-static double* send_buf(Rank& R) { return R.hSendB[R.sendSlot]; }
+template <class Real>
+static double* send_buf(Rank<Real>& R) { return R.hSendB[R.sendSlot]; }
 
-static void xch_pack(Job& J, Rank& R, int mode)
+template <class Real>
+static void xch_pack(Job<Real>& J, Rank<Real>& R, int mode)
 {
     if (J.K == 1) return;              // no peers: nothing to exchange, no barrier
     const double t0 = now_s();
-    Solver<double>& S = R.S;
+    Solver<Real>& S = R.S;
     (void)mode;                        // one exchange point left (P11)
     size_t bytes = ((size_t)SPH_XCH_REC_F * R.nSend[0] +
                     (size_t)SPH_XCH_REC_S * R.nSend[1]) * sizeof(double);
@@ -2192,11 +2207,12 @@ static void xch_pack(Job& J, Rank& R, int mode)
     R.xch_s   += t_bar - t0;
 }
 
-static void xch_unpack(Job& J, Rank& R, int mode)
+template <class Real>
+static void xch_unpack(Job<Real>& J, Rank<Real>& R, int mode)
 {
     if (J.K == 1) return;
     const double t0 = now_s();
-    Solver<double>& S = R.S;
+    Solver<Real>& S = R.S;
 
     // 1) relay: every peer's block for me -> my receive block (CPU memcpy)
     (void)mode;                        // one exchange point left (P11)
@@ -2231,7 +2247,8 @@ static void xch_unpack(Job& J, Rank& R, int mode)
 
 // P10: advance the buffer parity once per exchange point, on every rank (they
 // all follow the same sequence of points, so the halves line up).
-static void xch(Job& J, Rank& R, int mode)
+template <class Real>
+static void xch(Job<Real>& J, Rank<Real>& R, int mode)
 {
     R.sendSlot = R.xchSeq & 1;
     ++R.xchSeq;
@@ -2240,17 +2257,20 @@ static void xch(Job& J, Rank& R, int mode)
 }
 
 // C9 helpers (defined with the repartition code below)
-static void monitor_init(Rank& R);
-static void disp_collect(Job& J, Rank& R);
+template <class Real>
+static void monitor_init(Rank<Real>& R);
+template <class Real>
+static void disp_collect(Job<Real>& J, Rank<Real>& R);
 
 // one-off: the static fields of the ghost block.  A and vecn only a rank's
 // owner can produce (they depend on that rank's own neighbour set), and
 // k_prepare never runs over ghosts.
-static void xch_static(Job& J, Rank& R)
+template <class Real>
+static void xch_static(Job<Real>& J, Rank<Real>& R)
 {
     if (J.K == 1) return;
     const double t0 = now_s();
-    Solver<double>& S = R.S;
+    Solver<Real>& S = R.S;
     const size_t sbytes = (size_t)SPH_XCH_REC_ST * R.nSend[4] * sizeof(double);
     const size_t rbytes = (size_t)SPH_XCH_REC_ST * R.nRecv[4] * sizeof(double);
     launch_xch_gather(S.g, 4, R.dSendIdx[4], R.dSendOff[4], R.nSend[4], R.dStage, 0);
@@ -2278,9 +2298,10 @@ static void xch_static(Job& J, Rank& R)
 // ---------------------------------------------------------------------------
 // one step, in the order of the single-GPU loop but with the exchanges in it
 // ---------------------------------------------------------------------------
-static void step_d1(Job& J, Rank& R, int itime)
+template <class Real>
+static void step_d1(Job<Real>& J, Rank<Real>& R, int itime)
 {
-    Solver<double>& S = R.S;
+    Solver<Real>& S = R.S;
     const bool prof = J.prof;
     auto lap = [&](int k)
     {
@@ -2352,40 +2373,42 @@ static void step_d1(Job& J, Rank& R, int itime)
 // results: every rank pushes its owned particles into global gid-indexed
 // arrays, rank 0 writes the file in the exact format of write_result()
 // ---------------------------------------------------------------------------
-static void fetch_own(Job& J, Rank& R, Job::OutBuf& O)
+template <class Real>
+static void fetch_own(Job<Real>& J, Rank<Real>& R, typename Job<Real>::OutBuf& O)
 {
     const SphDims& d = R.S.g.d;
     const int n = d.num, ns = d.solnum;
     const int N = d.numP;
-    std::vector<double> hx((size_t)3 * n), hp(n);
-    CUDA_CHECK(cudaMemcpy(hx.data(),         R.S.g.x, (size_t)n * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hx.data() + n,     R.S.g.x + N, (size_t)n * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hx.data() + 2 * n, R.S.g.x + 2 * N, (size_t)n * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hp.data(), R.S.g.p, (size_t)n * sizeof(double), cudaMemcpyDeviceToHost));
-    std::vector<double> pia;
+    std::vector<Real> hx((size_t)3 * n), hp(n);
+    CUDA_CHECK(cudaMemcpy(hx.data(),         R.S.g.x, (size_t)n * sizeof(Real), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hx.data() + n,     R.S.g.x + N, (size_t)n * sizeof(Real), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hx.data() + 2 * n, R.S.g.x + 2 * N, (size_t)n * sizeof(Real), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hp.data(), R.S.g.p, (size_t)n * sizeof(Real), cudaMemcpyDeviceToHost));
+    std::vector<Real> pia;
     if (ns > 0)
     {
         pia.resize((size_t)SPH_PIA_STRIDE * ns);
-        CUDA_CHECK(cudaMemcpy(pia.data(), R.S.g.Pia, pia.size() * sizeof(double),
+        CUDA_CHECK(cudaMemcpy(pia.data(), R.S.g.Pia, pia.size() * sizeof(Real),
                               cudaMemcpyDeviceToHost));
     }
     for (int i = 0; i < n; ++i)
     {
         const int g = R.gid[i];
-        O.gx[g] = hx[i];
-        O.gy[g] = hx[n + i];
-        O.gz[g] = hx[2 * n + i];
-        if (i < d.ntotal)      O.gp[g] = hp[i];
+        O.gx[g] = (double)hx[i];
+        O.gy[g] = (double)hx[n + i];
+        O.gz[g] = (double)hx[2 * n + i];
+        if (i < d.ntotal)      O.gp[g] = (double)hp[i];
         else if (i < d.nall)
         {
             const size_t k = (size_t)(i - d.ntotal) * SPH_PIA_STRIDE;
-            O.gp[g] = pia[k] + pia[k + 4] + pia[k + 8];
+            O.gp[g] = (double)(pia[k] + pia[k + 4] + pia[k + 8]);
         }
         else                   O.gp[g] = 0.0;
     }
 }
 
-static void write_global_result(Job& J, const Job::OutBuf& O, int idx)
+template <class Real>
+static void write_global_result(Job<Real>& J, const typename Job<Real>::OutBuf& O, int idx)
 {
     const char* ef32 = getenv("SPH_OUT_F32");
     const bool f32 = (ef32 != nullptr) && (atoi(ef32) != 0);
@@ -2472,11 +2495,14 @@ static void write_global_result(Job& J, const Job::OutBuf& O, int idx)
 // its current dynamic state back from the gid-indexed migration buffer; ghost
 // slots are refreshed by the next E1 and by the static exchange below.
 // ---------------------------------------------------------------------------
-enum { MIG_N = 20 };
+template <class Real>
+constexpr int mig_n = 20 + (sizeof(Real) < sizeof(double) ? 7 : 0);   // + u3, xc3, rhoc
 
-static void build_send_lists(Job& J, Rank& R);   // defined below
+template <class Real>
+static void build_send_lists(Job<Real>& J, Rank<Real>& R);   // defined below
 
-static void xch_free(Rank& R)
+template <class Real>
+static void xch_free(Rank<Real>& R)
 {
     for (int s = 0; s < 2; ++s)
         if (R.hSendB[s]) { cudaFreeHost(R.hSendB[s]); R.hSendB[s] = nullptr; }
@@ -2503,7 +2529,8 @@ static void xch_free(Rank& R)
 // C9: snapshot of the positions the ghost set was chosen from, plus the device
 // scalar the displacement reduce lands in.  Called after every (re)build.
 // ---------------------------------------------------------------------------
-static void monitor_init(Rank& R)
+template <class Real>
+static void monitor_init(Rank<Real>& R)
 {
     if (R.dXBuild)  { cudaFree(R.dXBuild);  R.dXBuild = nullptr; }
     if (R.dMaxDisp) { cudaFree(R.dMaxDisp); R.dMaxDisp = nullptr; }
@@ -2512,15 +2539,26 @@ static void monitor_init(Rank& R)
     CUDA_CHECK(cudaMalloc((void**)&R.dXBuild, (size_t)3 * n * sizeof(double)));
     CUDA_CHECK(cudaMalloc((void**)&R.dMaxDisp, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemset(R.dMaxDisp, 0, sizeof(unsigned long long)));
+    // The snapshot is double even for Real = float: k_disp_max widens the live
+    // coordinate to double before subtracting, so both precisions measure the
+    // same metric.  One host round trip, once per (re)build.
+    std::vector<Real> hx((size_t)n);
+    std::vector<double> dx((size_t)n);
     for (int c = 0; c < 3; ++c)
-        CUDA_CHECK(cudaMemcpy(R.dXBuild + (size_t)c * n, R.S.g.x + (size_t)c * N,
-                              (size_t)n * sizeof(double), cudaMemcpyDeviceToDevice));
+    {
+        CUDA_CHECK(cudaMemcpy(hx.data(), R.S.g.x + (size_t)c * N,
+                              (size_t)n * sizeof(Real), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < n; ++i) dx[i] = (double)hx[i];
+        CUDA_CHECK(cudaMemcpy(R.dXBuild + (size_t)c * n, dx.data(),
+                              (size_t)n * sizeof(double), cudaMemcpyHostToDevice));
+    }
 }
 
 // P17: the displacement is reduced into the tail of the E1 staging block (xch_pack
 // does that), and after E1's barrier every rank reads the maximum over the peers'
 // blocks -- the same relay it already performs, no readback of its own.
-static void disp_collect(Job& J, Rank& R)
+template <class Real>
+static void disp_collect(Job<Real>& J, Rank<Real>& R)
 {
     if (!R.dXBuild || R.nSendE1 == 0) { R.disp = 0.0; return; }
     double mx = R.hSendB[R.sendSlot][R.nSendE1];
@@ -2535,53 +2573,67 @@ static void disp_collect(Job& J, Rank& R)
                1000.0 * mx, 1000.0 * J.skin);
 }
 
-static void mig_snapshot(Job& J, Rank& R)
+template <class Real>
+static void mig_snapshot(Job<Real>& J, Rank<Real>& R)
 {
     const SphDims& d = R.S.g.d;
     const int n = d.num, N = d.numP;
-    const double* src[MIG_N] = {
-        R.S.g.x, R.S.g.x + N, R.S.g.x + 2 * N,
-        R.S.g.vx, R.S.g.vx + N, R.S.g.vx + 2 * N,
-        R.S.g.rho, R.S.g.SurF,
-        R.S.g.A + 0 * N, R.S.g.A + 1 * N, R.S.g.A + 2 * N,
-        R.S.g.A + 3 * N, R.S.g.A + 4 * N, R.S.g.A + 5 * N,
-        R.S.g.A + 6 * N, R.S.g.A + 7 * N, R.S.g.A + 8 * N,
-        R.S.g.vecn, R.S.g.vecn + N, R.S.g.vecn + 2 * N
-    };
-    std::vector<double> buf((size_t)n);
-    for (int k = 0; k < MIG_N; ++k)
+    std::vector<const Real*> src;
+    src.reserve((size_t)mig_n<Real>);
+    src.push_back(R.S.g.x); src.push_back(R.S.g.x + N); src.push_back(R.S.g.x + 2 * N);
+    src.push_back(R.S.g.vx); src.push_back(R.S.g.vx + N); src.push_back(R.S.g.vx + 2 * N);
+    src.push_back(R.S.g.rho); src.push_back(R.S.g.SurF);
+    for (int c = 0; c < 9; ++c) src.push_back(R.S.g.A + (size_t)c * N);
+    src.push_back(R.S.g.vecn); src.push_back(R.S.g.vecn + N); src.push_back(R.S.g.vecn + 2 * N);
+    if constexpr (sizeof(Real) < sizeof(double))
     {
-        CUDA_CHECK(cudaMemcpy(buf.data(), src[k], (size_t)n * sizeof(double),
+        // fp32: x of a solid is X0 + u, and the Kahan compensations are the only
+        // record of the sub-ulp motion.  Losing them in a repartition would move
+        // the solid back by the accumulated rounding.
+        src.push_back(R.S.g.u); src.push_back(R.S.g.u + N); src.push_back(R.S.g.u + 2 * N);
+        src.push_back(R.S.g.xc); src.push_back(R.S.g.xc + N); src.push_back(R.S.g.xc + 2 * N);
+        src.push_back(R.S.g.rhoc);
+    }
+    std::vector<Real> buf((size_t)n);
+    for (int k = 0; k < (int)src.size(); ++k)
+    {
+        CUDA_CHECK(cudaMemcpy(buf.data(), src[(size_t)k], (size_t)n * sizeof(Real),
                               cudaMemcpyDeviceToHost));
         for (int i = 0; i < n; ++i)
-            J.mig[(size_t)R.gid[i] * MIG_N + k] = buf[i];
+            J.mig[(size_t)R.gid[i] * mig_n<Real> + k] = (double)buf[i];
     }
 }
 
-static void mig_restore(Job& J, Rank& R)
+template <class Real>
+static void mig_restore(Job<Real>& J, Rank<Real>& R)
 {
     const SphDims& d = R.S.g.d;
     const int n = d.num, N = d.numP;
-    double* dst[MIG_N] = {
-        R.S.g.x, R.S.g.x + N, R.S.g.x + 2 * N,
-        R.S.g.vx, R.S.g.vx + N, R.S.g.vx + 2 * N,
-        R.S.g.rho, R.S.g.SurF,
-        R.S.g.A + 0 * N, R.S.g.A + 1 * N, R.S.g.A + 2 * N,
-        R.S.g.A + 3 * N, R.S.g.A + 4 * N, R.S.g.A + 5 * N,
-        R.S.g.A + 6 * N, R.S.g.A + 7 * N, R.S.g.A + 8 * N,
-        R.S.g.vecn, R.S.g.vecn + N, R.S.g.vecn + 2 * N
-    };
-    std::vector<double> buf((size_t)n);
-    for (int k = 0; k < MIG_N; ++k)
+    std::vector<Real*> dst;
+    dst.reserve((size_t)mig_n<Real>);
+    dst.push_back(R.S.g.x); dst.push_back(R.S.g.x + N); dst.push_back(R.S.g.x + 2 * N);
+    dst.push_back(R.S.g.vx); dst.push_back(R.S.g.vx + N); dst.push_back(R.S.g.vx + 2 * N);
+    dst.push_back(R.S.g.rho); dst.push_back(R.S.g.SurF);
+    for (int c = 0; c < 9; ++c) dst.push_back(R.S.g.A + (size_t)c * N);
+    dst.push_back(R.S.g.vecn); dst.push_back(R.S.g.vecn + N); dst.push_back(R.S.g.vecn + 2 * N);
+    if constexpr (sizeof(Real) < sizeof(double))
+    {
+        dst.push_back(R.S.g.u); dst.push_back(R.S.g.u + N); dst.push_back(R.S.g.u + 2 * N);
+        dst.push_back(R.S.g.xc); dst.push_back(R.S.g.xc + N); dst.push_back(R.S.g.xc + 2 * N);
+        dst.push_back(R.S.g.rhoc);
+    }
+    std::vector<Real> buf((size_t)n);
+    for (int k = 0; k < (int)dst.size(); ++k)
     {
         for (int i = 0; i < n; ++i)
-            buf[i] = J.mig[(size_t)R.gid[i] * MIG_N + k];
-        CUDA_CHECK(cudaMemcpy(dst[k], buf.data(), (size_t)n * sizeof(double),
+            buf[i] = (Real)J.mig[(size_t)R.gid[i] * mig_n<Real> + k];
+        CUDA_CHECK(cudaMemcpy(dst[(size_t)k], buf.data(), (size_t)n * sizeof(Real),
                               cudaMemcpyHostToDevice));
     }
 }
 
-static void repartition(Job& J, Rank& R, int itime, const char* why, bool recut)
+template <class Real>
+static void repartition(Job<Real>& J, Rank<Real>& R, int itime, const char* why, bool recut)
 {
     const double t0 = now_s();
     const int n = R.S.g.d.num, N = R.S.g.d.numP;
@@ -2589,13 +2641,13 @@ static void repartition(Job& J, Rank& R, int itime, const char* why, bool recut)
 
     // 1) publish my positions and my dynamic state, both indexed by gid
     {
-        std::vector<double> buf((size_t)n);
+        std::vector<Real> buf((size_t)n);
         for (int c = 0; c < 3; ++c)
         {
             CUDA_CHECK(cudaMemcpy(buf.data(), R.S.g.x + (size_t)c * N,
-                                  (size_t)n * sizeof(double), cudaMemcpyDeviceToHost));
+                                  (size_t)n * sizeof(Real), cudaMemcpyDeviceToHost));
             for (int i = 0; i < n; ++i)
-                J.pos[(size_t)R.gid[i] * 3 + c] = buf[i];
+                J.pos[(size_t)R.gid[i] * 3 + c] = (double)buf[i];
         }
     }
     if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: positions published\n", R.id);
@@ -2750,7 +2802,8 @@ static void repartition(Job& J, Rank& R, int itime, const char* why, bool recut)
 // which peer, and where their records live in my send block), so it is built
 // before the peers' buffers exist; the relay offsets (peerOff) come from the
 // same pass in build_job, so the scatter side can be built immediately too.
-static void build_send_lists(Job& J, Rank& R)
+template <class Real>
+static void build_send_lists(Job<Real>& J, Rank<Real>& R)
 {
     CUDA_CHECK(cudaSetDevice(R.gpu));
     const size_t sbytes = (std::max<size_t>(R.sendCap, 1) + 1) * sizeof(double);   // +1: P17 tail
@@ -2823,11 +2876,12 @@ static void build_send_lists(Job& J, Rank& R)
         up_i(off2, R.dRecvOff[g]);
     }
 }
-static void rank_main(Job* Jp, int r)
+template <class Real>
+static void rank_main(Job<Real>* Jp, int r)
 {
-    Job& J = *Jp;
-    Rank& R = J.ranks[r];
-    tl_job = &J;
+    Job<Real>& J = *Jp;
+    Rank<Real>& R = J.ranks[r];
+    tl_job<Real> = &J;
     tl_rank = r;
     CUDA_CHECK(cudaSetDevice(R.gpu));
     // Each device has its own copy of the __device__ clamp symbols.
@@ -2850,6 +2904,7 @@ static void rank_main(Job* Jp, int r)
     if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: deck loaded, numP=%d\n", r, R.S.g.d.numP);
     monitor_init(R);                  // C9: the reference for the displacement trigger
     R.S.build_cells();
+    if (getenv("SPH_VERIFY")) R.S.verify_cells();
     R.S.init_reference_state();
     CUDA_CHECK(cudaDeviceSynchronize());
     if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: reference state ok\n", r);
@@ -2860,6 +2915,7 @@ static void rank_main(Job* Jp, int r)
     launch_build_solid_pack(R.S.g, 0);
     if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: static exchange + pack ok\n", r);
     if (sph_use_static_solid) R.S.build_solid_lists();
+    if (getenv("SPH_VERIFY")) R.S.verify_cells();
     if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: solid lists ok (npair %d, nsolC %d)\n", r, R.S.g.npair, R.S.g.d.nsolC);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -2869,6 +2925,12 @@ static void rank_main(Job* Jp, int r)
         {
             std::lock_guard<std::mutex> lk(J.print_m);
             fprintf(stderr, "[D1] rank %d: warning: %d particle(s) fell back to A = I\n", r, nfb);
+            if constexpr (sizeof(Real) < sizeof(double))
+            {
+                fprintf(stderr, "[D1] rank %d: fp32: the F - I displacement form is invalid "
+                                "for this deck; re-run with --fp64\n", r);
+                std::exit(4);
+            }
         }
     }
 
@@ -2919,7 +2981,7 @@ static void rank_main(Job* Jp, int r)
             if (r == 0)
             {
                 const int idx = itime / g_out_cadence;
-                Job::OutBuf& O = J.out[s];
+                typename Job<Real>::OutBuf& O = J.out[s];
                 J.outFut[s] = std::async(std::launch::async,
                                          [&J, &O, idx] { write_global_result(J, O, idx); });
                 J.outBusy[s] = true;
@@ -3068,9 +3130,11 @@ static int choose_auto_k(const Deck& D, int ndev, double skin, std::vector<doubl
     return pick;
 }
 
+template <class Real>
 static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpus);
 
 // L1: rank the devices, choose K, then run the ordinary driver on that set.
+template <class Real>
 static int run_auto(const char* deck, int maxStep)
 {
     std::vector<double> rows;
@@ -3118,22 +3182,23 @@ static int run_auto(const char* deck, int maxStep)
     const int K = choose_auto_k(D, (int)devs.size(), skin, pred);
     std::vector<int> gpus;
     for (int i = 0; i < K; ++i) gpus.push_back(devs[(size_t)i].id);
-    return run(deck, maxStep, K, gpus);
+    return run<Real>(deck, maxStep, K, gpus);
 }
 
 // ---------------------------------------------------------------------------
 // driver
 // ---------------------------------------------------------------------------
+template <class Real>
 static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpus)
 {
-    Job J;
+    Job<Real> J;
     J.K = K;
     J.bar.K = K;
     J.maxStep = maxStep;
     J.deck = deck;
     J.prof = (getenv("SPH_D1PROF") != nullptr);
     // C12: from here on build_solid_lists() decides the A6 layout collectively
-    sph_a3_fat_hook = &a3_fat_agreed;
+    sph_a3_fat_hook = &a3_fat_agreed<Real>;
     if (const char* b = getenv("SPH_BARRIER"))
         g_barrier_mode = (!strcmp(b, "spin")) ? 1 : (!strcmp(b, "block")) ? 2 : 0;
     if (const char* e = getenv("SPH_D1_REPART")) J.repart = atoi(e);
@@ -3209,7 +3274,7 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
     if (J.repart > 0 || J.skin > 0.0)
     {
         J.pos.assign((size_t)3 * J.num, 0.0);
-        J.mig.assign((size_t)MIG_N * J.num, 0.0);
+        J.mig.assign((size_t)mig_n<Real> * J.num, 0.0);
     }
     if (J.repart > 0)
         std::printf("[D1] repartition every %d steps%s\n", J.repart,
@@ -3240,7 +3305,7 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
     }
     for (int r = 0; r < K; ++r)
     {
-        const Rank& R = J.ranks[r];
+        const Rank<Real>& R = J.ranks[r];
         int nf = 0, ns = 0, nw = 0, gf = 0, gs = 0, gw = 0;
         for (int i = 0; i < R.ownNum; ++i)
         {
@@ -3266,7 +3331,7 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
 
     std::vector<std::thread> th;
     th.reserve(K);
-    for (int r = 0; r < K; ++r) th.emplace_back(rank_main, &J, r);
+    for (int r = 0; r < K; ++r) th.emplace_back(rank_main<Real>, &J, r);
     for (auto& t : th) t.join();
 
     double wall = 0.0;
@@ -3274,7 +3339,7 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
     const int steps = maxStep > 0 ? maxStep : 1;
     for (int r = 0; r < K; ++r)
     {
-        const Rank& R = J.ranks[r];
+        const Rank<Real>& R = J.ranks[r];
         // P19: the wall clock, not just the sum of the step kernels -- the previous
         // figure excluded the halo rebuilds and the result writes, which are a large
         // part of a long run.
@@ -3297,7 +3362,7 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
                                       "pass2_fluid", "pass2_solid", "update" };
         for (int r = 0; r < K; ++r)
         {
-            const Rank& R = J.ranks[r];
+            const Rank<Real>& R = J.ranks[r];
             std::printf("[D1] rank %d phases (ms/step):", r);
             for (int k = 0; k < 14; ++k) std::printf(" %s=%.3f", nm[k], 1000.0 * R.ph[k] / steps);
             std::printf("\n[D1] rank %d exchange split (ms/step): gather-launch=%.3f "
@@ -3311,7 +3376,7 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
 }
 
 }  // namespace d1
-#endif  // SPH_HAVE_FP64
+#endif  // SPH_HAVE_FP64 || SPH_HAVE_FP32
 
 // ---------------------------------------------------------------------------
 // driver for one precision
@@ -3752,26 +3817,17 @@ int main(int argc, char** argv)
         const int K = atoi(e);
         if (!strcmp(e, "auto"))             // L1: rank the devices, choose K
         {
-            if (want_f32)
-            {
-                fprintf(stderr, "SPH_RANKS=auto: the multi-GPU path is fp64 only; "
-                                "drop --fp32 / SPH_PRECISION=fp32\n");
-                return 2;
-            }
+#if SPH_HAVE_FP32
+            if (want_f32) return d1::run_auto<float>(input, iMaxStep);
+#endif
 #if SPH_HAVE_FP64
-            return d1::run_auto(input, iMaxStep);
+            return d1::run_auto<double>(input, iMaxStep);
 #else
             fprintf(stderr, "this build has no fp64 path (SPH_ENABLE_FP64=OFF)\n");
             return 2;
 #endif
         }
         if (K < 1) { fprintf(stderr, "SPH_RANKS must be >= 1 or 'auto' (got '%s')\n", e); return 2; }
-        if (want_f32)
-        {
-            fprintf(stderr, "SPH_RANKS=%d: the multi-GPU path is fp64 only; "
-                            "drop --fp32 / SPH_PRECISION=fp32\n", K);
-            return 2;
-        }
         std::vector<int> gpus;
         if (const char* g = getenv("SPH_RANKS_GPUS"))
         {
@@ -3810,10 +3866,13 @@ int main(int argc, char** argv)
                         gpus[i], ndev - 1);
                 return 2;
             }
-#if SPH_HAVE_FP64
         if (profile)
             fprintf(stderr, "[D1] note: SPH_PROFILE is not implemented on the decomposed path\n");
-        return d1::run(input, iMaxStep, K, gpus);
+#if SPH_HAVE_FP32
+        if (want_f32) return d1::run<float>(input, iMaxStep, K, gpus);
+#endif
+#if SPH_HAVE_FP64
+        return d1::run<double>(input, iMaxStep, K, gpus);
 #else
         (void)gpus;
         fprintf(stderr, "this build has no fp64 path (SPH_ENABLE_FP64=OFF)\n");

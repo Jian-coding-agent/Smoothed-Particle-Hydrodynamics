@@ -107,8 +107,14 @@ struct SphGridBox
 // point, holding only the fields the receiving kernels actually read (P9):
 //
 //   E1  fluid  x, vx, rho, SurFD                                    (8)
-//   E1  solid  x, vx, rho                                           (7)
+//   E1  solid  x, vx, rho, u                                        (10)
 //   init solid/wall  A[9], vecn[3]                                  (12)
+//
+// The solid record carries the fp32 displacement u: a layer-1 ghost solid runs
+// its own pass1_solid/constitution, and the fp32 F - I form is built from
+// u_q - u_p.  Recomputing u = x - X0 on the ghost would round differently from
+// the owner's compensated u, so it is exchanged exactly.  In fp64 u is unused
+// (the kernel uses x - X0 there) and the three extra doubles are harmless.
 //
 // One exchange point per step is all that is left: E3 (fluid PIJW, identically
 // zero) is gone (P8), and E2 is gone because the layer-1 ghost solids run their
@@ -119,7 +125,7 @@ struct SphGridBox
 // (launch_xch_fixup).
 // ---------------------------------------------------------------------------
 #define SPH_XCH_REC_F   8
-#define SPH_XCH_REC_S   7
+#define SPH_XCH_REC_S   10
 #define SPH_XCH_REC_ST  12
 
 // P1: slots per fluid particle in the neighbour list.  This deck's worst fluid
@@ -496,21 +502,29 @@ template <class Real> void launch_gra_correc(SphPtrsT<Real> s, Real* d_a, cudaSt
 template <class Real> void launch_gra_invert(SphPtrsT<Real> s, Real* d_a, cudaStream_t st);
 
 // ---------------------------------------------------------------------------
-// D1: exchange kernels (fp64 only).  One gather kernel per record type packs
-// the owned particles of a link into a device staging block, the host copies
-// the whole block once, relays the peers' blocks with plain memcpy, and one
-// scatter kernel per record type writes the ghost slots.  See sph_kernels.cu.
+// D1: exchange kernels.  One gather kernel per record type packs the owned
+// particles of a link into a device staging block, the host copies the whole
+// block once, relays the peers' blocks with plain memcpy, and one scatter
+// kernel per record type writes the ghost slots.  The staging block and the
+// relocation lists are double even when the solver is fp32: the physics is
+// fp32, the exchange keeps the exact float values in a double container (a
+// float is exact in a double), and V2's byte-identity holds for both
+// precisions.  See sph_kernels.cu.
 // ---------------------------------------------------------------------------
-void launch_xch_gather(const SphPtrsD s, int mode, const int* d_idx, const int* d_off,
+template <class Real>
+void launch_xch_gather(SphPtrsT<Real> s, int mode, const int* d_idx, const int* d_off,
                        int n, double* d_stage, cudaStream_t st);
-void launch_xch_scatter(SphPtrsD s, int mode, const int* d_idx, const int* d_off,
+template <class Real>
+void launch_xch_scatter(SphPtrsT<Real> s, int mode, const int* d_idx, const int* d_off,
                         int n, const double* d_base, cudaStream_t st);
 // TASK 2 / P9: rebuild 1/rho (and, for the ghost fluid block, p) after E1
 // instead of sending either of them
-void launch_xch_fixup(SphPtrsD s, cudaStream_t st);
+template <class Real>
+void launch_xch_fixup(SphPtrsT<Real> s, cudaStream_t st);
 // C9: max |x - x_build| over the owned particles, as the IEEE bit pattern of a
 // non-negative double so it can be reduced with atomicMax
-void launch_disp_max(const SphPtrsD s, const double* d_xbuild,
+template <class Real>
+void launch_disp_max(const SphPtrsT<Real> s, const double* d_xbuild,
                      unsigned long long* d_max, cudaStream_t st);
 // P17: drop the reduced maximum into a double slot (the tail of the E1 block)
 void launch_disp_store(const unsigned long long* d_max, double* d_out, cudaStream_t st);

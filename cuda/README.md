@@ -77,6 +77,7 @@ Environment variables:
 | `SPH_STEP0=N` / `--step0=N` | absolute step number of a fresh run |
 | `SPH_PROFILE` | per-phase timing (prepare / cell / pass1 / constitution / pass2 / update; single-GPU path) |
 | `SPH_STEPTIME=1` | one `ms/step` line per 500-step window (single-GPU path) |
+| `SPH_VERIFY=1` | validate the cell list (works on a decomposed rank too: all `numP` slots must be in their live cell) |
 | `SPH_SOLDDYN=1` | walk the grid in the solid kernels instead of the static pair list |
 | `SPH_REFLECT=flip` | flip `v_z` unconditionally above `z = 1` (1.cpp's form); the default only reflects outward motion (M8) |
 | `SPH_LITERALFLUID=1` | literal `pass1_fluid` body instead of the factored one |
@@ -111,11 +112,11 @@ result-frame cadence are the same on one card and on K cards.
 
 | | single GPU (`SPH_RANKS` unset) | decomposed (`SPH_RANKS=K>1`) |
 |---|---|---|
-| precision | fp64 or fp32 | fp64 only |
+| precision | fp64 or fp32 | fp64 or fp32 |
 | checkpoint / resume | yes (`SPH_CKPT`, `SPH_CKPT_IN`) | no (refused at start-up) |
 | `SPH_OUTCADENCE`, `SPH_OUT_F32` | yes | yes |
 | `SPH_SOLDBOX` | yes | yes (each rank clamps its owned solids) |
-| `SPH_SORTEDTHREADS` (S1) | yes | not used (the sorted array also holds ghosts) |
+| `SPH_SORTEDTHREADS` (S1) | yes | yes (fp32 auto; ghosts in `sorted[]` are skipped) |
 | neighbourhood | fixed grid from the deck | same global grid + ghost halo (V2) |
 | results | written by the process | gathered by rank 0, same format |
 
@@ -139,8 +140,10 @@ the previous single-GPU build on the 237k deck).
 per rank).  The deck is cut into an `nx*ny*nz` block grid whose compute weight is
 balanced, every rank also keeps copies of its neighbours' boundary particles
 ("ghosts"), and the fields those copies need are exchanged **once per step**: E1
-carries x, vx, rho and SurFD, and the layer-1 ghost solids run their own
-constitution instead of receiving its result (P11).
+carries x, vx, rho and SurFD (and, for solids, the fp32 displacement `u`), and the
+layer-1 ghost solids run their own constitution instead of receiving its result
+(P11).  Both fp64 and fp32 work; the exchange staging block stays double, so a
+float value crosses exactly and V2's byte identity holds for both.
 
 ```bat
 set SPH_RANKS=8
@@ -181,14 +184,25 @@ neighbour grid and orders a cell by global particle id, so the summation order i
 the one the single-GPU run uses.  A halo or exchange bug can no longer hide under
 1e-16 noise.  Measured: K = 4 and K = 8 over 3001 steps, with automatic rebuilds,
 with `SPH_D1_REPART=1000`, and through `SPH_RANKS=auto` -- zero differing bytes.
+The same holds for fp32: 237k K=2 over 501 steps, 3.7M K=2 over 501 steps, and
+237k K=2 with `SPH_D1_REPART=100` (two repartitions) are byte-identical to the
+single fp32 run.
 
-Constraints: the decomposition is fp64 only (`SPH_RANKS` + `--fp32` is refused);
-checkpoint/resume is single-GPU only (the ghosts would have to be saved with the
-owner's state); and a deck whose walls have a non-zero velocity is refused -- the
-exchange carries the fluid and solid groups only, so a moving wall would not
-reach its ghosts.  The solid wall clamp *is* applied on the decomposed path:
-each rank clamps its owned solids before the next exchange, so the ghosts inherit
-the clamped velocity and K > 1 still matches K = 1 bit for bit.
+Constraints: checkpoint/resume is single-GPU only (the ghosts would have to be
+saved with the owner's state), and a deck whose walls have a non-zero velocity
+is refused -- the exchange carries the fluid and solid groups only, so a moving
+wall would not reach its ghosts.  The solid wall clamp *is* applied on the
+decomposed path: each rank clamps its owned solids before the next exchange, so
+the ghosts inherit the clamped velocity and K > 1 still matches K = 1 bit for
+bit.
+
+**fp32 on the decomposed path** uses the same fp32 physics kernels as the single
+path.  The exchange records and the repartition migration buffer are double
+containers: a float is exact in a double, so the value that arrives is the value
+the owner wrote, and V2's byte identity is preserved.  The solid record carries
+`u` (the fp32 compensated displacement `x - X0`), because a layer-1 ghost solid
+builds its own `F - I` from `u_q - u_p`; recomputing `u` from the exchanged `x`
+would round differently from the owner's compensated sum.
 
 ## Precision
 
