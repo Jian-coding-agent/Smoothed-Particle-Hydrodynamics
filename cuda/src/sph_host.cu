@@ -528,6 +528,27 @@ struct Solver
         // The decomposed driver hashes the whole deck itself (the rank rows are
         // only a slice).
         if (g_ckpt_wanted && numAll == num) deck_fp = sph_deck_fingerprint(rows, num);
+
+        // The solid clamp defaults follow the 3.7M case (y1 = 3.31).  A deck
+        // whose structure reaches beyond that would have every particle above
+        // 3.31 frozen at each step, which is a silent physics change -- say so
+        // instead of letting the run look plausible.
+        if (sph_use_soldbox)
+        {
+            double maxy = -1e300;
+            for (int i = 0; i < numAll; ++i)
+                if (rows[(size_t)i * nf + 9] < -10.0)
+                {
+                    const double y = rows[(size_t)i * nf + 1];
+                    if (y > maxy) maxy = y;
+                }
+            if (maxy > g_soldbox_y1 + 1e-6)
+                fprintf(stderr, "[soldbox] warning: solids reach y=%.4f but the clamp is "
+                                "y<=%.4f; everything above %.4f is frozen every step.  "
+                                "Use SPH_SOLDBOX=%.3f,%.3f,%.3f for this deck (or =off).\n",
+                        maxy, g_soldbox_y1, g_soldbox_y1,
+                        g_soldbox_z, g_soldbox_y0, maxy + 0.01);
+        }
         return true;
     }
 

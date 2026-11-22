@@ -134,6 +134,11 @@ would otherwise lose the first lattice layer.
 CPU reference: it leaves the numeric path untouched (verified byte-identical to
 the previous single-GPU build on the 237k deck).
 
+If the deck's solids reach past the default `y1`, every particle above it would
+be frozen at each step, so the loader prints a warning and a suggested triple
+computed from the deck (`[soldbox] warning: solids reach y=... use
+SPH_SOLDBOX=z,y0,maxy+0.01`).  It does not change the run by itself.
+
 ## Multiple GPUs (D1)
 
 `SPH_RANKS=K` runs the same deck on K devices in one process (one host thread

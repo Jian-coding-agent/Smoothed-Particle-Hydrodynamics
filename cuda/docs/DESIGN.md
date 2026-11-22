@@ -1189,7 +1189,9 @@ double thresholds (`(float)0.01 != 0.01` loses the first lattice layer in fp64),
 and is applied to the owned solids of a decomposed rank before the exchange, so
 K > 1 and K = 1 still agree bit for bit.  The default bounds are the 3.7M case;
 `SPH_SOLDBOX="0.01,0.01,0.49"` (237k), `"0.01,0.00,1.31"` (1.2M) or `off`
-selects the others.
+selects the others.  If the solids reach past the default `y1`, `finish_deck()`
+prints a warning with the deck's max solid y and a suggested triple; it does not
+change the run.
 
 ### 15.2 Checkpointing both paths
 
