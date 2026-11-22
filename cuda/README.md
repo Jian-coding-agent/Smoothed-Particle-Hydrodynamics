@@ -50,6 +50,7 @@ sph_cuda.exe cases\dam_1203k.sphbin --fp32     :: single precision
 sph_cuda.exe input.dat                          :: legacy 14-column text deck
 sph_cuda.exe --precision=fp32 <deck>
 set SPH_PRECISION=fp32                          :: same, via the environment
+sph_cuda.exe --resume=dam.chk <deck>            :: continue a checkpoint
 sph_cuda.exe --help
 ```
 
@@ -61,20 +62,59 @@ python tools\sphbin.py make input_1203k.dat input_1203k.sphbin
 python tools\sphbin.py info input_1203k.sphbin
 ```
 
+### Checkpoint / restart
+
+A long run can be stopped and continued bit-identically: `--ckpt=<file>` (or
+`SPH_CKPT`) writes the cross-step state, `--resume=<file>` (or `SPH_CKPT_IN`)
+continues from it, and `SPH_MAXSTEP` counts the steps of the current segment.
+Frames keep the index a straight run would have written.
+
+```bat
+set SPH_MAXSTEP=200000 & set SPH_CKPT=dam.chk & set SPH_CKPT_EVERY=5000
+sph_cuda.exe cases\dam_1203k.sphbin --fp32
+
+set SPH_MAXSTEP=100000
+sph_cuda.exe cases\dam_1203k.sphbin --fp32 --resume=dam.chk
+```
+
+A `result*.sphbin` is **not** a restart state (4 values of the 20 carried per
+particle, and three of them are not even current: see
+[`docs/CHECKPOINT.md`](docs/CHECKPOINT.md)).  The checkpoint is 160 B/particle
+in fp64 and 108 B in fp32 — 183.6 / 124.0 MiB for 1.2 M particles.  The deck,
+the precision and the solver switches must match; the loader refuses anything
+else instead of continuing into different physics.
+
 Environment variables:
 
 | variable | effect |
 |---|---|
-| `SPH_MAXSTEP` | maximum number of time steps (default 10 000 001) |
+| `SPH_MAXSTEP` | maximum number of time steps (default 10 000 001), for this invocation |
 | `SPH_PRECISION` | `fp64` / `fp32` when no command-line flag is given |
+| `SPH_OUTCADENCE` | steps per result file (default 500) |
 | `SPH_OUT_F32=1` | write results as float32 (half the size) |
+| `SPH_CKPT` | write a checkpoint at the end of the run |
+| `SPH_CKPT_EVERY` | also write one every N steps (0 = only at the end) |
+| `SPH_CKPT_IN` | resume from this checkpoint |
+| `SPH_STEP0` | absolute step number of a fresh run (result naming only) |
+| `SPH_SOLDBOX` | solid wall clamp: `z,y0,y1` bounds, or `off` (default: the deck's geometry -- 3.7M case `0.01,0.00,3.31`, 1.2M case `0.01,0.00,1.31`) |
 | `SPH_PROFILE` | per-phase timing (prepare / cell / pass1 / constitution / pass2 / update) |
+| `SPH_STEPTIME=1` | print `ms/step` every 500 steps (with `SPH_PROFILE`: per phase) |
+| `SPH_SORTEDTHREADS=0` | turn off the cell-sorted thread mapping (see below) |
 | `SPH_SOLDDYN=1` | walk the grid in the solid kernels instead of the static pair list |
 | `SPH_LITERALFLUID=1` | literal `pass1_fluid` body instead of the factored one |
 | `SPH_FLUIDLIST=0` | fused fp64 `pass1_fluid` instead of the two-phase list version |
 
 The last three are diagnostics for A/B comparison; the optimised paths are the
 default and are what was validated.
+
+`SPH_SORTEDTHREADS` (S1): the fluid kernels are launched over the cell-sorted
+order, so the 32 threads of a warp own spatially adjacent particles.  Particle
+ids are frozen at t = 0, so without this the warp's threads scatter as soon as
+the flow mixes and `pass1_fluid` costs 2.8x more for exactly the same pair count
+(5.40 vs 1.90 ms on the 1.2 M deck).  The per-particle summation order is
+unchanged, so the output is byte-identical; it is on by default in fp32 and off
+in fp64 (where the two-phase list is faster).  It is slightly slower for the
+first few hundred steps, while the particles are still lattice ordered.
 
 ## Precision
 
@@ -110,8 +150,9 @@ remaining fp32 error is the quantisation of `p = c0^2(rho-1000)` with `rho` near
 ## Validation
 
 > The numbers below were obtained with the previous fixed-case build and its
-> text output.  The current build uses the new-case boundary conditions (no
-> test-only solid clamp, `z > 1.0` reflection) and binary I/O; the new-case
+> text output.  The current build uses the new-case boundary conditions (the
+> solid wall clamp is re-enabled by default behind `SPH_SOLDBOX`, `z > 1.0`
+> reflection) and binary I/O; the new-case
 > comparison against the CPU reference is in
 > [`docs/BINARY_IO.md`](docs/BINARY_IO.md).
 
@@ -158,10 +199,11 @@ CMakeLists.txt        build definition (no absolute paths, precision switches)
 build.bat             one-click build
 src/sph.h             runtime dims, SoA container, device math, prototypes
 src/sph_kernels.cu    all CUDA kernels and launch wrappers
-src/sph_host.cu       host driver (binary/text loading, dynamic allocation, step loop, binary output)
+src/sph_host.cu       host driver (binary/text loading, dynamic allocation, step loop, binary output, checkpoints)
 docs/DESIGN.md        algorithm, porting notes, validation, performance analysis
 docs/BINARY_IO.md     binary container, runtime sizing, new-case measurements
-tools/sphbin.py       text deck -> .sphbin converter / inspector
+docs/CHECKPOINT.md    restart state, SPHCHK format, what a resume refuses
+tools/sphbin.py       text deck -> .sphbin converter, deck / checkpoint inspector
 tools/cmp_bin_text.py compare a .sphbin result against a legacy text result
 tools/                result comparison helper (from the original package)
 ```

@@ -23,6 +23,22 @@
 // the host reads it through gra_fallback_count().
 static __device__ int sph_gra_fallbacks = 0;
 
+// Solid wall box clamp (1.cpp:196 of the new case), see sph_set_soldbox below.
+// Declared up here because k_update_solid uses them; the values are copied in
+// from the host at start-up.
+//
+// double, not float: the comparison is `x <= threshold` against the particle
+// position, and in fp64 a float threshold is *not* the number the reference
+// compares against.  (float)0.01 = 0.00999999977648258, so the 1 700 solid
+// particles that sit exactly on z = 0.01 failed the test in the fp64 build --
+// while they passed it in fp32, where the position is also rounded to 0.01f.
+// That is one full lattice layer of the structure losing its floor support, and
+// it made the two precisions do different physics.
+__device__ double sph_soldbox_z  = 0.01;
+__device__ double sph_soldbox_y0 = 0.00;
+__device__ double sph_soldbox_y1 = 3.31;
+__device__ int    sph_soldbox_on = 1;
+
 // A4 pre-filter: is candidate q certainly outside 3*hsml?  Compiled only for
 // Real = double -- for Real = float the exact test below is already fp32, so a
 // float pre-filter would just add three loads and six operations per candidate
@@ -258,6 +274,12 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
         const Real Dz = -(Aq6 * Gx + Aq7 * Gy + Aq8 * Gz);
 
         const size_t e = (size_t)j * s.d.solnum + k;
+        // C3 in the kernel: never write past the slot array.  If the count pass
+        // and this pass disagree by one pair at a knife edge, the entry used to
+        // land in the next particle's slots (silent corruption) and only the
+        // host's comparison noticed, long after the write.  Stopping here leaves
+        // cur[k] short of h[k], which is exactly what that comparison reports.
+        if (e >= (size_t)s.sw) return;
         s.sQ[e]      = q;
         s.sG[e]      = Gx; s.sG[L + e]      = Gy; s.sG[2 * L + e]      = Gz;
         s.sB[e]      = Bx; s.sB[L + e]      = By; s.sB[2 * L + e]      = Bz;
@@ -516,6 +538,12 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid(SphPtrsT<Real> s)
 
     sph_neigh2(s, p, xp0, xp1, xp2, [&](int q, Real d0, Real d1, Real d2, Real r2)
     {
+        // 1.cpp branches on `itype[i]>0 && itype[j]>0` / `itype[i]>0 && itype[j]<0`,
+        // so a rigid particle with itype == 0 gets *no* fluid term at all.  The
+        // loader accepts that value (sph.h documents -10 <= itype <= 0 for walls),
+        // so mirror the reference instead of silently treating 0 as a wall.
+        if (s.itype[q] == Real(0.0)) return;
+
         const Real dr = sqrt(r2 + Real(0.0000000000001));   // 1e-13, as in 1.cpp
         const Real pinv = Real(1.0) / dr;
         const Real qk = dr * sph_inv_h<Real>();
@@ -632,10 +660,14 @@ __global__ void k_fluid_nbr_build(SphPtrsT<Real> s)
 // USE_LIST = true : the same body over the recorded list.  The four kernels
 // that used to make the fp64 body run under a sparse lane mask are gone.
 // ---------------------------------------------------------------------------
-template <class Real, bool USE_LIST>
+template <class Real, bool USE_LIST, bool SORTED = false>
 __global__ void __launch_bounds__(256, 4) k_pass1_fluid_body(SphPtrsT<Real> s)
 {
-    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    // S1: thread t -> the t-th particle in cell-sorted order (48 % of the lanes
+    // are solid/wall and return immediately, but the surviving lanes of a warp
+    // are one or two cells apart instead of ~30).
+    const int p = SORTED ? ((t < s.d.num) ? s.sorted[t] : s.d.num) : t;
     if (p >= s.d.ntotal) return;
 
     const Real C0   = Real(SPH_C0);
@@ -658,6 +690,7 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid_body(SphPtrsT<Real> s)
 
     auto pair = [&](int q, Real d0, Real d1, Real d2, Real r2)
     {
+        if (s.itype[q] == Real(0.0)) return;                 // 1.cpp skips itype == 0
         const Real r2e = r2 + Real(0.0000000000001);        // 1e-13, as in 1.cpp
         const Real dr = sqrt(r2e);
         const Real qk = dr * invh;
@@ -1405,8 +1438,18 @@ __global__ void k_update_solid(SphPtrsT<Real> s, int base)
     Real v1 = s.vx[N + i]     + dt * s.PIJW[N + i]     + dt * s.SForce[N + i];
     Real v2 = s.vx[2 * N + i] + dt * s.PIJW[2 * N + i] + dt * s.SForce[2 * N + i] - dt * GRAV;
 
-    // New case (1.cpp): the old test-only box clamp is commented out there
-    // (it froze the plate); the solid now deforms freely.
+    // 1.cpp:196 -- hold the solid against the tank walls.  This is the clamp
+    // the new-case 1.cpp has commented out; without it the structure sinks.
+    if (sph_soldbox_on)
+    {
+        const Real zc = s.x[2 * N + i];
+        const Real yc = s.x[N + i];
+        if (zc <= Real(sph_soldbox_z) || yc <= Real(sph_soldbox_y0) || yc >= Real(sph_soldbox_y1))
+        {
+            v0 = Real(0.0); v1 = Real(0.0); v2 = Real(0.0);
+        }
+    }
+
     s.vx[i] = v0; s.vx[N + i] = v1; s.vx[2 * N + i] = v2;
 }
 
@@ -1575,7 +1618,13 @@ __global__ void k_gra_invert(SphPtrsT<Real> s, const Real* __restrict__ a, int b
 // ---------------------------------------------------------------------------
 static const int BLK = 256;
 
-static inline int nblocks(int n) { return (n + BLK - 1) / BLK; }
+// A launch with zero blocks is an *invalid configuration* in CUDA, not a no-op:
+// a deck with no solid (or no fluid) particles would abort the whole run at the
+// first kernel of that block ("invalid argument", raised by the C5 check at the
+// end of the step).  Every kernel starts with an index bounds check, so one
+// empty block is a harmless stand-in -- and this keeps the "one binary, any
+// deck" promise for the degenerate splits too.
+static inline int nblocks(int n) { return (n > 0) ? (n + BLK - 1) / BLK : 1; }
 
 // A3 switch, see sph.h: 0 = pre-A3 path (cell list walk every step)
 int sph_use_static_solid = 1;
@@ -1583,6 +1632,30 @@ int sph_use_static_solid = 1;
 int sph_fast_fluid_loop = 1;
 // P1 switch: 0 = fused fp64 pass1_fluid (A/B comparison)
 int sph_use_fluid_list = 1;
+
+// S1 experiment: fluid kernels launched over the cell-sorted order.
+// -1 = auto: on for fp32, off for fp64 (the fp64 two-phase list is faster there).
+int sph_sorted_threads = -1;
+
+// Solid wall box clamp (1.cpp:196 of the new case).  The reference zeroes the
+// velocity of a solid particle that sits on the floor or against a side wall.
+// Without it the structure has no support at all -- there is no solid-wall
+// interaction term, only solid-solid and fluid-(solid|wall) -- and it
+// free-falls under gravity.  Defaults follow the deck in use: the 3.7M case has
+// its floor at z = 0.01 and side walls at y = 0.00 / y = 3.31 (1.cpp:
+// x[2]<=0.01 || x[1]<=0.00 || x[1]>=3.31); the 1.2M case uses 0.01/0.00/1.31.
+// SPH_SOLDBOX="z,y0,y1" overrides both, SPH_SOLDBOX=off disables the clamp.
+int sph_use_soldbox = 1;
+
+void sph_set_soldbox(int on, double z, double y0, double y1)
+{
+    sph_use_soldbox = on ? 1 : 0;
+    int   onc = on ? 1 : 0;
+    cudaMemcpyToSymbol(sph_soldbox_z,  &z,   sizeof(double));
+    cudaMemcpyToSymbol(sph_soldbox_y0, &y0,  sizeof(double));
+    cudaMemcpyToSymbol(sph_soldbox_y1, &y1,  sizeof(double));
+    cudaMemcpyToSymbol(sph_soldbox_on, &onc, sizeof(int));
+}
 
 int gra_fallback_count()
 {
@@ -1693,6 +1766,17 @@ void launch_pass1_fluid(SphPtrsT<Real> s, cudaStream_t st)
     if (!sph_fast_fluid_loop)
     {
         k_pass1_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
+        return;
+    }
+    // S1: thread -> cell-sorted order.  Launched over all particles, because
+    // the fluid particles are scattered through the sorted array; the
+    // solid/wall lanes exit at once.  -1 = auto (on for fp32, off for fp64,
+    // where the two-phase list below is the measured winner).
+    const int sorted = (sph_sorted_threads < 0) ? (sizeof(Real) < sizeof(double) ? 1 : 0)
+                                                : sph_sorted_threads;
+    if (sorted)
+    {
+        k_pass1_fluid_body<Real, false, true><<<nblocks(s.d.num), BLK, 0, st>>>(s);
         return;
     }
     // P1: the list pays off only in fp64; fp32 is traversal bound and the fused

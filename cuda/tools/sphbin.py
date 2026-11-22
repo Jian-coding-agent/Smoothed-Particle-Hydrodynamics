@@ -10,20 +10,25 @@ Format (little endian, 128-byte header, then num*nfields float64, row-major):
      16     4  num
      20     4  ntotal   (itype > 0)
      24     4  solnum   (itype < -10)
-     28     4  nfields  (14 = input, 5 = output: x,y,z,p,itype)
+     28     4  nfields  (14 = deck, 4 = result: x,y,z,ppp)
      32     4  step     (0 for input files)
-     36     4  flags    (bit0: itype present)
+     36     4  flags    (bit0: itype present, bit1: result, bit2: float32 results)
      40     8  hsml
      48     8  dt
      56    48  gx0,gy0,gz0,gx1,gy1,gz1  (informational; the solver recomputes)
     104    24  reserved (zero)
 
 Input rows: x,y,z,p,vx,vy,vz,rho,mass,itype,X0,X0y,X0z,rho0 (the 14 text columns).
-Output rows: x,y,z,p,itype.
+Result rows: x,y,z,ppp  (fluid p, solid trace(Pia), 0 for rigid particles).
+
+The checkpoint container (SPHCHK) is a different file; `ckpt` prints it:
+
+    python sphbin.py ckpt <state.sphchk>
 
 Usage:
     python sphbin.py make  <deck.txt> <deck.sphbin> [--hsml 0.01] [--dt 1e-5]
     python sphbin.py info  <deck.sphbin>
+    python sphbin.py ckpt  <state.sphchk>
 """
 import sys, struct, os
 import numpy as np
@@ -56,18 +61,22 @@ def cmd_make(src, dst, hsml, dt):
     it = a[:, 9]
     nf_mask = it > 0
     ns_mask = it < -10
-    nw_mask = ~(nf_mask | ns_mask)
-    ntotal, solnum, nwall = int(nf_mask.sum()), int(ns_mask.sum()), int(nw_mask.sum())
-    # the kernels require the block layout fluid | solid | wall
-    order = np.concatenate([nf_mask, ns_mask, nw_mask])  # not used; check transitions
-    tr = np.flatnonzero(np.diff(it))
-    types = it[tr]
-    # every transition must be fluid->solid or solid->wall, and only once
-    seq = [it[0]] + [it[i + 1] for i in tr]
-    ok = (len(seq) == 3 and seq[0] > 0 and -10 > seq[1] and seq[2] >= -10)
-    if not ok:
-        raise SystemExit(f"deck is not ordered as fluid|solid|wall; type sequence at "
-                         f"transitions is {seq[:6]} (transitions={len(tr)})")
+    ntotal, solnum = int(nf_mask.sum()), int(ns_mask.sum())
+    nwall = n - ntotal - solnum
+    # The kernels require the block layout fluid | solid | wall.  Check the block
+    # membership itself (what Solver::finish_deck checks), not the number of
+    # itype transitions: a deck may legitimately have no rigid particles, no
+    # solid, or several different wall values, and all of those are accepted by
+    # the solver.  Empty blocks are fine too.
+    bad = np.flatnonzero(np.concatenate([
+        it[:ntotal] <= 0,
+        it[ntotal:ntotal + solnum] >= -10,
+        (it[ntotal + solnum:] < -10) | (it[ntotal + solnum:] > 0)]))
+    if bad.size:
+        k = int(bad[0])
+        raise SystemExit(f"deck is not ordered as fluid | solid | wall: particle {k} has "
+                         f"itype {it[k]:g} but the blocks are fluid [{ntotal}] "
+                         f"solid [{solnum}] wall [{nwall}]")
     x = a[:, 0]; y = a[:, 1]; z = a[:, 2]
     gx0, gx1 = float(x.min()) - 0.05, float(x.max()) + 0.05
     gy0, gy1 = float(y.min()) - 0.05, float(y.max()) + 0.05
@@ -95,6 +104,57 @@ def cmd_info(path):
         print("  itype counts:", int((it > 0).sum()), int((it < -10).sum()),
               int(((it >= -10) & (it <= 0)).sum()))
 
+CKPT_MAGIC = b"SPHCHK\0\0"
+CKPT_HDR = struct.Struct("<8sIIIIIIIIQdddddQQddd")   # see docs/CHECKPOINT.md
+assert CKPT_HDR.size == 128
+
+# array order written by Solver::ckpt_arrays(), as (name, components-per-particle)
+CKPT_ARRAYS = [("x", 3), ("vx", 3), ("rho", 1), ("SurF", 1), ("A", 9), ("vecn", 3),
+               ("u", 3), ("xc", 3), ("rhoc", 1)]
+
+
+def cmd_ckpt(path):
+    with open(path, "rb") as f:
+        h = f.read(128)
+        (magic, version, hsize, num, ntotal, solnum, narray, flags, nfb,
+         step, hsml, dt, bz, by0, by1, fp, payload, c0, lamd, muyou) = CKPT_HDR.unpack(h)
+        if magic != CKPT_MAGIC:
+            raise SystemExit(f"{path}: not a checkpoint (magic {magic!r}) -- "
+                             f"a result*.sphbin is not a restart state")
+        f32 = bool(flags & 1)
+        dt_ = "<f4" if f32 else "<f8"
+        body = f.read()
+    size = 128 + len(body)
+    print(f"{path}: version={version} step={step} {'fp32' if f32 else 'fp64'} "
+          f"num={num} fluid={ntotal} solid={solnum}")
+    print(f"  hsml={hsml} dt={dt} c0={c0} lamd={lamd:g} muyou={muyou:g}")
+    print(f"  soldbox={'on' if flags & 4 else 'off'}"
+          f"{f' z<={bz} y<={by0} y>={by1}' if flags & 4 else ''}")
+    print(f"  switches: static-solid={bool(flags & 8)} fluid-list={bool(flags & 16)} "
+          f"fast-fluid={bool(flags & 32)}  gra-fallbacks={nfb}")
+    print(f"  deck fingerprint=0x{fp:016x}  payload={payload/1048576:.1f} MiB "
+          f"file={size/1048576:.1f} MiB")
+    expect = sum(c for _, c in CKPT_ARRAYS[:narray]) * num * (4 if f32 else 8)
+    ok_size = (payload == expect) and (size == 128 + expect)
+    print(f"  layout: {narray} arrays, {expect/1048576:.1f} MiB "
+          f"{'OK' if ok_size else 'MISMATCH'}")
+    if not ok_size:
+        return
+    data = np.frombuffer(body, dtype=dt_)
+    off = 0
+    for name, comp in CKPT_ARRAYS[:narray]:
+        a = data[off:off + comp * num].reshape(comp, num)
+        off += comp * num
+        lo, hi = a.min(), a.max()
+        if name == "x":
+            print(f"  {name:5s} bbox x[{a[0].min():.4f},{a[0].max():.4f}] "
+                  f"y[{a[1].min():.4f},{a[1].max():.4f}] z[{a[2].min():.4f},{a[2].max():.4f}]")
+        elif name == "A":
+            print(f"  {name:5s} [{lo:.4f}, {hi:.4f}]  (identity = 1)")
+        else:
+            print(f"  {name:5s} [{lo:.6g}, {hi:.6g}]  mean {a.mean():.6g}")
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(__doc__); sys.exit(1)
@@ -104,5 +164,7 @@ if __name__ == "__main__":
         cmd_make(sys.argv[2], sys.argv[3], hsml, dt)
     elif sys.argv[1] == "info":
         cmd_info(sys.argv[2])
+    elif sys.argv[1] == "ckpt":
+        cmd_ckpt(sys.argv[2])
     else:
         print(__doc__); sys.exit(1)

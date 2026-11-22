@@ -301,9 +301,25 @@ extern int sph_fast_fluid_loop;
 // P1 switch: 1 = two-phase fp64 pass1_fluid (default), 0 = fused traversal.
 // Ignored in fp32, where the fused kernel is faster (SPH_FLUIDLIST=0).
 extern int sph_use_fluid_list;
+// S1: launch the fluid kernels over the *cell-sorted* order instead of the
+// particle id.  Thread t then owns s.sorted[t], so the 32 lanes of a warp are
+// spatially adjacent (one or two cells) instead of scattered over the domain.
+// The per-particle summation order does not change -- every particle still walks
+// the same 27 cells in the same order -- so the output is identical.  Without it
+// the traversal degrades 2.8x as soon as the flow mixes (a t=0 lattice is the
+// lucky best case, not the steady state); with it the cost is state independent.
+// -1 = auto (on in fp32).  SPH_SORTEDTHREADS=0/1 forces it off/on.
+extern int sph_sorted_threads;
 // C8: particles whose gradient-correction matrix fell back to the identity.
 // Non-zero makes the fp32 displacement form (F - I) invalid; checked at start-up.
 int gra_fallback_count();
+
+// Solid wall box clamp (1.cpp:196).  1 = enabled (default); the bounds follow
+// the deck in use -- 3.7M case: floor z = 0.01, side walls y = 0.00 / 3.31
+// (the 1.2M case was 0.01 / 0.00 / 1.31).
+// SPH_SOLDBOX="z,y0,y1" overrides them, SPH_SOLDBOX=off disables the clamp.
+extern int sph_use_soldbox;
+void sph_set_soldbox(int on, double z, double y0, double y1);
 
 template <class Real> void launch_cell_hist(SphPtrsT<Real> s, int* d_count, int* d_solid, int* d_fluid, cudaStream_t st);
 void launch_cell_scan(int* d_cellStart, int* d_count, int ncell, cudaStream_t st);
