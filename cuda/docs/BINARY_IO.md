@@ -74,8 +74,16 @@ Text decks keep working (`sph_cuda.exe input.dat`); the loader sniffs the magic.
   were clamped into boundary cells).
 * `k_cell_scan` uses a chunked prefix sum and a 512-thread block, so it works
   for any grid size (the old one was a `static_assert` at 32,768 cells).
-* The old test-only solid clamp is gone and the fluid reflects at `z > 1.0`,
-  matching the new-case `1.cpp`.
+* The fluid reflects at `z > 1.0`, matching the new-case `1.cpp`.  The solid
+  wall clamp is **not** gone: it was commented out in the new-case reference and
+  this build re-enables it by default (`SPH_SOLDBOX`, bounds `z<=0.01`,
+  `y<=0.00`, `y>=3.31` -- the 3.7M deck's `1.cpp`; the 1.2M deck's box is
+  `0.01,0.00,1.31`; the 237k deck `0.01,0.01,0.49`), because without it the
+  structure has no support at all and free-falls.  The earlier sentence here
+  ("the old test-only solid clamp is gone") was wrong; `SPH_SOLDBOX=off`
+  reproduces the pre-fix trajectory exactly.  The bounds are compared in double
+  (they used to be stored as `float`, which silently dropped the
+  1,700-particle bottom layer in the fp64 build).
 
 ## Measured on the new case
 
@@ -102,12 +110,20 @@ neighbour enumeration order changes while the pair set is identical.
 
 ## Limitations / notes
 
-* Result cadence is fixed at 500 steps and every particle is written (the old
-  908,308-row bound and the `SurFD <= 2.5` filter were case-specific).
-* The A3 solid list is still built once from `X0`.  On the old 237k deck its
-  pair count varies by ~0.1% between runs because thousands of reference pairs
-  sit exactly at `r = 3h` and the gradient-correction matrix is built with
-  atomics; those pairs carry zero kernel weight.  The new deck's list is stable.
+* Result cadence is `SPH_OUTCADENCE` steps (default 500) and every particle is
+  written (the old 908,308-row bound and the `SurFD <= 2.5` filter were
+  case-specific).  `SPH_OUTCADENCE=0` disables result frames; `SPH_OUT_F32=0`
+  keeps float64 (the old code tested presence, not value).
+* Results are for looking at, not for resuming: a `result*.sphbin` carries 4 of
+  the 20 values a step needs.  Restarting is a separate container -- see
+  [`CHECKPOINT.md`](CHECKPOINT.md), which is single-GPU only.
+* The A3 solid list is still built once from `X0`.  The old note here said its
+  pair count on the 237k deck varies by ~0.1% between runs because of the
+  knife-edge pairs and the atomics in the gradient correction; that was wrong.
+  The variation came from `build_cells_for()` scattering the *live* `x` into a
+  histogram of `X0`, which this revision fixes: the 237k list is 4 844 544
+  pairs / ELL width 92, identical on every run, as it was before the
+  runtime-sizing revision.  The 1.2 M deck was unaffected (`x == X0` exactly).
 * The boundary conditions are those of the new case, so running the old 237k
   deck through this build does **not** reproduce the old validation numbers in
   `README.md` / `docs/DESIGN.md`; that table describes the pre-2026-11-19

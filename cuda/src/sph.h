@@ -431,6 +431,26 @@ extern int sph_fast_fluid_loop;
 // P1 switch: 1 = two-phase fp64 pass1_fluid (default), 0 = fused traversal.
 // Ignored in fp32, where the fused kernel is faster (SPH_FLUIDLIST=0).
 extern int sph_use_fluid_list;
+// S1: launch the fluid kernels over the *cell-sorted* order instead of the
+// particle id, so the 32 lanes of a warp are spatially adjacent.  The
+// per-particle summation order is unchanged (every particle still walks the
+// same 27 cells in the same order), so the result is bit-identical.  -1 = auto
+// (on in fp32, where the traversal is latency bound; off in fp64, where the
+// two-phase list is faster).  SPH_SORTEDTHREADS=0/1 forces it.  Single-GPU path
+// only: sorted[] also holds ghosts on a decomposed run.
+extern int sph_sorted_threads;
+// Solid wall box clamp (1.cpp:196).  The reference zeroes the velocity of a
+// solid particle that lies on the tank floor or against a side wall; without it
+// a structure in a dry region free-falls.  The default bounds follow the 3.7M
+// case (floor z<=0.01, side walls y<=0.00 / y>=3.31); the 1.2M deck uses
+// 0.01/0.00/1.31 and the 237k deck 0.01/0.01/0.49.  SPH_SOLDBOX="z,y0,y1"
+// overrides, SPH_SOLDBOX=off disables the clamp.  Values are double because a
+// float 0.01 is not 0.01 and loses the whole first lattice layer in fp64.
+extern int sph_use_soldbox;
+void sph_set_soldbox(int on, double z, double y0, double y1);
+// Re-copy the clamp to the current device's __device__ symbols (D1: one per
+// rank, after cudaSetDevice; each device has its own copy).
+void sph_apply_soldbox();
 // C8: particles whose gradient-correction matrix fell back to the identity.
 // Non-zero makes the fp32 displacement form (F - I) invalid; checked at start-up.
 int gra_fallback_count();

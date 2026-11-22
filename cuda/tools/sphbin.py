@@ -27,9 +27,14 @@ The deck must be ordered fluid|solid|wall.  How many distinct itype values a
 block uses does not matter (a fluid block may carry several), only that the
 class never goes backwards.
 
+The checkpoint container (SPHCHK) is a different file; `ckpt` prints it:
+
+    python sphbin.py ckpt <state.sphchk>
+
 Usage:
     python sphbin.py make  <deck.txt> <deck.sphbin> [--hsml 0.01] [--dt 1e-5]
     python sphbin.py info  <deck.sphbin>
+    python sphbin.py ckpt  <state.sphchk>
 """
 import sys, struct, os
 import numpy as np
@@ -74,9 +79,9 @@ def cmd_make(src, dst, hsml, dt):
     bad = np.flatnonzero(np.diff(cls) < 0)
     if bad.size:
         i = int(bad[0])
-        raise SystemExit(f"deck is not ordered as fluid|solid|wall: record {i} has "
-                         f"itype {it[i]:g} (class {cls[i]}) after record {i+1} "
-                         f"with itype {it[i+1]:g} (class {cls[i+1]})")
+        raise SystemExit(f"deck is not ordered as fluid|solid|wall: record {i+1} has "
+                         f"itype {it[i+1]:g} (class {cls[i+1]}) after record {i} "
+                         f"with itype {it[i]:g} (class {cls[i]})")
     x = a[:, 0]; y = a[:, 1]; z = a[:, 2]
     gx0, gx1 = float(x.min()) - 0.05, float(x.max()) + 0.05
     gy0, gy1 = float(y.min()) - 0.05, float(y.max()) + 0.05
@@ -104,6 +109,57 @@ def cmd_info(path):
         print("  itype counts:", int((it > 0).sum()), int((it < -10).sum()),
               int(((it >= -10) & (it <= 0)).sum()))
 
+CKPT_MAGIC = b"SPHCHK\0\0"
+CKPT_HDR = struct.Struct("<8sIIIIIIIIQdddddQQddd")   # see docs/CHECKPOINT.md
+assert CKPT_HDR.size == 128
+
+# array order written by Solver::ckpt_arrays(), as (name, components-per-particle)
+CKPT_ARRAYS = [("x", 3), ("vx", 3), ("rho", 1), ("SurF", 1), ("A", 9), ("vecn", 3),
+               ("u", 3), ("xc", 3), ("rhoc", 1)]
+
+
+def cmd_ckpt(path):
+    with open(path, "rb") as f:
+        h = f.read(128)
+        (magic, version, hsize, num, ntotal, solnum, narray, flags, nfb,
+         step, hsml, dt, bz, by0, by1, fp, payload, c0, lamd, muyou) = CKPT_HDR.unpack(h)
+        if magic != CKPT_MAGIC:
+            raise SystemExit(f"{path}: not a checkpoint (magic {magic!r}) -- "
+                             f"a result*.sphbin is not a restart state")
+        f32 = bool(flags & 1)
+        dt_ = "<f4" if f32 else "<f8"
+        body = f.read()
+    size = 128 + len(body)
+    print(f"{path}: version={version} step={step} {'fp32' if f32 else 'fp64'} "
+          f"num={num} fluid={ntotal} solid={solnum}")
+    print(f"  hsml={hsml} dt={dt} c0={c0} lamd={lamd:g} muyou={muyou:g}")
+    print(f"  soldbox={'on' if flags & 4 else 'off'}"
+          f"{f' z<={bz} y<={by0} y>={by1}' if flags & 4 else ''}")
+    print(f"  switches: static-solid={bool(flags & 8)} fluid-list={bool(flags & 16)} "
+          f"fast-fluid={bool(flags & 32)} reflect-guard={bool(flags & 64)} "
+          f" gra-fallbacks={nfb}")
+    print(f"  deck fingerprint=0x{fp:016x}  payload={payload/1048576:.1f} MiB "
+          f"file={size/1048576:.1f} MiB")
+    expect = sum(c for _, c in CKPT_ARRAYS[:narray]) * num * (4 if f32 else 8)
+    ok_size = (payload == expect) and (size == 128 + expect)
+    print(f"  layout: {narray} arrays, {expect/1048576:.1f} MiB "
+          f"{'OK' if ok_size else 'MISMATCH'}")
+    if not ok_size:
+        return
+    data = np.frombuffer(body, dtype=dt_)
+    off = 0
+    for name, comp in CKPT_ARRAYS[:narray]:
+        a = data[off:off + comp * num].reshape(comp, num)
+        off += comp * num
+        lo, hi = a.min(), a.max()
+        if name == "x":
+            print(f"  {name:5s} bbox x[{a[0].min():.4f},{a[0].max():.4f}] "
+                  f"y[{a[1].min():.4f},{a[1].max():.4f}] z[{a[2].min():.4f},{a[2].max():.4f}]")
+        elif name == "A":
+            print(f"  {name:5s} [{lo:.4f}, {hi:.4f}]  (identity = 1)")
+        else:
+            print(f"  {name:5s} [{lo:.6g}, {hi:.6g}]  mean {a.mean():.6g}")
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(__doc__); sys.exit(1)
@@ -113,5 +169,7 @@ if __name__ == "__main__":
         cmd_make(sys.argv[2], sys.argv[3], hsml, dt)
     elif sys.argv[1] == "info":
         cmd_info(sys.argv[2])
+    elif sys.argv[1] == "ckpt":
+        cmd_ckpt(sys.argv[2])
     else:
         print(__doc__); sys.exit(1)

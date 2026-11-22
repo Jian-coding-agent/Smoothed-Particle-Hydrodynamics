@@ -42,7 +42,8 @@ cmake --build build --config Release
 
 The first argument is the deck; the name is arbitrary.  A `.sphbin` container is
 read directly, a text deck is parsed as before.  Results are written to the
-**current directory** as `result<N>.sphbin` every 500 steps:
+**current directory** as `result<N>.sphbin`, by default every 500 steps
+(`SPH_OUTCADENCE` changes that; 0 disables result frames):
 
 ```bat
 sph_cuda.exe cases\dam_1203k.sphbin            :: fp64 (default)
@@ -67,12 +68,20 @@ Environment variables:
 |---|---|
 | `SPH_MAXSTEP` | maximum number of time steps (default 10 000 001) |
 | `SPH_PRECISION` | `fp64` / `fp32` when no command-line flag is given |
-| `SPH_OUT_F32=1` | write results as float32 (half the size) |
-| `SPH_PROFILE` | per-phase timing (prepare / cell / pass1 / constitution / pass2 / update) |
+| `SPH_OUTCADENCE=N` | write a result every N steps (default 500); 0 = no result frames |
+| `SPH_OUT_F32=1` | write results as float32 (half the size); `=0` keeps float64 |
+| `SPH_SOLDBOX="z,y0,y1"` / `=off` | solid wall clamp (default `0.01,0.00,3.31`, the 3.7M case); see below |
+| `SPH_CKPT=<file>` | write a restart state (single-GPU path) |
+| `SPH_CKPT_IN=<file>` / `--resume=<file>` | resume from a restart state |
+| `SPH_CKPT_EVERY=N` | checkpoint cadence (0 = only at the end of the run) |
+| `SPH_STEP0=N` / `--step0=N` | absolute step number of a fresh run |
+| `SPH_PROFILE` | per-phase timing (prepare / cell / pass1 / constitution / pass2 / update; single-GPU path) |
+| `SPH_STEPTIME=1` | one `ms/step` line per 500-step window (single-GPU path) |
 | `SPH_SOLDDYN=1` | walk the grid in the solid kernels instead of the static pair list |
 | `SPH_REFLECT=flip` | flip `v_z` unconditionally above `z = 1` (1.cpp's form); the default only reflects outward motion (M8) |
 | `SPH_LITERALFLUID=1` | literal `pass1_fluid` body instead of the factored one |
 | `SPH_FLUIDLIST=0` | fused fp64 `pass1_fluid` instead of the two-phase list version |
+| `SPH_SORTEDTHREADS=0/1` | force the S1 fluid-kernel thread order (auto: on in fp32, off in fp64) |
 | `SPH_A3_FULL=1` / `=0` | force the fat (stored `sG/sB/sD`) / lean (index-only) solid pair list; unset = auto |
 | `SPH_A3_LIMIT_MB` | auto threshold: go lean when the fat list would exceed this (default 4096 MB) |
 
@@ -91,6 +100,39 @@ slot-major and coalesced).  Auto mode keeps the fat list while it fits under
 `SPH_A3_LIMIT_MB`, so the current cases keep full speed and only the very large
 decks pay the surcharge.
 
+## One binary: single GPU and multiple GPUs
+
+The same executable runs both ways.  With `SPH_RANKS` unset it takes the ordinary
+single-GPU path (`run_case`); with `SPH_RANKS=K` it starts the domain-decomposed
+driver (`SPH_RANKS=1` is the decomposed driver with one rank, and is
+byte-identical to the ordinary path).  The two paths share the physics kernels,
+so the solid wall clamp, the `itype == 0` rule, the output format and the
+result-frame cadence are the same on one card and on K cards.
+
+| | single GPU (`SPH_RANKS` unset) | decomposed (`SPH_RANKS=K>1`) |
+|---|---|---|
+| precision | fp64 or fp32 | fp64 only |
+| checkpoint / resume | yes (`SPH_CKPT`, `SPH_CKPT_IN`) | no (refused at start-up) |
+| `SPH_OUTCADENCE`, `SPH_OUT_F32` | yes | yes |
+| `SPH_SOLDBOX` | yes | yes (each rank clamps its owned solids) |
+| `SPH_SORTEDTHREADS` (S1) | yes | not used (the sorted array also holds ghosts) |
+| neighbourhood | fixed grid from the deck | same global grid + ghost halo (V2) |
+| results | written by the process | gathered by rank 0, same format |
+
+**The solid wall clamp is a bug fix, and it is on by default.**  `1.cpp` of the
+3.7M case zeroes the velocity of a solid particle on the tank floor or against a
+side wall (`x[2] <= 0.01 || x[1] <= 0.00 || x[1] >= 3.31`).  The CUDA port had
+dropped that block, so a structure standing in a dry region free-fell under
+gravity.  The default bounds follow that case; the older decks need
+`SPH_SOLDBOX="0.01,0.01,0.49"` (237k) or `"0.01,0.00,1.31"` (1.2M), and
+`SPH_SOLDBOX=off` reproduces the pre-fix trajectory exactly.  Values are
+compared in double, because `(float)0.01` is 0.00999999977 and the fp64 build
+would otherwise lose the first lattice layer.
+
+`SPH_SOLDBOX=off` is also the clean way to compare against an older run or the
+CPU reference: it leaves the numeric path untouched (verified byte-identical to
+the previous single-GPU build on the 237k deck).
+
 ## Multiple GPUs (D1)
 
 `SPH_RANKS=K` runs the same deck on K devices in one process (one host thread
@@ -107,7 +149,7 @@ sph_cuda.exe input.sphbin
 
 | variable | effect |
 |---|---|
-| `SPH_RANKS=K` | number of ranks; unset or `1` = the ordinary single-GPU path |
+| `SPH_RANKS=K` | number of ranks; unset = the ordinary single-GPU path, `1` = the decomposed driver with one rank (byte-identical) |
 | `SPH_RANKS=auto` | rank the devices (bandwidth probe, free memory, display flag) and choose K from the partition model |
 | `SPH_RANKS_GPUS=0,1,...` | which devices, in rank order (default `0..K-1`) |
 | `SPH_D1_SKIN=<m>` | ghost-shell skin past 3 h (default `1.5*hsml`); the shell is rebuilt when a particle has moved half of it |
@@ -140,10 +182,13 @@ the one the single-GPU run uses.  A halo or exchange bug can no longer hide unde
 1e-16 noise.  Measured: K = 4 and K = 8 over 3001 steps, with automatic rebuilds,
 with `SPH_D1_REPART=1000`, and through `SPH_RANKS=auto` -- zero differing bytes.
 
-Two constraints: the decomposition is fp64 only (`SPH_RANKS` + `--fp32` is
-refused), and a deck whose walls have a non-zero velocity is refused too -- the
+Constraints: the decomposition is fp64 only (`SPH_RANKS` + `--fp32` is refused);
+checkpoint/resume is single-GPU only (the ghosts would have to be saved with the
+owner's state); and a deck whose walls have a non-zero velocity is refused -- the
 exchange carries the fluid and solid groups only, so a moving wall would not
-reach its ghosts.
+reach its ghosts.  The solid wall clamp *is* applied on the decomposed path:
+each rank clamps its owned solids before the next exchange, so the ghosts inherit
+the clamped velocity and K > 1 still matches K = 1 bit for bit.
 
 ## Precision
 

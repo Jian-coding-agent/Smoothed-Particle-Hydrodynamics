@@ -1160,4 +1160,68 @@ not assumed -- and the choice is a knob rather than a silent change.
   and an insertion sort); the decomposed path now inherits the same grid by
   design, because V2 requires it.
 
+---
 
+## 15. The single-GPU / multi-GPU merge (2026-11-22)
+
+The two lines of work -- the single-GPU branch (runtime decks, binary I/O,
+checkpoint/restart, S1 thread ordering, the solid wall clamp) and the D1 branch
+(V2, A6, CUB scan, halo refresh) -- were developed from the same `a106b7b` base
+but had diverged.  This tree is the union: `SPH_RANKS` unset runs the ordinary
+single-GPU path with every feature above, `SPH_RANKS=K` runs D1, and both share
+the physics kernels and the result format.
+
+### 15.1 The solid wall clamp was missing on both paths
+
+`1.cpp` of the 3.7M case has
+
+```c
+if (x[2] <= 0.01 || x[1] <= 0.00 || x[1] >= 3.31) { vx = vy = vz = 0; }
+```
+
+after the solid velocity update.  The CUDA port had carried the *comment* that
+the new-case reference disables it, and no clamp at all.  A solid therefore had
+no floor or side-wall support -- there is no solid-wall interaction term, only
+solid-solid and fluid-(solid|wall) -- and a gate standing in a dry region
+free-fell at `g` (1.2M case: solid mean `z` 0.534 -> 0.101 in 0.297 s; the
+plate's lowest point reached -0.42 m).  It is restored in `k_update_solid`, with
+double thresholds (`(float)0.01 != 0.01` loses the first lattice layer in fp64),
+and is applied to the owned solids of a decomposed rank before the exchange, so
+K > 1 and K = 1 still agree bit for bit.  The default bounds are the 3.7M case;
+`SPH_SOLDBOX="0.01,0.01,0.49"` (237k), `"0.01,0.00,1.31"` (1.2M) or `off`
+selects the others.
+
+### 15.2 Features that are single-GPU only, by design
+
+| feature | why the decomposed path does not have it |
+|---|---|
+| checkpoint / resume | a restart has to save the decomposition, every rank's owned state *and* the ghost halo; doing only the first two silently resumes a different neighbour set |
+| fp32 | the D1 exchange records, `Rank::S` and the migration buffers are `double`; templating the whole decomposed driver is a separate change |
+| S1 sorted threads | `sorted[]` holds `numP` slots including ghosts, so mapping thread `t -> sorted[t]` is not an owned particle |
+
+Everything else is shared: `SPH_OUTCADENCE`, `SPH_OUT_F32` (`=0` is float64, the
+old code tested presence), the checked result writer, `SPH_SOLDBOX`, the
+`itype == 0` rule, and the `k_solid_pair_fill` bound check.
+
+### 15.3 Validation of the merged tree
+
+RTX 5080, one device; decomposed runs put every rank on GPU 0 with
+`SPH_RANKS_GPUS=0,0,...`, so they test correctness, not multi-card speed.
+
+| run | result |
+|---|---|
+| 237k, 501 steps, `SPH_SOLDBOX=off`, single | byte-identical to the pre-merge build |
+| 237k, 501 steps, `SPH_SOLDBOX=on`, single | clamp changes the trajectory (expected) |
+| 237k, K = 1, 2, 4, 501 steps, clamp on | all byte-identical to the single run |
+| 237k, K = 2, 501 steps, clamp off | byte-identical to the single run and to the pre-merge build |
+| 3.7M, K = 1 vs K = 2, 501 steps, fp64 | byte-identical (`93F23097...`) |
+| 3.7M, 1001 steps, fp32, clamp on vs off | floor layer stays at `z = 0.0100` with the clamp, `0.0095` without |
+| 237k, fp64 150 + resume 150 vs 300 | checkpoint SHA256 equal |
+| 237k, fp32 75 + resume 75 vs 150 | checkpoint SHA256 equal |
+| 237k, fp32 200 steps, S1 off vs on | result SHA256 equal |
+| 237k, 301 steps, `SPH_OUTCADENCE=100` | `result0..3`, header steps 0/100/200/300 |
+| `SPH_RANKS=2` + `SPH_CKPT` | refused with a clear message |
+
+The `SPH_SOLDBOX=off` row is the regression guard: the clamp is the only
+intentional change to the single-GPU numeric path, and turning it off reproduces
+the previous build exactly.

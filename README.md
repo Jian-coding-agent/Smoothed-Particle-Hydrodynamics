@@ -104,7 +104,8 @@ cuda\build\sph_cuda.exe          :: fp64
 cuda\build\sph_cuda.exe --fp32   :: single precision
 ```
 
-This writes `result0.sphbin` … (one file every 500 steps) into the current
+This writes `result0.sphbin` … (one file every 500 steps by default; set
+`SPH_OUTCADENCE=N` for another cadence, or 0 for no frames) into the current
 directory.  `cuda\build\sph_cuda.exe --help` lists the other options, and
 `cuda\README.md` documents the environment switches, including `SPH_RANKS=K` (or
 `SPH_RANKS=auto`) for the multi-GPU driver.  With more than one rank the results
@@ -127,6 +128,30 @@ cpu\build\Release\SPH.exe
 The CPU run is much slower (about 105 s for 500 steps at 32 threads).  Use
 `SPH_THREADS` to limit the thread count and `SPH_MAXSTEP` to stop early.
 
+## Making a deck from CAD
+
+The `Input_3D` preprocessor places particles with one hand-written loop nest per
+block, so every new case is a C++ edit.  `tools/geom2deck.py` takes the same
+information a CFD preprocessor takes -- a domain, a spacing, a fluid region and
+a set of STL parts or boxes -- voxelises the parts onto the particle lattice and
+writes the deck, ordered fluid | solid | wall:
+
+```bat
+python cases\make_8hole_gate.py                          :: the case as 56 boxes
+python tools\geom2deck.py cases\8hole_gate.json --sphbin input.sphbin
+python tools\geom2deck.py cases\8hole_gate.json --check ref.sphbin
+python tools\test_geom2deck.py                           :: self-test
+```
+
+The 8-hole deck it generates is the one `1.cpp` produces: 3,715,828 particles in
+the same lattice cells, and the text deck has the same bytes and the same set of
+lines (only the order inside a block differs).  500 solver steps of the two decks
+agree to 2.4e-7 m per particle.  [`docs/GEOMETRY_INPUT.md`](docs/GEOMETRY_INPUT.md)
+(Chinese) covers the case-file format, the role -> itype mapping, the measured
+accuracy on curved surfaces, and the limitations -- the particle lattice has no
+FAVOR-style area/volume fractions, so a solid boundary is a half-spacing
+staircase.
+
 ## Repository layout
 
 ```
@@ -134,8 +159,16 @@ input.dat                shared input deck (237,298 particles, ~21 MB)
 cpu/                     reference solver: 1.cpp, CMake project, build scripts
 cuda/                    CUDA port: src/, CMakeLists.txt, build.bat
   docs/DESIGN.md         design, porting notes, validation, performance analysis
+  docs/CHECKPOINT.md     single-GPU restart container and what it carries
+tools/
+  geom2deck.py           build a deck from CAD (STL) or boxes
+  test_geom2deck.py      self-test for the above
+cases/
+  8hole_gate.json        the 8-hole gate case as a geometry specification
+  make_8hole_gate.py     regenerates that JSON from parameters
 docs/
   CUDA_PORT_ANALYSIS.md  source analysis and porting plan
+  GEOMETRY_INPUT.md      geometry-driven particle placement (Chinese)
 ```
 
 ## Documentation
@@ -146,17 +179,20 @@ docs/
 | [`docs/CUDA_PORT_ANALYSIS.md`](docs/CUDA_PORT_ANALYSIS.md) | analysis of `1.cpp` and the initial porting plan |
 | [`docs/algorithm-cpu-vs-gpu.md`](docs/algorithm-cpu-vs-gpu.md) | how each implementation computes a step, why the GPU is faster, performance across machines |
 | [`cuda/README.md`](cuda/README.md) | CUDA build, run options, diagnostics |
+| [`cuda/docs/CHECKPOINT.md`](cuda/docs/CHECKPOINT.md) | restart container, what it stores, why a result file cannot resume |
+| [`docs/GEOMETRY_INPUT.md`](docs/GEOMETRY_INPUT.md) | geometry-driven particle placement (Chinese) |
 | [`cpu/README.md`](cpu/README.md) | CPU project, build matrix, troubleshooting |
 | [`cpu/QUICKSTART.txt`](cpu/QUICKSTART.txt) | one-page CPU quick start |
 
 ## Notes
 
 * **The CUDA port follows a newer version of the case than `cpu/1.cpp`.**  The
-  port has no solid clamp and reflects a fluid particle at `z > 1.0`; `1.cpp`
-  is still the old case (it clamps the solid at step 193 and writes text every
-  50 steps).  The port's correctness baseline is therefore the *physics*, not a
-  byte-for-byte match with the committed `1.cpp` past the first 500 steps; the
-  diff that defines the new case should be committed with it.
+  port reflects a fluid particle at `z > 1.0` and re-enables the solid wall clamp
+  (`SPH_SOLDBOX`, default bounds of the 3.7M case); `1.cpp` is still the old case
+  (it clamps the solid at step 193 and writes text every 50 steps).  The port's
+  correctness baseline is therefore the *physics*, not a byte-for-byte match with
+  the committed `1.cpp` past the first 500 steps; the diff that defines the new
+  case should be committed with it.
 * `result*.sphbin` column 4 (the pressure) is the value the step *used*, i.e. it
   is one update older than `x`, `vx` and `rho` in the same record.  `p` is
   therefore not `c0^2 (rho - 1000)`; this reproduces the reference solver exactly.

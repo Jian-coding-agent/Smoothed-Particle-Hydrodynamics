@@ -27,6 +27,46 @@
 #include <algorithm>
 #include <string>
 #include <future>
+#include <filesystem>
+
+// ---------------------------------------------------------------------------
+// Result cadence (SPH_OUTCADENCE).  The historical value is 500; a smaller
+// cadence is what a video needs, and 0 disables result frames entirely.
+// ---------------------------------------------------------------------------
+static int g_out_cadence = 500;
+
+// ---------------------------------------------------------------------------
+// Checkpointing (single-GPU path): SPH_CKPT writes, SPH_CKPT_IN resumes,
+// SPH_CKPT_EVERY is the cadence (0 = only at the end), SPH_STEP0 is the absolute
+// step number of a fresh run.  cuda/docs/CHECKPOINT.md has the format and the
+// reasoning; the array list is in Solver::ckpt_arrays().
+// ---------------------------------------------------------------------------
+static const char SPHCHK_MAGIC[8] = { 'S', 'P', 'H', 'C', 'H', 'K', '\0', '\0' };
+static const uint32_t SPHCHK_VERSION = 2;
+static int  g_ckpt_every  = 0;
+static bool g_ckpt_wanted = false;   // any checkpoint in play -> hash the deck
+// The solid wall clamp as the user asked for it (main() parses it).  The device
+// only ever sees a copy; a resume is compared against these host values.
+static double g_soldbox_z = 0.01, g_soldbox_y0 = 0.0, g_soldbox_y1 = 3.31;
+
+// FNV-1a over raw bytes: catches "resumed against the wrong deck".
+static uint64_t sph_fnv1a(uint64_t h, const void* p, size_t n)
+{
+    const unsigned char* b = (const unsigned char*)p;
+    for (size_t i = 0; i < n; ++i) { h ^= (uint64_t)b[i]; h *= 1099511628211ULL; }
+    return h;
+}
+static const uint64_t SPH_FNV_OFFSET = 14695981039346656037ULL;
+
+// 64-bit stdio seek/tell.  `long` is 32 bits on Windows, and a >2 GB deck (or a
+// failed seek) used to give sz = -1 and an out-of-bounds write at buf[rd].
+#ifdef _WIN32
+#define sph_fseek64 _fseeki64
+#define sph_ftell64 _ftelli64
+#else
+#define sph_fseek64 fseeko
+#define sph_ftell64 ftello
+#endif
 
 #define CUDA_CHECK(x)                                                          \
     do {                                                                       \
@@ -132,6 +172,9 @@ struct Solver
     std::vector<double> itype_host;       // itype of every record (constant)
     bool dump_step = false;
     bool dump_a = false;
+    uint64_t deck_fp = 0;   // fingerprint of the deck's constant columns (checkpoint)
+    int      nfb     = 0;   // GraCorrec fallbacks (C8), carried through a checkpoint
+    long long ckpt_done = -1;   // step of the checkpoint already on disk (avoids a duplicate write)
 
     // ---------------- allocation ----------------
     void* dev_alloc(size_t bytes)
@@ -285,6 +328,15 @@ struct Solver
             }
             if (!header_metrics_ok(hdr, path)) { fclose(f); return false; }
             g.d.num = (int)num; g.d.ntotal = (int)ntotal; g.d.solnum = (int)solnum;
+            // 64-bit seek/tell: on Windows `long` is 32 bits, so a >2 GB deck (or
+            // a failed ftell) used to give sz = -1 and an out-of-bounds buf[rd].
+            sph_fseek64(f, 0, SEEK_END);
+            const long long actual = sph_ftell64(f);
+            const long long expect = 128 + (long long)num * 14 * 8;
+            if (actual != expect)
+                fprintf(stderr, "[input] %s: warning: %lld bytes, header implies %lld "
+                                "(trailing data ignored)\n", path, actual, expect);
+            sph_fseek64(f, 128, SEEK_SET);       // skip the header we already read
             rows.resize((size_t)num * 14);
             if (fread(rows.data(), sizeof(double), rows.size(), f) != rows.size())
             {
@@ -293,11 +345,18 @@ struct Solver
         }
         else
         {
-            fseek(f, 0, SEEK_END);
-            const long sz = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            std::vector<char> buf((size_t)sz + 1);
-            const size_t rd = fread(buf.data(), 1, (size_t)sz, f);
+            // 64-bit seek/tell: see above.  A 2 GB text deck is real at 14 columns
+            // of ascii (~100 B/row, i.e. 20 M particles).
+            sph_fseek64(f, 0, SEEK_END);
+            const long long szi = sph_ftell64(f);
+            sph_fseek64(f, 0, SEEK_SET);
+            if (szi < 0)
+            {
+                fprintf(stderr, "[input] %s: cannot determine the file size\n", path);
+                fclose(f); return false;
+            }
+            std::vector<char> buf((size_t)szi + 1);
+            const size_t rd = fread(buf.data(), 1, (size_t)szi, f);
             buf[rd] = '\0';
             const char* q = buf.data();
             char* end = nullptr;
@@ -443,6 +502,23 @@ struct Solver
 
         itype_host.resize(numAll);
         for (int i = 0; i < numAll; ++i) itype_host[i] = rows[(size_t)i * nf + 9];
+
+        // Constants the checkpoint does not store (they belong to the deck, not
+        // to the run): hash them so a resume with the wrong deck is refused.
+        // Only a single-GPU deck is checkpointable, so hash the owned rows only.
+        if (g_ckpt_wanted && numAll == num)
+        {
+            uint64_t h = SPH_FNV_OFFSET;
+            for (int i = 0; i < num; ++i)
+            {
+                const size_t b = (size_t)i * nf;
+                h = sph_fnv1a(h, &rows[b + 8], 8);       // mass
+                h = sph_fnv1a(h, &rows[b + 9], 8);       // itype
+                h = sph_fnv1a(h, &rows[b + 10], 3 * 8);  // X0
+                h = sph_fnv1a(h, &rows[b + 13], 8);      // rho0
+            }
+            deck_fp = h;
+        }
         return true;
     }
 
@@ -805,20 +881,24 @@ struct Solver
     // itype is implied by the block split stored in the header
     // (fluid [0,ntotal) | solid [ntotal,nall) | wall [nall,num)).
     // SPH_OUT_F32=1 stores the four values as float32 (half the size).
-    void write_result(int idx)
+    bool write_result(long long itime)
     {
-        const bool f32 = (getenv("SPH_OUT_F32") != nullptr);
+        // value test, not presence: SPH_OUT_F32=0 must mean float64.  Every other
+        // switch is atoi-parsed, and the docs say "SPH_OUT_F32=1".
+        const char* ef32 = getenv("SPH_OUT_F32");
+        const bool f32 = (ef32 != nullptr) && (atoi(ef32) != 0);
+        const int idx = (int)(itime / (g_out_cadence > 0 ? g_out_cadence : 1));
         char name[128];
         snprintf(name, sizeof(name), "result%d.sphbin", idx);
         FILE* f = fopen(name, "wb");
-        if (!f) { fprintf(stderr, "cannot write %s\n", name); return; }
+        if (!f) { fprintf(stderr, "cannot write %s\n", name); return false; }
 
         unsigned char h[128] = {0};
         const char magic[8] = { 'S','P','H','B','I','N','\0','\0' };
         memcpy(h, magic, 8);
         const uint32_t ver = 1, hs = 128, num = (uint32_t)g.d.num,
                        ntotal = (uint32_t)g.d.ntotal, solnum = (uint32_t)g.d.solnum,
-                       nfields = 4, step = (uint32_t)(idx * 500),
+                       nfields = 4, step = (uint32_t)itime,
                        flags = 2u | (f32 ? 4u : 0u);
         memcpy(h + 8, &ver, 4);      memcpy(h + 12, &hs, 4);
         memcpy(h + 16, &num, 4);     memcpy(h + 20, &ntotal, 4);
@@ -831,34 +911,350 @@ struct Solver
                                  g.d.gy0 + g.d.ny * SPH_CS,
                                  g.d.gz0 + g.d.nz * SPH_CS };
         memcpy(h + 56, grid, 48);
-        fwrite(h, 1, 128, f);
+
+        // Every write is checked: a short result file (full disk, dropped share)
+        // used to be silent, and the solver has no reader that would notice.
+        bool ok = (fwrite(h, 1, 128, f) == 128);
 
         const size_t rec = 4;
         if (f32)
         {
             std::vector<float> buf(rec * 65536);
             size_t used = 0;
-            for (int i = 0; i < g.d.num; ++i)
+            for (int i = 0; i < g.d.num && ok; ++i)
             {
-                if (used + rec > buf.size()) { fwrite(buf.data(), sizeof(float), used, f); used = 0; }
+                if (used + rec > buf.size())
+                {
+                    ok = (fwrite(buf.data(), sizeof(float), used, f) == used);
+                    used = 0;
+                }
                 buf[used++] = (float)ox[i]; buf[used++] = (float)oy[i];
                 buf[used++] = (float)oz[i]; buf[used++] = (float)op[i];
             }
-            if (used) fwrite(buf.data(), sizeof(float), used, f);
+            if (used != 0 && ok) ok = (fwrite(buf.data(), sizeof(float), used, f) == used);
         }
         else
         {
             std::vector<double> buf(rec * 65536);
             size_t used = 0;
-            for (int i = 0; i < g.d.num; ++i)
+            for (int i = 0; i < g.d.num && ok; ++i)
             {
-                if (used + rec > buf.size()) { fwrite(buf.data(), sizeof(double), used, f); used = 0; }
+                if (used + rec > buf.size())
+                {
+                    ok = (fwrite(buf.data(), sizeof(double), used, f) == used);
+                    used = 0;
+                }
                 buf[used++] = ox[i]; buf[used++] = oy[i];
                 buf[used++] = oz[i]; buf[used++] = op[i];
             }
-            if (used) fwrite(buf.data(), sizeof(double), used, f);
+            if (used != 0 && ok) ok = (fwrite(buf.data(), sizeof(double), used, f) == used);
+        }
+        ok = (fflush(f) == 0) && ok;
+        ok = (fclose(f) == 0) && ok;
+        if (!ok)
+        {
+            fprintf(stderr, "short write on %s (disk full?) -- frame abandoned\n", name);
+            remove(name);
+        }
+        return ok;
+    }
+
+    // ------------------------------------------------------------------
+    // Checkpoint (.sphchk): the cross-step state, nothing else.
+    //
+    // A step reads only what the previous step left in these arrays:
+    //      x, vx, rho   the integration variables;
+    //      SurF         one step of history -- k_prepare copies it into SurFD
+    //                   and the *next* step's pass1 selects eta from SurFD;
+    //      A, vecn      built once at t = 0 by init_reference_state() and never
+    //                   refreshed.  Both are searched in the *live* positions
+    //                   (A also weights with X0, vecn with rho), so recomputing
+    //                   them from a deformed state gives a different answer --
+    //                   the same trap as the static solid list (C1).
+    //      u, xc, rhoc  fp32 only: the displacement form x = X0 + u and the
+    //                   Kahan compensations; they cannot be rebuilt from x.
+    // Everything else (p, irho, drhodt, dvxdt, viscos, SForce, PIJW, F, DFdt,
+    // Pia, SurFD, the cell list) is written before it is read inside one step.
+    // X0, rho0, mass, itype are deck constants: not stored, fingerprinted in
+    // the header instead.  A resumed run must therefore pass the same deck.
+    // ------------------------------------------------------------------
+    int ckpt_array_count() const { return (sizeof(Real) < sizeof(double)) ? 9 : 6; }
+
+    struct CkptArr { Real* p; size_t len; };
+
+    int ckpt_arrays(CkptArr* a) const
+    {
+        const size_t n = (size_t)g.d.num;
+        a[0] = { g.x,    3 * n };
+        a[1] = { g.vx,   3 * n };
+        a[2] = { g.rho,  n };
+        a[3] = { g.SurF, n };
+        a[4] = { g.A,    9 * n };
+        a[5] = { g.vecn, 3 * n };
+        if (sizeof(Real) < sizeof(double))
+        {
+            a[6] = { g.u,    3 * n };
+            a[7] = { g.xc,   3 * n };
+            a[8] = { g.rhoc, n };
+        }
+        return ckpt_array_count();
+    }
+
+    uint32_t ckpt_flags() const
+    {
+        const bool f32 = (sizeof(Real) < sizeof(double));
+        return (f32 ? 1u : 0u)                       // data is float32
+             | (f32 ? 2u : 0u)                       // compensated arrays present
+             | (sph_use_soldbox ? 4u : 0u)           // solid wall clamp
+             | (sph_use_static_solid ? 8u : 0u)      // A3 static solid list
+             | (sph_use_fluid_list ? 16u : 0u)       // P1 fluid neighbour list
+             | (sph_fast_fluid_loop ? 32u : 0u)      // A5 factored pass1
+             | (sph_reflect_guard ? 64u : 0u);       // M8 reflection at z = 1
+    }
+
+    void ckpt_header(unsigned char* h, long long done, uint64_t payload) const
+    {
+        memset(h, 0, 128);
+        memcpy(h, SPHCHK_MAGIC, 8);
+        const uint32_t ver = SPHCHK_VERSION, hs = 128,
+                       num = (uint32_t)g.d.num, ntotal = (uint32_t)g.d.ntotal,
+                       solnum = (uint32_t)g.d.solnum,
+                       narray = (uint32_t)ckpt_array_count(),
+                       flags = ckpt_flags(), nfbs = (uint32_t)nfb;
+        memcpy(h + 8,  &ver, 4);    memcpy(h + 12, &hs, 4);
+        memcpy(h + 16, &num, 4);    memcpy(h + 20, &ntotal, 4);
+        memcpy(h + 24, &solnum, 4); memcpy(h + 28, &narray, 4);
+        memcpy(h + 32, &flags, 4);  memcpy(h + 36, &nfbs, 4);
+        const uint64_t step = (uint64_t)done;
+        const double hsml = SPH_HSML, dt = SPH_DT;
+        memcpy(h + 40, &step, 8);
+        memcpy(h + 48, &hsml, 8);   memcpy(h + 56, &dt, 8);
+        memcpy(h + 64, &g_soldbox_z, 8);
+        memcpy(h + 72, &g_soldbox_y0, 8);
+        memcpy(h + 80, &g_soldbox_y1, 8);
+        memcpy(h + 88, &deck_fp, 8);
+        memcpy(h + 96, &payload, 8);
+        // The remaining compile-time physics that is *not* derived from the deck.
+        // Something has to catch a rebuilt solver whose constants moved: the
+        // header contract is "refuse anything that would resume a different
+        // problem", and c0/lamd/muyou change every stress in the run.
+        const double c0 = SPH_C0, lamd = SPH_LAMD, muyou = SPH_MUYOU;
+        memcpy(h + 104, &c0, 8); memcpy(h + 112, &lamd, 8); memcpy(h + 120, &muyou, 8);
+    }
+
+    // Write to <path>.tmp and rename over <path>: an interrupted or failed
+    // write must leave the previous checkpoint intact -- that file is exactly
+    // what the next resume will be reading after a crash.
+    bool save_checkpoint(const char* path, long long done)
+    {
+        if (g.d.numP != g.d.num)
+        {
+            fprintf(stderr, "[ckpt] a decomposed run has ghosts; checkpointing is only "
+                            "implemented for the single-GPU path (leave SPH_RANKS unset "
+                            "and use the ordinary single-GPU path)\n");
+            return false;
+        }
+        if (done == ckpt_done) return true;         // that state is already in the file
+        char tmp[520];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        FILE* f = fopen(tmp, "wb");
+        if (!f) { fprintf(stderr, "[ckpt] cannot write %s\n", tmp); return false; }
+
+        CkptArr arr[9];
+        const int na = ckpt_arrays(arr);
+        uint64_t payload = 0;
+        for (int a = 0; a < na; ++a) payload += (uint64_t)arr[a].len * sizeof(Real);
+
+        unsigned char h[128];
+        ckpt_header(h, done, payload);
+        bool ok = (fwrite(h, 1, 128, f) == 128);
+
+        const size_t chunk = 1u << 20;              // 8 MB of doubles
+        std::vector<Real> buf(chunk);
+        for (int a = 0; a < na && ok; ++a)
+        {
+            size_t left = arr[a].len;
+            const Real* src = arr[a].p;
+            while (left != 0)
+            {
+                const size_t m = (left < chunk) ? left : chunk;
+                const cudaError_t e = cudaMemcpy(buf.data(), src, m * sizeof(Real),
+                                                 cudaMemcpyDeviceToHost);
+                if (e != cudaSuccess)
+                {
+                    fprintf(stderr, "[ckpt] device->host copy failed: %s\n", cudaGetErrorString(e));
+                    ok = false; break;
+                }
+                if (fwrite(buf.data(), sizeof(Real), m, f) != m) { ok = false; break; }
+                src += m; left -= m;
+            }
+        }
+        const bool flushed = (fflush(f) == 0);
+        fclose(f);
+        if (!ok || !flushed)
+        {
+            fprintf(stderr, "[ckpt] write failed: %s\n", tmp);
+            remove(tmp);
+            return false;
+        }
+        // std::filesystem::rename is MoveFileEx(..., MOVEFILE_REPLACE_EXISTING) on
+        // Windows: it replaces the old checkpoint in one step, so a crash cannot
+        // leave the run with neither file (remove() + rename() could).
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec)
+        {
+            fprintf(stderr, "[ckpt] cannot rename %s -> %s: %s\n", tmp, path, ec.message().c_str());
+            return false;
+        }
+        ckpt_done = done;
+        printf("[ckpt] %s: %lld step%s, %.1f MB\n", path, done, (done == 1) ? "" : "s",
+               (double)(128 + payload) / 1048576.0);
+        fflush(stdout);                 // a checkpoint message must precede the next long run
+        return true;
+    }
+
+    // Refuses anything that would silently resume a different problem.
+    bool load_checkpoint(const char* path, long long& done)
+    {
+        if (g.d.numP != g.d.num)
+        {
+            fprintf(stderr, "[ckpt] a decomposed run has ghosts; checkpointing is only "
+                            "implemented for the single-GPU path\n");
+            return false;
+        }
+        FILE* f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "[ckpt] cannot open %s\n", path); return false; }
+
+        auto bad = [&](const char* why) -> bool
+        {
+            fprintf(stderr, "[ckpt] %s: %s\n", path, why);
+            fclose(f);
+            return false;
+        };
+
+        unsigned char h[128];
+        if (fread(h, 1, 128, f) != 128 || memcmp(h, SPHCHK_MAGIC, 8) != 0)
+            return bad("not a checkpoint (bad magic or short header) -- a result*.sphbin "
+                       "is not a restart state");
+
+        uint32_t ver, hs, num, ntotal, solnum, narray, flags, nfbs;
+        uint64_t step, payload, fp;
+        double hsml, dt, bz, by0, by1, c0, lamd, muyou;
+        memcpy(&ver, h + 8, 4);    memcpy(&hs, h + 12, 4);
+        memcpy(&num, h + 16, 4);   memcpy(&ntotal, h + 20, 4);
+        memcpy(&solnum, h + 24, 4); memcpy(&narray, h + 28, 4);
+        memcpy(&flags, h + 32, 4); memcpy(&nfbs, h + 36, 4);
+        memcpy(&step, h + 40, 8);
+        memcpy(&hsml, h + 48, 8);  memcpy(&dt, h + 56, 8);
+        memcpy(&bz, h + 64, 8);    memcpy(&by0, h + 72, 8); memcpy(&by1, h + 80, 8);
+        memcpy(&fp, h + 88, 8);    memcpy(&payload, h + 96, 8);
+        memcpy(&c0, h + 104, 8);   memcpy(&lamd, h + 112, 8); memcpy(&muyou, h + 120, 8);
+
+        if (hs != 128 || (ver != 1 && ver != SPHCHK_VERSION))
+            return bad("unsupported container version");
+        if (num != (uint32_t)g.d.num || ntotal != (uint32_t)g.d.ntotal ||
+            solnum != (uint32_t)g.d.solnum)
+            return bad("particle counts differ from the deck");
+        const bool f32 = (sizeof(Real) < sizeof(double));
+        if (((flags & 1u) != 0) != f32 || ((flags & 2u) != 0) != f32)
+            return bad(f32 ? "checkpoint holds fp64 state, this run is fp32"
+                           : "checkpoint holds fp32 state, this run is fp64");
+        if (narray != (uint32_t)ckpt_array_count())
+            return bad("array count does not match this precision");
+        if (hsml != SPH_HSML || dt != SPH_DT) return bad("hsml/dt differ from this build");
+        if (c0 != SPH_C0 || lamd != SPH_LAMD || muyou != SPH_MUYOU)
+            return bad("c0/lamd/muyou differ from this build (the solver was rebuilt with "
+                       "different constitutive constants)");
+        if (((flags & 4u) != 0) != (sph_use_soldbox != 0))
+            return bad("solid wall clamp (SPH_SOLDBOX) differs from the run that wrote it");
+        if (sph_use_soldbox && (bz != g_soldbox_z || by0 != g_soldbox_y0 || by1 != g_soldbox_y1))
+            return bad("SPH_SOLDBOX bounds differ from the run that wrote it");
+        if (((flags & 8u) != 0) != (sph_use_static_solid != 0) ||
+            ((flags & 16u) != 0) != (sph_use_fluid_list != 0) ||
+            ((flags & 32u) != 0) != (sph_fast_fluid_loop != 0))
+            return bad("solver switches (SPH_SOLDDYN / SPH_FLUIDLIST / SPH_LITERALFLUID) "
+                       "differ from the run that wrote it");
+        if (((flags & 64u) != 0) != (sph_reflect_guard != 0))
+        {
+            // Version 1 was written by the pre-merge single-GPU build, which had
+            // no M8 switch and always used 1.cpp's unconditional flip.  Treat a
+            // v1 checkpoint as "flip" instead of guessing.
+            if (ver == 1)
+            {
+                if (sph_reflect_guard != 0)
+                    return bad("this is a version-1 checkpoint from the pre-merge build, "
+                               "which reflects v_z unconditionally at z=1; resume it with "
+                               "SPH_REFLECT=flip, or start this chain with the new build");
+            }
+            else
+                return bad("the z = 1 reflection (SPH_REFLECT) differs from the run that wrote it");
+        }
+        if (fp != deck_fp)
+        {
+            // Print both values: a mismatch between an old checkpoint and a
+            // rebuilt solver looks exactly like a wrong deck, and the two
+            // numbers are the only way to tell them apart afterwards.
+            fprintf(stderr, "[ckpt] %s: deck fingerprint mismatch -- the checkpoint says "
+                            "0x%016llx, this deck hashes to 0x%016llx\n"
+                            "       (a checkpoint belongs to the run that wrote it: same deck, "
+                            "same precision, same switches, same build.  Re-run the first segment "
+                            "with this build, or resume with the build that wrote the file.)\n",
+                    path, (unsigned long long)fp, (unsigned long long)deck_fp);
+            fclose(f);
+            return false;
+        }
+
+        uint64_t expect = 0;
+        CkptArr arr[9];
+        const int na = ckpt_arrays(arr);
+        for (int a = 0; a < na; ++a) expect += (uint64_t)arr[a].len * sizeof(Real);
+        if (payload != expect) return bad("payload size does not match the layout");
+        sph_fseek64(f, 0, SEEK_END);
+        const long long sz = sph_ftell64(f);
+        if ((uint64_t)sz != expect + 128)
+            return bad("file size does not match the header (truncated write?)");
+        sph_fseek64(f, 128, SEEK_SET);
+
+        const size_t chunk = 1u << 20;
+        std::vector<Real> buf(chunk);
+        for (int a = 0; a < na; ++a)
+        {
+            size_t left = arr[a].len;
+            Real* dst = arr[a].p;
+            while (left != 0)
+            {
+                const size_t m = (left < chunk) ? left : chunk;
+                if (fread(buf.data(), sizeof(Real), m, f) != m)
+                    return bad("short read (truncated write?)");
+                const cudaError_t e = cudaMemcpy(dst, buf.data(), m * sizeof(Real),
+                                                 cudaMemcpyHostToDevice);
+                if (e != cudaSuccess)
+                {
+                    fprintf(stderr, "[ckpt] host->device copy failed: %s\n", cudaGetErrorString(e));
+                    fclose(f);
+                    return false;
+                }
+                dst += m; left -= m;
+            }
         }
         fclose(f);
+
+        done = (long long)step;
+        nfb  = (int)nfbs;
+        printf("[ckpt] %s: step %lld, %s, %.1f MB\n", path, done,
+               f32 ? "fp32" : "fp64", (double)sz / 1048576.0);
+        fflush(stdout);
+        if (nfb != 0)
+            fprintf(stderr, "[ckpt] warning: %d particle(s) had a singular gradient-correction "
+                            "matrix in the run that wrote this checkpoint\n", nfb);
+        if (nfb != 0 && f32)
+        {
+            fprintf(stderr, "[ckpt] fp32: the F - I displacement form is invalid for this deck; "
+                            "re-run in fp64\n");
+            return false;
+        }
+        return true;
     }
 };
 
@@ -1126,11 +1522,16 @@ static bool read_deck(const char* path, std::vector<double>& rows,
     }
     else
     {
-        fseek(f, 0, SEEK_END);
-        const long sz = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        std::vector<char> buf((size_t)sz + 1);
-        const size_t rd = fread(buf.data(), 1, (size_t)sz, f);
+        sph_fseek64(f, 0, SEEK_END);
+        const long long szi = sph_ftell64(f);
+        sph_fseek64(f, 0, SEEK_SET);
+        if (szi < 0)
+        {
+            fprintf(stderr, "[D1] %s: cannot determine the file size\n", path);
+            fclose(f); return false;
+        }
+        std::vector<char> buf((size_t)szi + 1);
+        const size_t rd = fread(buf.data(), 1, (size_t)szi, f);
         buf[rd] = '\0';
         const char* q = buf.data();
         char* end = nullptr;
@@ -1986,7 +2387,8 @@ static void fetch_own(Job& J, Rank& R, Job::OutBuf& O)
 
 static void write_global_result(Job& J, const Job::OutBuf& O, int idx)
 {
-    const bool f32 = (getenv("SPH_OUT_F32") != nullptr);
+    const char* ef32 = getenv("SPH_OUT_F32");
+    const bool f32 = (ef32 != nullptr) && (atoi(ef32) != 0);
     char name[128];
     snprintf(name, sizeof(name), "result%d.sphbin", idx);
     FILE* f = fopen(name, "wb");
@@ -1997,7 +2399,8 @@ static void write_global_result(Job& J, const Job::OutBuf& O, int idx)
     memcpy(h, magic, 8);
     const uint32_t ver = 1, hs = 128, num = (uint32_t)J.num,
                    ntotal = (uint32_t)J.ntotal, solnum = (uint32_t)J.solnum,
-                   nfields = 4, step = (uint32_t)(idx * 500),
+                   nfields = 4,
+                   step = (uint32_t)((long long)idx * (g_out_cadence > 0 ? g_out_cadence : 1)),
                    flags = 2u | (f32 ? 4u : 0u);
     memcpy(h + 8, &ver, 4);      memcpy(h + 12, &hs, 4);
     memcpy(h + 16, &num, 4);     memcpy(h + 20, &ntotal, 4);
@@ -2006,34 +2409,48 @@ static void write_global_result(Job& J, const Job::OutBuf& O, int idx)
     const double hsml = SPH_HSML, dt = SPH_DT;
     memcpy(h + 40, &hsml, 8); memcpy(h + 48, &dt, 8);
     memcpy(h + 56, J.grid, 48);
-    fwrite(h, 1, 128, f);
 
+    bool ok = (fwrite(h, 1, 128, f) == 128);
     const size_t rec = 4;
     if (f32)
     {
         std::vector<float> buf(rec * 65536);
         size_t used = 0;
-        for (int i = 0; i < J.num; ++i)
+        for (int i = 0; i < J.num && ok; ++i)
         {
-            if (used + rec > buf.size()) { fwrite(buf.data(), sizeof(float), used, f); used = 0; }
+            if (used + rec > buf.size())
+            {
+                ok = (fwrite(buf.data(), sizeof(float), used, f) == used);
+                used = 0;
+            }
             buf[used++] = (float)O.gx[i]; buf[used++] = (float)O.gy[i];
             buf[used++] = (float)O.gz[i]; buf[used++] = (float)O.gp[i];
         }
-        if (used) fwrite(buf.data(), sizeof(float), used, f);
+        if (used != 0 && ok) ok = (fwrite(buf.data(), sizeof(float), used, f) == used);
     }
     else
     {
         std::vector<double> buf(rec * 65536);
         size_t used = 0;
-        for (int i = 0; i < J.num; ++i)
+        for (int i = 0; i < J.num && ok; ++i)
         {
-            if (used + rec > buf.size()) { fwrite(buf.data(), sizeof(double), used, f); used = 0; }
+            if (used + rec > buf.size())
+            {
+                ok = (fwrite(buf.data(), sizeof(double), used, f) == used);
+                used = 0;
+            }
             buf[used++] = O.gx[i]; buf[used++] = O.gy[i];
             buf[used++] = O.gz[i]; buf[used++] = O.gp[i];
         }
-        if (used) fwrite(buf.data(), sizeof(double), used, f);
+        if (used != 0 && ok) ok = (fwrite(buf.data(), sizeof(double), used, f) == used);
     }
-    fclose(f);
+    ok = (fflush(f) == 0) && ok;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok)
+    {
+        fprintf(stderr, "[D1] short write on %s (disk full?) -- frame abandoned\n", name);
+        remove(name);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2413,6 +2830,8 @@ static void rank_main(Job* Jp, int r)
     tl_job = &J;
     tl_rank = r;
     CUDA_CHECK(cudaSetDevice(R.gpu));
+    // Each device has its own copy of the __device__ clamp symbols.
+    sph_apply_soldbox();
 
     // exchange buffers and both halves of the lists, once
     build_send_lists(J, R);
@@ -2482,13 +2901,13 @@ static void rank_main(Job* Jp, int r)
         const auto s1 = std::chrono::steady_clock::now();
         R.step_s += std::chrono::duration<double>(s1 - s0).count();
 
-        if (itime % 500 == 0)
+        if (g_out_cadence > 0 && itime % g_out_cadence == 0)
         {
             // P14: hand the file to a writer thread and keep stepping.  Two stages
             // are enough: a stage is only reused two results later, and rank 0
             // waits for that writer before the barrier that releases it.
             // C20: derived, not stored -- every rank computes the same value
-            const int s = (itime / 500) & 1;
+            const int s = (itime / g_out_cadence) & 1;
             if (r == 0 && J.outBusy[s])
             {
                 J.outFut[s].wait();
@@ -2499,7 +2918,7 @@ static void rank_main(Job* Jp, int r)
             J.bar.wait();                 // it now holds every rank's particles
             if (r == 0)
             {
-                const int idx = itime / 500;
+                const int idx = itime / g_out_cadence;
                 Job::OutBuf& O = J.out[s];
                 J.outFut[s] = std::async(std::launch::async,
                                          [&J, &O, idx] { write_global_result(J, O, idx); });
@@ -2898,7 +3317,8 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
 // driver for one precision
 // ---------------------------------------------------------------------------
 template <class Real>
-static int run_case(const char* input_path, int iMaxStep, int profile, const char* prec_name)
+static int run_case(const char* input_path, int iMaxStep, int profile, const char* prec_name,
+                    const char* ckpt_out, const char* ckpt_in, long long step0)
 {
     Solver<Real> S;
     S.dump_step = (getenv("SPH_DUMPSTEP") != nullptr);
@@ -2910,17 +3330,40 @@ static int run_case(const char* input_path, int iMaxStep, int profile, const cha
 
     S.build_cells();
     if (getenv("SPH_VERIFY")) S.verify_cells();
-    S.init_reference_state();
-    CUDA_CHECK(cudaDeviceSynchronize());
-    // C8: the fp32 solid kernels accumulate F - I, which is only the same tensor
-    // as F when every A is a true inverse (a * = I).  A particle whose A fell
-    // back to the identity breaks that, so refuse fp32 rather than run wrong.
+
+    long long itime0 = step0;
+    if (ckpt_in != nullptr)
     {
-        int nfb = gra_fallback_count();
-        if (nfb != 0)
+        // A resume replaces both init-only arrays (A, vecn) with the state of
+        // the run that wrote the checkpoint, so init_reference_state() must not
+        // run: it would search in the restored, already deformed positions.
+        long long done = 0;
+        if (!S.load_checkpoint(ckpt_in, done)) return 5;
+        itime0 = done;
+        launch_copy_xf(S.g, 0);
+        S.build_cells();
+        if (getenv("SPH_LOADA"))
+            fprintf(stderr, "[ckpt] SPH_LOADA ignored: A comes from the checkpoint\n");
+        if (g_out_cadence > 0)
+            printf("[ckpt] resumed at step %lld; the next result frame is written after step %lld "
+                   "(SPH_MAXSTEP counts this run's steps only)\n",
+                   itime0, ((itime0 + g_out_cadence - 1) / g_out_cadence) * g_out_cadence);
+        else
+            printf("[ckpt] resumed at step %lld\n", itime0);
+        fflush(stdout);
+    }
+    else
+    {
+        S.init_reference_state();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        // C8: the fp32 solid kernels accumulate F - I, which is only the same tensor
+        // as F when every A is a true inverse (a * = I).  A particle whose A fell
+        // back to the identity breaks that, so refuse fp32 rather than run wrong.
+        S.nfb = gra_fallback_count();
+        if (S.nfb != 0)
         {
             fprintf(stderr, "[A] warning: %d particle(s) have a singular gradient-correction "
-                            "matrix and fell back to A = I (as 1.cpp does)\n", nfb);
+                            "matrix and fell back to A = I (as 1.cpp does)\n", S.nfb);
             if constexpr (sizeof(Real) < sizeof(double))
             {
                 fprintf(stderr, "[A] fp32: the F - I displacement form is invalid for this deck; "
@@ -2928,9 +3371,9 @@ static int run_case(const char* input_path, int iMaxStep, int profile, const cha
                 return 4;
             }
         }
+        if (const char* pa = getenv("SPH_LOADA")) S.load_A_from_dump(pa);
     }
-    if (const char* pa = getenv("SPH_LOADA")) S.load_A_from_dump(pa);
-    launch_build_solid_pack(S.g, 0);            // after SPH_LOADA: the pack holds a copy of A
+    launch_build_solid_pack(S.g, 0);            // after SPH_LOADA / the checkpoint: the pack holds a copy of A
     if (sph_use_static_solid) S.build_solid_lists();   // A3, must follow GraCorrec + LOADA
     CUDA_CHECK(cudaDeviceSynchronize());
     if (S.dump_a) S.dump_reference_arrays();
@@ -3028,11 +3471,26 @@ static int run_case(const char* input_path, int iMaxStep, int profile, const cha
 
     double step_seconds = 0.0;
     double prof[6] = {0, 0, 0, 0, 0, 0};
+    double pw[6] = {0, 0, 0, 0, 0, 0};      // per-window snapshot for [profwin]
     cudaEvent_t ev[8];
     if (profile) for (int k = 0; k < 8; ++k) CUDA_CHECK(cudaEventCreate(&ev[k]));
 
-    for (int itime = 0; itime < iMaxStep; ++itime)
+    // SPH_STEPTIME: print the wall time of every window of 500 steps.  A long run
+    // gets slower as the flow develops; this shows the drift directly in the log.
+    const bool steptime = (getenv("SPH_STEPTIME") != nullptr);
+    double win_seconds = 0.0;
+
+    for (long long itime = itime0; itime < itime0 + (long long)iMaxStep; ++itime)
     {
+        // The checkpoint is taken *here*, before the step, so its `step` count
+        // is the number of completed steps and resuming replays exactly the
+        // iterations this run would have executed next -- same result frame
+        // names, same printed diagnostics.
+        if (ckpt_out != nullptr && g_ckpt_every > 0 && itime % g_ckpt_every == 0)
+        {
+            if (!S.save_checkpoint(ckpt_out, itime)) return 6;
+        }
+
         if (itime % 500 == 0)
         {
             // the list built inside the previous step predates that step's position
@@ -3042,7 +3500,12 @@ static int run_case(const char* input_path, int iMaxStep, int profile, const cha
             launch_count_pairs(S.g, S.d_niac, 0);
             int niac = 0;
             CUDA_CHECK(cudaMemcpy(&niac, S.d_niac, sizeof(int), cudaMemcpyDeviceToHost));
-            printf("T= %d\tpairs=%d\n", itime / 500, niac / 2);
+            printf("T= %lld\tpairs=%d\n", itime / 500, niac / 2);
+            if (steptime && itime > 0 && !profile)   // profile mode prints [profwin] instead
+            {
+                printf("[steptime] step %lld\t%.3f ms/step\n", itime, 1000.0 * win_seconds / 500.0);
+                win_seconds = 0.0;
+            }
         }
 
         if (profile)
@@ -3073,21 +3536,38 @@ static int run_case(const char* input_path, int iMaxStep, int profile, const cha
                 CUDA_CHECK(cudaEventElapsedTime(&ms, ev[k], ev[k + 1]));
                 prof[k] += ms * 1e-3;
             }
+            if (steptime && itime > 0 && itime % 500 == 0)
+            {
+                printf("[profwin] step %lld  prepare %.3f  cell %.3f  pass1 %.3f  "
+                       "cons %.3f  pass2 %.3f  update %.3f  (ms/step)\n", itime,
+                       1000.0 * (prof[0] - pw[0]) / 500.0, 1000.0 * (prof[1] - pw[1]) / 500.0,
+                       1000.0 * (prof[2] - pw[2]) / 500.0, 1000.0 * (prof[3] - pw[3]) / 500.0,
+                       1000.0 * (prof[4] - pw[4]) / 500.0, 1000.0 * (prof[5] - pw[5]) / 500.0);
+                for (int k = 0; k < 6; ++k) pw[k] = prof[k];
+            }
         }
         else
         {
             auto s0 = std::chrono::steady_clock::now();
-            S.step(itime);
+            S.step((int)itime);
             CUDA_CHECK(cudaDeviceSynchronize());
             auto s1 = std::chrono::steady_clock::now();
             step_seconds += std::chrono::duration<double>(s1 - s0).count();
+            win_seconds  += std::chrono::duration<double>(s1 - s0).count();
         }
 
-        if (itime % 500 == 0)
+        if (g_out_cadence > 0 && itime % g_out_cadence == 0)
         {
             S.fetch_state();
-            S.write_result(itime / 500);
+            if (!S.write_result(itime)) return 7;
         }
+    }
+
+    // A run that stops (or is stopped between two periodic writes) still leaves
+    // a checkpoint that is exactly its final state.
+    if (ckpt_out != nullptr)
+    {
+        if (!S.save_checkpoint(ckpt_out, itime0 + (long long)iMaxStep)) return 6;
     }
 
     if (profile)
@@ -3109,7 +3589,16 @@ static int run_case(const char* input_path, int iMaxStep, int profile, const cha
 static void usage()
 {
     printf("usage: sph_cuda [input.dat] [--fp64|--fp32] [--precision=fp64|fp32]\n"
-           "  env: SPH_MAXSTEP, SPH_PRECISION, SPH_PROFILE\n");
+           "                [--resume=<checkpoint>] [--ckpt=<checkpoint>] [--step0=<n>]\n"
+           "  env: SPH_MAXSTEP, SPH_OUTCADENCE, SPH_OUT_F32, SPH_SOLDBOX, SPH_PRECISION,\n"
+           "       SPH_PROFILE, SPH_STEPTIME (per-500-step ms/step), SPH_BENCH,\n"
+           "       SPH_CKPT (write), SPH_CKPT_IN (resume), SPH_CKPT_EVERY (steps,\n"
+           "       0 = at the end), SPH_STEP0 (absolute step number of a fresh run),\n"
+           "       SPH_SORTEDTHREADS=0/1 (single-GPU fluid-kernel thread order)\n"
+           "       SPH_RANKS=K / SPH_RANKS=auto, SPH_RANKS_GPUS=0,1,... (multi-GPU)\n"
+           "  a resume needs the same deck, precision and solver switches as the run that wrote\n"
+           "  the checkpoint; the checkpoint supplies x, vx, rho, SurF, A, vecn (+ u, xc, rhoc in\n"
+           "  fp32).  Checkpointing is single-GPU only.  See cuda/docs/CHECKPOINT.md.\n");
 }
 
 // PREC_FP32 / PREC_FP64 for a precision name (case-insensitive), -1 if the
@@ -3130,8 +3619,15 @@ static int parse_precision(const char* v)
 
 int main(int argc, char** argv)
 {
+    // Unbuffered: a long run that is killed (or that hangs) must still show how
+    // far it got.  The per-step path prints at most once every 500 steps.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     const char* input = "input.dat";
     int prec = -1;
+    const char* ckpt_out = nullptr;
+    const char* ckpt_in = nullptr;
+    long long step0 = 0;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -3143,6 +3639,9 @@ int main(int argc, char** argv)
             prec = parse_precision(a + 12);
             if (prec < 0) { fprintf(stderr, "unknown precision '%s'\n", a + 12); usage(); return 2; }
         }
+        else if (!strncmp(a, "--resume=", 9)) ckpt_in = a + 9;
+        else if (!strncmp(a, "--ckpt=", 7)) ckpt_out = a + 7;
+        else if (!strncmp(a, "--step0=", 8)) step0 = atoll(a + 8);
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { usage(); return 0; }
         else if (a[0] != '-') input = a;
         else { fprintf(stderr, "unknown option %s\n", a); usage(); return 2; }
@@ -3159,11 +3658,23 @@ int main(int argc, char** argv)
     if (prec < 0) prec = SPH_PREC_DEFAULT;
 
     int iMaxStep = 10000001;
-    if (const char* e = getenv("SPH_MAXSTEP")) iMaxStep = atoi(e);
+    if (const char* e = getenv("SPH_MAXSTEP"))
+    {
+        iMaxStep = atoi(e);
+        if (iMaxStep < 0) { fprintf(stderr, "SPH_MAXSTEP must be >= 0 (got %s)\n", e); return 2; }
+    }
+    // 0 is a meaningful value: no result frames at all.
+    if (const char* e = getenv("SPH_OUTCADENCE"))
+    {
+        const int c = atoi(e);
+        if (c < 0) { fprintf(stderr, "SPH_OUTCADENCE must be >= 0 (got %s)\n", e); return 2; }
+        g_out_cadence = c;
+    }
     const int profile = (getenv("SPH_PROFILE") != nullptr) ? 1 : 0;
     if (const char* e = getenv("SPH_SOLDDYN")) sph_use_static_solid = (atoi(e) == 0) ? 1 : 0;
     if (const char* e = getenv("SPH_LITERALFLUID")) sph_fast_fluid_loop = (atoi(e) == 0) ? 1 : 0;
     if (const char* e = getenv("SPH_FLUIDLIST")) sph_use_fluid_list = (atoi(e) == 0) ? 0 : 1;
+    if (const char* e = getenv("SPH_SORTEDTHREADS")) sph_sorted_threads = (atoi(e) == 0) ? 0 : 1;
     // A6: which solid-list layout to use.  -1 = auto (lean when the fat list
     // would dominate VRAM), 0 = fat (sG/sB/sD stored, fastest), 1 = lean.
     // SPH_A3_FULL=0/1 forces lean/fat; SPH_A3_LIMIT_MB sets the auto threshold.
@@ -3172,10 +3683,51 @@ int main(int argc, char** argv)
     // M8: the z = 1 reflection.  'flip' is 1.cpp's unconditional form.
     if (const char* e = getenv("SPH_REFLECT")) sph_reflect_guard = strcmp(e, "flip") != 0;
 
+    // ---- checkpointing (single-GPU path; see cuda/docs/CHECKPOINT.md) ----
+    if (ckpt_out == nullptr) ckpt_out = getenv("SPH_CKPT");
+    if (ckpt_in  == nullptr) ckpt_in  = getenv("SPH_CKPT_IN");
+    if (ckpt_out != nullptr && *ckpt_out == '\0') ckpt_out = nullptr;
+    if (ckpt_in  != nullptr && *ckpt_in  == '\0') ckpt_in  = nullptr;
+    if (const char* e = getenv("SPH_CKPT_EVERY")) { int c = atoi(e); if (c > 0) g_ckpt_every = c; }
+    if (const char* e = getenv("SPH_STEP0")) step0 = atoll(e);
+    if (step0 < 0) { fprintf(stderr, "SPH_STEP0 must be >= 0\n"); return 2; }
+    if (g_ckpt_every > 0 && ckpt_out == nullptr)
+    {
+        fprintf(stderr, "SPH_CKPT_EVERY=%d needs SPH_CKPT=<file>\n", g_ckpt_every);
+        return 2;
+    }
+    g_ckpt_wanted = (ckpt_out != nullptr) || (ckpt_in != nullptr);
+    if (ckpt_in != nullptr)
+    {
+        // the checkpoint carries the step count; --step0 only names a fresh run
+        if (step0 != 0) fprintf(stderr, "[ckpt] --step0 ignored: the checkpoint carries the step count\n");
+        step0 = 0;
+    }
+
     CUDA_CHECK(cudaSetDevice(0));
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
 
+    {
+        // solid wall box clamp, see sph.h.  Defaults: the 3.7M deck's geometry
+        // (1.cpp of that case: x[2]<=0.01 || x[1]<=0.00 || x[1]>=3.31).  The
+        // 1.2M deck's box is "0.01,0.00,1.31"; the 237k deck "0.01,0.01,0.49".
+        double bz = 0.01, by0 = 0.00, by1 = 3.31;
+        int bon = 1;
+        if (const char* e = getenv("SPH_SOLDBOX"))
+        {
+            if (!strcmp(e, "off") || !strcmp(e, "0")) bon = 0;
+            else if (sscanf(e, "%lf,%lf,%lf", &bz, &by0, &by1) != 3)
+            {
+                fprintf(stderr, "SPH_SOLDBOX expects \"z,y0,y1\" or \"off\"\n");
+                return 2;
+            }
+        }
+        g_soldbox_z = bz; g_soldbox_y0 = by0; g_soldbox_y1 = by1;
+        sph_set_soldbox(bon, bz, by0, by1);
+        if (bon) printf("[soldbox] solid wall clamp on: z<=%.3f | y<=%.3f | y>=%.3f\n", bz, by0, by1);
+        else     printf("[soldbox] solid wall clamp OFF\n");
+    }
 
     const bool want_f32 = (prec == PREC_FP32);
 #if !SPH_HAVE_FP32
@@ -3191,6 +3743,12 @@ int main(int argc, char** argv)
     // ------------------------------------------------------------------
     if (const char* e = getenv("SPH_RANKS"))
     {
+        if (ckpt_out != nullptr || ckpt_in != nullptr)
+        {
+            fprintf(stderr, "checkpoint/resume (SPH_CKPT / SPH_CKPT_IN / --resume) is only "
+                            "implemented for the single-GPU path; leave SPH_RANKS unset\n");
+            return 2;
+        }
         const int K = atoi(e);
         if (!strcmp(e, "auto"))             // L1: rank the devices, choose K
         {
@@ -3268,10 +3826,12 @@ int main(int argc, char** argv)
            prop.totalGlobalMem / 1073741824.0);
 
 #if SPH_HAVE_FP32
-    if (want_f32) return run_case<float>(input, iMaxStep, profile, "fp32");
+    if (want_f32) return run_case<float>(input, iMaxStep, profile, "fp32",
+                                         ckpt_out, ckpt_in, step0);
 #endif
 #if SPH_HAVE_FP64
-    return run_case<double>(input, iMaxStep, profile, "fp64");
+    return run_case<double>(input, iMaxStep, profile, "fp64",
+                            ckpt_out, ckpt_in, step0);
 #else
     return 0;
 #endif

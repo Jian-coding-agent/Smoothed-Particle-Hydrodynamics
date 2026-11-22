@@ -45,6 +45,17 @@
 // the host reads it through gra_fallback_count().
 static __device__ int sph_gra_fallbacks = 0;
 
+// Solid wall box clamp (1.cpp:196 of the new case), see sph_set_soldbox().
+// Kept in double: the comparison is `x <= threshold` against the particle
+// position, and in fp64 a float threshold is not the number the reference
+// compares against -- (float)0.01 = 0.00999999977648258, so the 1700 solid
+// particles that sit exactly on z = 0.01 failed the test in the fp64 build while
+// they passed it in fp32, and the two precisions did different physics.
+__device__ double sph_soldbox_z  = 0.01;
+__device__ double sph_soldbox_y0 = 0.00;
+__device__ double sph_soldbox_y1 = 3.31;
+__device__ int    sph_soldbox_on = 1;
+
 // A4 pre-filter: is candidate q certainly outside 3*hsml?  Compiled only for
 // Real = double -- for Real = float the exact test below is already fp32, so a
 // float pre-filter would just add three loads and six operations per candidate
@@ -310,6 +321,12 @@ __global__ void k_solid_pair_fill(SphPtrsT<Real> s, int* __restrict__ cur)
         const Real Dz = -(Aq6 * Gx + Aq7 * Gy + Aq8 * Gz);
 
         const size_t e = (size_t)j * s.d.nsolC + k;
+        // C3 in the kernel: never write past the slot array.  If the count pass
+        // and this pass disagree by one pair at a knife edge, the entry used to
+        // land in the next particle's slots (silent corruption); stopping here
+        // leaves cur[k] short of h[k], which is exactly what the host's C3 check
+        // reports.
+        if (e >= (size_t)s.sw) return;
         s.sQ[e]      = q;
         if constexpr (!LEAN)
         {
@@ -532,6 +549,12 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid(SphPtrsT<Real> s)
 
     sph_neigh2(s, p, xp0, xp1, xp2, [&](int q, Real d0, Real d1, Real d2, Real r2)
     {
+        // 1.cpp branches on `itype[i]>0 && itype[j]>0` / `itype[i]>0 && itype[j]<0`,
+        // so a rigid particle with itype == 0 gets *no* fluid term at all.  The
+        // loader accepts that value (-10 <= itype <= 0 is a wall class), so mirror
+        // the reference instead of silently treating 0 as a wall.
+        if (s.itype[q] == Real(0.0)) return;
+
         const Real dr = sqrt(r2 + Real(0.0000000000001));   // 1e-13, as in 1.cpp
         const Real pinv = Real(1.0) / dr;
         const Real qk = dr * sph_inv_h<Real>();
@@ -650,10 +673,16 @@ __global__ void k_fluid_nbr_build(SphPtrsT<Real> s)
 // USE_LIST = true : the same body over the recorded list.  The four kernels
 // that used to make the fp64 body run under a sparse lane mask are gone.
 // ---------------------------------------------------------------------------
-template <class Real, bool USE_LIST>
+template <class Real, bool USE_LIST, bool SORTED = false>
 __global__ void __launch_bounds__(256, 4) k_pass1_fluid_body(SphPtrsT<Real> s)
 {
-    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    // S1: thread t -> the t-th particle in cell-sorted order.  About half of the
+    // lanes are solid/wall and exit immediately, but the surviving lanes of a
+    // warp are one or two cells apart instead of ~30, so the gather addresses
+    // are coherent.  Per-particle summation order is unchanged, hence the bits
+    // are unchanged.  Only used when numP == num (no ghosts).
+    const int p = SORTED ? ((t < s.d.num) ? s.sorted[t] : s.d.num) : t;
     if (p >= s.d.ntotal) return;
 
     const Real C0   = Real(SPH_C0);
@@ -676,6 +705,7 @@ __global__ void __launch_bounds__(256, 4) k_pass1_fluid_body(SphPtrsT<Real> s)
 
     auto pair = [&](int q, Real d0, Real d1, Real d2, Real r2)
     {
+        if (s.itype[q] == Real(0.0)) return;                 // 1.cpp skips itype == 0
         const Real r2e = r2 + Real(0.0000000000001);        // 1e-13, as in 1.cpp
         const Real dr = sqrt(r2e);
         const Real qk = dr * invh;
@@ -1494,8 +1524,25 @@ __global__ void k_update_solid(SphPtrsT<Real> s, int base)
     Real v1 = s.vx[N + i]     + dt * s.PIJW[N + i]     + dt * s.SForce[N + i];
     Real v2 = s.vx[2 * N + i] + dt * s.PIJW[2 * N + i] + dt * s.SForce[2 * N + i] - dt * GRAV;
 
-    // New case (1.cpp): the old test-only box clamp is commented out there
-    // (it froze the plate); the solid now deforms freely.
+    // 1.cpp:196 -- hold the solid against the tank walls.  This is the clamp the
+    // new-case 1.cpp has commented out; without it the structure has no support
+    // at all (there is no solid-wall interaction term, only solid-solid and
+    // fluid-(solid|wall)) and free-falls under gravity.
+    //
+    // Only owned solids reach this kernel; a decomposed rank never writes a
+    // ghost.  The bounds are global constants, so K > 1 applies the same clamp
+    // as K = 1 and stays byte-identical.
+    if (sph_soldbox_on)
+    {
+        const Real zc = s.x[2 * N + i];
+        const Real yc = s.x[N + i];
+        if (zc <= Real(sph_soldbox_z) || yc <= Real(sph_soldbox_y0) ||
+            yc >= Real(sph_soldbox_y1))
+        {
+            v0 = Real(0.0); v1 = Real(0.0); v2 = Real(0.0);
+        }
+    }
+
     s.vx[i] = v0; s.vx[N + i] = v1; s.vx[2 * N + i] = v2;
 }
 
@@ -1859,6 +1906,36 @@ int sph_reflect_guard = 1;
 // C12: installed by the decomposed driver so that every rank picks the same A6
 // layout (see sph.h)
 double (*sph_a3_fat_hook)(double fat_mb) = nullptr;
+// S1: -1 = auto (on in fp32, off in fp64), 0 / 1 forces it (SPH_SORTEDTHREADS).
+int sph_sorted_threads = -1;
+// Solid wall clamp, see sph_set_soldbox() and k_update_solid.
+int sph_use_soldbox = 1;
+
+// Copy the host-side clamp into the device symbols of the *current* device.
+// D1 calls sph_apply_soldbox() again in every rank thread after cudaSetDevice(),
+// because each device has its own copy of the __device__ variables.
+static int    sph_soldbox_on_host = 1;
+static double sph_soldbox_z_host = 0.01;
+static double sph_soldbox_y0_host = 0.00;
+static double sph_soldbox_y1_host = 3.31;
+
+void sph_apply_soldbox()
+{
+    cudaMemcpyToSymbol(sph_soldbox_z,  &sph_soldbox_z_host,  sizeof(double));
+    cudaMemcpyToSymbol(sph_soldbox_y0, &sph_soldbox_y0_host, sizeof(double));
+    cudaMemcpyToSymbol(sph_soldbox_y1, &sph_soldbox_y1_host, sizeof(double));
+    cudaMemcpyToSymbol(sph_soldbox_on, &sph_soldbox_on_host, sizeof(int));
+}
+
+void sph_set_soldbox(int on, double z, double y0, double y1)
+{
+    sph_use_soldbox = on ? 1 : 0;
+    sph_soldbox_on_host = on ? 1 : 0;
+    sph_soldbox_z_host = z;
+    sph_soldbox_y0_host = y0;
+    sph_soldbox_y1_host = y1;
+    sph_apply_soldbox();
+}
 
 int gra_fallback_count()
 {
@@ -2006,6 +2083,17 @@ void launch_pass1_fluid(SphPtrsT<Real> s, cudaStream_t st)
     if (!sph_fast_fluid_loop)
     {
         k_pass1_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
+        return;
+    }
+    // S1: launch over the cell-sorted order.  This is a single-GPU optimisation:
+    // sorted[] covers numP slots and on a decomposed run some of them are ghost
+    // copies, so the mapping t -> sorted[t] would not be an owned particle.
+    const int sorted = (sph_sorted_threads < 0)
+                           ? (sizeof(Real) < sizeof(double) ? 1 : 0)
+                           : sph_sorted_threads;
+    if (sorted && s.d.numP == s.d.num)
+    {
+        k_pass1_fluid_body<Real, false, true><<<nblocks(s.d.num), BLK, 0, st>>>(s);
         return;
     }
     // P1: the list pays off only in fp64; fp32 is traversal bound and the fused

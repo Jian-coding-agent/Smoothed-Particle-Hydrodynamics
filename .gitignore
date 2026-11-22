@@ -6,6 +6,8 @@ out/
 result*.dat
 *.sphbin
 gpu_*.bin
+*.chk
+*.sphchk
 
 # Visual Studio / MSVC intermediates
 .vs/
