@@ -1,13 +1,14 @@
 # Checkpoint / restart
 
 A run can be stopped and continued from its last checkpoint, and the continuation
-is **bit-identical** to a straight run of the same length — in both precisions.
+is **bit-identical** to a straight run of the same length — in both precisions and
+on both paths.
 
-> **Scope: the single-GPU path only.**  `SPH_CKPT` / `SPH_CKPT_IN` / `--resume`
-> with `SPH_RANKS` set are refused at start-up: a decomposed run also has ghost
-> copies and a halo that belongs to other ranks, so a restart would have to save
-> the decomposition and every rank's state together.  Use the ordinary path
-> (`SPH_RANKS` unset) for a checkpointed run.
+> **Two containers.**  The ordinary single-GPU path (`SPH_RANKS` unset) writes
+> `SPHCHK`; a decomposed run (`SPH_RANKS=K`) writes `SPHD1CK`, which stores the
+> state by deck id and rebuilds the decomposition on resume.  The formats are
+> deliberately not interchangeable: `SPH_RANKS=1` is a decomposed run too, so use
+> `SPH_RANKS` unset to read an `SPHCHK` file.
 
 ```bat
 :: one long run, checkpoint every 5000 steps and again at the end
@@ -190,6 +191,70 @@ including the static solid list) and then runs at the same ms/step.
 * Not implemented: automatic restart after a crash (the periodic checkpoint is
   the mechanism — set `SPH_CKPT_EVERY`), rotation between two files, and
   compression.
+
+## Multi-GPU (`SPHD1CK`)
+
+`SPH_RANKS=K` writes a different container.  It holds the **global state by deck
+id** and no decomposition: a resume reads the deck, rebuilds the initial
+`build_job()` split, uploads the owned part of the state, and then performs one
+halo refresh from the restored *current* positions.  The refresh re-selects every
+ghost the run actually needs (a decomposition saved at t=0 would be incomplete),
+while the gid-order summation still matches a straight run.  The cost is one halo
+refresh at resume (0.1 s at 237k, 1.8 s at 3.7M in the tests below).
+
+```bat
+set SPH_RANKS=8
+set SPH_CKPT=dam8.chk
+set SPH_CKPT_EVERY=50000
+sph_cuda.exe input.sphbin
+
+set SPH_MAXSTEP=100000
+sph_cuda.exe input.sphbin --resume=dam8.chk
+```
+
+Header (160 bytes), then `nvals * num` values of the run's precision:
+
+| off | size | field |
+|---:|---:|---|
+| 0 | 8 | magic `SPHD1CK\0` |
+| 8 | 4 | version = 1 |
+| 12 | 4 | header size = 160 |
+| 16 | 4 | num |
+| 20 | 4 | ntotal |
+| 24 | 4 | solnum |
+| 28 | 4 | K (must match on resume) |
+| 32 | 4 | nvals (20 fp64, 27 fp32) |
+| 36 | 4 | flags (same bits as `SPHCHK`, bit6 reflection) |
+| 40 | 8 | step (completed steps) |
+| 48 | 8 | deck fingerprint |
+| 56 | 8 | hsml |
+| 64 | 8 | dt |
+| 72 | 8 | solid clamp z |
+| 80 | 8 | y0 |
+| 88 | 8 | y1 |
+| 96 | 8 | c0 |
+| 104 | 8 | lamd |
+| 112 | 8 | muyou |
+| 120 | 8 | payload bytes |
+| 128 | 4 | gnx |
+| 132 | 4 | gny |
+| 136 | 4 | gnz |
+| 140 | 20 | reserved |
+
+State order: `x[3], vx[3], rho, SurF, A[9], vecn[3]`, then fp32 only
+`u[3], xc[3], rhoc`.  `F/DFdt/Pia`, `SForce/PIJW`, `p/irho/SurFD` and the cell
+list are step-local and rebuilt by the first step.  A resume refuses a different
+K, precision, deck, `SPH_SOLDBOX`, `SPH_REFLECT` or solver switches, exactly like
+the single-GPU container.  `SPH_RANKS=auto` reads K from the header before it
+chooses devices (the saved rank count cannot be changed).
+
+| run | result |
+|---|---|
+| 237k, K=2, fp64 150 + resume 150 vs 300 | SHA256 equal |
+| 237k, K=2, fp32 75 + resume 75 vs 150 | SHA256 equal |
+| 237k, K=2, `SPH_CKPT_EVERY=100`, 300 + resume 100 vs 400 | SHA256 equal |
+| 3.7M, K=2, fp32 60 + resume 60 vs 120 | SHA256 equal (382.7 MB) |
+| 237k, K=2, result0/1/2 across a 101 + 100 resume | byte-identical |
 
 ## Latent bug found on the way
 

@@ -1191,11 +1191,18 @@ K > 1 and K = 1 still agree bit for bit.  The default bounds are the 3.7M case;
 `SPH_SOLDBOX="0.01,0.01,0.49"` (237k), `"0.01,0.00,1.31"` (1.2M) or `off`
 selects the others.
 
-### 15.2 What is still single-GPU only
+### 15.2 Checkpointing both paths
 
-| feature | why the decomposed path does not have it |
-|---|---|
-| checkpoint / resume | a restart has to save the decomposition, every rank's owned state *and* the ghost halo; doing only the first two silently resumes a different neighbour set |
+The single path writes the `SPHCHK` container described in
+[`CHECKPOINT.md`](CHECKPOINT.md).  A decomposed run writes `SPHD1CK`, which holds
+the global state by deck id and *no decomposition*: on resume the driver rebuilds
+the initial `build_job()` split from the deck, uploads the owned state, and runs
+one halo refresh from the restored current positions.  That refresh is required
+because a ghost set saved at t=0 is not the set the particles need after they
+have moved; the gid summation order still matches a straight run.  The rank count
+is in the header and must match (`SPH_RANKS=auto` reads it before choosing
+devices).  Both containers validate the deck fingerprint, precision, K,
+`SPH_SOLDBOX`, `SPH_REFLECT` and the solver switches.
 
 Everything else is shared: `SPH_OUTCADENCE`, `SPH_OUT_F32` (`=0` is float64, the
 old code tested presence), the checked result writer, `SPH_SOLDBOX`, the
@@ -1239,10 +1246,14 @@ RTX 5080, one device; decomposed runs put every rank on GPU 0 with
 | 3.7M, K = 1 vs K = 2, 501 steps, fp64 | byte-identical (`93F23097...`) |
 | 3.7M, K = 1 vs K = 2, 501 steps, fp32 | byte-identical (`BE3C274C...`) |
 | 3.7M, 1001 steps, fp32, clamp on vs off | floor layer stays at `z = 0.0100` with the clamp, `0.0095` without |
-| 237k, fp64 150 + resume 150 vs 300 | checkpoint SHA256 equal |
-| 237k, fp32 75 + resume 75 vs 150 | checkpoint SHA256 equal |
-| 237k, 301 steps, `SPH_OUTCADENCE=100` | `result0..3`, header steps 0/100/200/300 |
-| `SPH_RANKS=2` + `SPH_CKPT` | refused with a clear message |
+| 237k, single fp64 150 + resume 150 vs 300 | checkpoint SHA256 equal |
+| 237k, single fp32 75 + resume 75 vs 150 | checkpoint SHA256 equal |
+| 237k, K=2, fp64 150 + resume 150 vs 300 | checkpoint SHA256 equal |
+| 237k, K=2, fp32 75 + resume 75 vs 150 | checkpoint SHA256 equal |
+| 237k, K=2, fp32, `SPH_CKPT_EVERY=100`, 300 + resume 100 vs 400 | checkpoint SHA256 equal |
+| 237k, K=2, result0/1/2 across 101 + resume 100 | byte-identical |
+| 3.7M, K=2, fp32 60 + resume 60 vs 120 | checkpoint SHA256 equal (382.7 MB) |
+| resume with a different K | refused with a clear message |
 | `SPH_VERIFY=1`, K = 2, fp32 | both ranks: all `numP` slots in their live cell, 0 missing/0 wrong |
 
 The `SPH_SOLDBOX=off` row is the regression guard: the clamp is the only

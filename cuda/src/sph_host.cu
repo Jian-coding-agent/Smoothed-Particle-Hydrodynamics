@@ -43,6 +43,8 @@ static int g_out_cadence = 500;
 // ---------------------------------------------------------------------------
 static const char SPHCHK_MAGIC[8] = { 'S', 'P', 'H', 'C', 'H', 'K', '\0', '\0' };
 static const uint32_t SPHCHK_VERSION = 2;
+static const char* g_ckpt_out = nullptr;
+static const char* g_ckpt_in = nullptr;
 static int  g_ckpt_every  = 0;
 static bool g_ckpt_wanted = false;   // any checkpoint in play -> hash the deck
 // The solid wall clamp as the user asked for it (main() parses it).  The device
@@ -57,6 +59,24 @@ static uint64_t sph_fnv1a(uint64_t h, const void* p, size_t n)
     return h;
 }
 static const uint64_t SPH_FNV_OFFSET = 14695981039346656037ULL;
+
+// Fingerprint of the deck's constant columns (mass, itype, X0, rho0).  Both
+// checkpoint containers use it, so a resume with a different deck is refused
+// before any state is touched.
+static uint64_t sph_deck_fingerprint(const std::vector<double>& rows, int num)
+{
+    const int nf = 14;
+    uint64_t h = SPH_FNV_OFFSET;
+    for (int i = 0; i < num; ++i)
+    {
+        const size_t b = (size_t)i * nf;
+        h = sph_fnv1a(h, &rows[b + 8], 8);       // mass
+        h = sph_fnv1a(h, &rows[b + 9], 8);       // itype
+        h = sph_fnv1a(h, &rows[b + 10], 3 * 8);  // X0
+        h = sph_fnv1a(h, &rows[b + 13], 8);      // rho0
+    }
+    return h;
+}
 
 // 64-bit stdio seek/tell.  `long` is 32 bits on Windows, and a >2 GB deck (or a
 // failed seek) used to give sz = -1 and an out-of-bounds write at buf[rd].
@@ -505,20 +525,9 @@ struct Solver
 
         // Constants the checkpoint does not store (they belong to the deck, not
         // to the run): hash them so a resume with the wrong deck is refused.
-        // Only a single-GPU deck is checkpointable, so hash the owned rows only.
-        if (g_ckpt_wanted && numAll == num)
-        {
-            uint64_t h = SPH_FNV_OFFSET;
-            for (int i = 0; i < num; ++i)
-            {
-                const size_t b = (size_t)i * nf;
-                h = sph_fnv1a(h, &rows[b + 8], 8);       // mass
-                h = sph_fnv1a(h, &rows[b + 9], 8);       // itype
-                h = sph_fnv1a(h, &rows[b + 10], 3 * 8);  // X0
-                h = sph_fnv1a(h, &rows[b + 13], 8);      // rho0
-            }
-            deck_fp = h;
-        }
+        // The decomposed driver hashes the whole deck itself (the rank rows are
+        // only a slice).
+        if (g_ckpt_wanted && numAll == num) deck_fp = sph_deck_fingerprint(rows, num);
         return true;
     }
 
@@ -1457,11 +1466,20 @@ struct Job
     std::vector<int>    owner;          // [num] current ownership
     std::vector<double> box;            // [6*K] current block bounds
     std::vector<double> pos;            // [3*num] current positions (gathered)
-    std::vector<double> mig;            // [20*num] dynamic state, by gid
+    std::vector<double> mig;            // [20/27*num] dynamic state, by gid
     int  repart = 0;                    // 0 = never
     bool regrid = false;                // re-search the candidate grids too
     long long repart_count = 0;
     double repart_s = 0.0;              // wall spent in repartition (rank 0)
+
+    // ---- multi-GPU checkpoint (SPHD1CK) -------------------------------
+    // ckState is the assembled global state by gid; every rank fills its owned
+    // entries, rank 0 writes the file.  step0 is the absolute step of a resumed
+    // run (0 for a fresh one), resume says to rebuild from the saved positions.
+    std::vector<Real> ckState;
+    uint64_t deck_fp = 0;
+    long long step0 = 0;
+    bool resume = false;
 
     // V2: the neighbour grid every rank bins into (derived once from the deck)
     SphGridBox cellgrid;
@@ -2477,6 +2495,294 @@ static void write_global_result(Job<Real>& J, const typename Job<Real>::OutBuf& 
 }
 
 // ---------------------------------------------------------------------------
+// Multi-GPU checkpoint (SPHD1CK).
+//
+// A decomposed run does not save its decomposition: the file holds the global
+// state by deck id, and a resume rebuilds the ranks with build_job() from the
+// deck and then runs one halo refresh from the restored *current* positions.
+// That re-selects the ghost set for where the particles are now (a stale set
+// would silently drop neighbours), while the physics and the gid summation order
+// remain the ones a straight run uses.  The state is therefore:
+//
+//   x[3], vx[3], rho, SurF, A[9], vecn[3]          (20 values)
+//   u[3], xc[3], rhoc                              (fp32 only, 7 more)
+//
+// exactly the cross-step state of the single-GPU checkpoint.  F/DFdt/Pia,
+// SForce/PIJW, p/irho/SurFD and the cell list are step-local and are rebuilt.
+// ---------------------------------------------------------------------------
+template <class Real>
+constexpr int d1_state_nvals() { return 20 + (sizeof(Real) < sizeof(double) ? 7 : 0); }
+
+// The rank count is not stored in the decomposition (there is none), but it is
+// in the header and a resume must use it: SPH_RANKS=auto reads it before it
+// chooses devices.
+static int read_d1_checkpoint_K(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[ckpt] cannot open %s\n", path); return -1; }
+    unsigned char h[160];
+    if (fread(h, 1, sizeof(h), f) != sizeof(h) || memcmp(h, "SPHD1CK\0", 8) != 0)
+    {
+        fprintf(stderr, "[ckpt] %s: not a multi-GPU checkpoint\n", path);
+        fclose(f); return -1;
+    }
+    fclose(f);
+    uint32_t k = 0;
+    memcpy(&k, h + 28, 4);
+    return (int)k;
+}
+
+template <class Real>
+static uint32_t d1_ckpt_flags()
+{
+    const bool f32 = (sizeof(Real) < sizeof(double));
+    return (f32 ? 1u : 0u)                       // data is float32
+         | (f32 ? 2u : 0u)                       // compensated arrays present
+         | (sph_use_soldbox ? 4u : 0u)           // solid wall clamp
+         | (sph_use_static_solid ? 8u : 0u)      // A3 static solid list
+         | (sph_use_fluid_list ? 16u : 0u)       // P1 fluid neighbour list
+         | (sph_fast_fluid_loop ? 32u : 0u)      // A5 factored pass1
+         | (sph_reflect_guard ? 64u : 0u);       // M8 reflection at z = 1
+}
+
+// Read the header and the global state.  Returns false with a specific message
+// instead of resuming a different problem.
+template <class Real>
+static bool load_d1_checkpoint(const char* path, int num, int ntotal, int solnum,
+                               int K, uint64_t deck_fp,
+                               std::vector<Real>& state, long long& step)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[ckpt] cannot open %s\n", path); return false; }
+    auto bad = [&](const char* why) -> bool
+    {
+        fprintf(stderr, "[ckpt] %s: %s\n", path, why);
+        fclose(f);
+        return false;
+    };
+
+    unsigned char h[160];
+    if (fread(h, 1, sizeof(h), f) != sizeof(h) || memcmp(h, "SPHD1CK\0", 8) != 0)
+        return bad("not a multi-GPU checkpoint (bad magic or short header)");
+    uint32_t ver, hs, hn, hnt, hsold, hk, hnval, flags, gnx, gny, gnz;
+    uint64_t hstep, hfp, payload;
+    double hsml, dt, bz, by0, by1, c0, lamd, muyou;
+    memcpy(&ver, h + 8, 4);   memcpy(&hs, h + 12, 4);
+    memcpy(&hn, h + 16, 4);   memcpy(&hnt, h + 20, 4);
+    memcpy(&hsold, h + 24, 4); memcpy(&hk, h + 28, 4);
+    memcpy(&hnval, h + 32, 4); memcpy(&flags, h + 36, 4);
+    memcpy(&hstep, h + 40, 8); memcpy(&hfp, h + 48, 8);
+    memcpy(&hsml, h + 56, 8);  memcpy(&dt, h + 64, 8);
+    memcpy(&bz, h + 72, 8);    memcpy(&by0, h + 80, 8); memcpy(&by1, h + 88, 8);
+    memcpy(&c0, h + 96, 8);    memcpy(&lamd, h + 104, 8); memcpy(&muyou, h + 112, 8);
+    memcpy(&payload, h + 120, 8);
+    memcpy(&gnx, h + 128, 4);  memcpy(&gny, h + 132, 4); memcpy(&gnz, h + 136, 4);
+
+    if (ver != 1 || hs != 160) return bad("unsupported container version");
+    if (hn != (uint32_t)num || hnt != (uint32_t)ntotal || hsold != (uint32_t)solnum)
+        return bad("particle counts differ from the deck");
+    if (hk != (uint32_t)K)
+    {
+        fprintf(stderr, "[ckpt] %s: checkpoint was run with SPH_RANKS=%u, this run has %d; "
+                        "the decomposition is not stored, so the rank count must match\n",
+                path, hk, K);
+        fclose(f);
+        return false;
+    }
+    if (hnval != (uint32_t)d1_state_nvals<Real>())
+        return bad("state layout does not match this precision");
+    const bool f32 = (sizeof(Real) < sizeof(double));
+    if (((flags & 1u) != 0) != f32 || ((flags & 2u) != 0) != f32)
+        return bad(f32 ? "checkpoint holds fp64 state, this run is fp32"
+                       : "checkpoint holds fp32 state, this run is fp64");
+    if (((flags & 4u) != 0) != (sph_use_soldbox != 0))
+        return bad("solid wall clamp (SPH_SOLDBOX) differs from the run that wrote it");
+    if (sph_use_soldbox && (bz != g_soldbox_z || by0 != g_soldbox_y0 || by1 != g_soldbox_y1))
+        return bad("SPH_SOLDBOX bounds differ from the run that wrote it");
+    if (((flags & 8u) != 0) != (sph_use_static_solid != 0) ||
+        ((flags & 16u) != 0) != (sph_use_fluid_list != 0) ||
+        ((flags & 32u) != 0) != (sph_fast_fluid_loop != 0))
+        return bad("solver switches (SPH_SOLDDYN / SPH_FLUIDLIST / SPH_LITERALFLUID) "
+                   "differ from the run that wrote it");
+    if (((flags & 64u) != 0) != (sph_reflect_guard != 0))
+        return bad("the z = 1 reflection (SPH_REFLECT) differs from the run that wrote it");
+    if (hsml != SPH_HSML || dt != SPH_DT) return bad("hsml/dt differ from this build");
+    if (c0 != SPH_C0 || lamd != SPH_LAMD || muyou != SPH_MUYOU)
+        return bad("c0/lamd/muyou differ from this build");
+    if (hfp != deck_fp)
+    {
+        fprintf(stderr, "[ckpt] %s: deck fingerprint mismatch -- checkpoint 0x%016llx, "
+                        "this deck 0x%016llx\n", path,
+                (unsigned long long)hfp, (unsigned long long)deck_fp);
+        fclose(f);
+        return false;
+    }
+    const uint64_t expect = (uint64_t)hnval * (uint64_t)num * sizeof(Real);
+    if (payload != expect) return bad("payload size does not match the layout");
+    sph_fseek64(f, 0, SEEK_END);
+    const long long sz = sph_ftell64(f);
+    if ((uint64_t)sz != 160 + expect) return bad("file size does not match the header");
+    sph_fseek64(f, 160, SEEK_SET);
+
+    state.resize((size_t)hnval * (size_t)num);
+    if (fread(state.data(), sizeof(Real), state.size(), f) != state.size())
+        return bad("short read (truncated write?)");
+    fclose(f);
+
+    step = (long long)hstep;
+    printf("[ckpt] %s: step %lld, %s, K=%u, %u particles, grid %ux%ux%u, %.1f MB\n",
+           path, step, f32 ? "fp32" : "fp64", hk, hn, gnx, gny, gnz,
+           (double)sz / 1048576.0);
+    return true;
+}
+
+// Copy the owned part of the global checkpoint state into a rank's arrays.
+// Only the owned block is uploaded: a resume runs a halo refresh next, so the
+// initial ghost slots are never read before they are rebuilt.
+template <class Real>
+static void upload_owned_state(Job<Real>& J, Rank<Real>& R)
+{
+    const int n = R.ownNum;
+    if (n <= 0) return;
+    if (J.ckState.size() != (size_t)d1_state_nvals<Real>() * (size_t)J.num)
+    {
+        fprintf(stderr, "[ckpt] internal: checkpoint state has the wrong size\n");
+        std::exit(1);
+    }
+    const size_t N = (size_t)J.num;
+    const int stride = R.S.g.d.numP;
+    auto up = [&](Real* dst, int dstStride, int k0, int comps)
+    {
+        std::vector<Real> buf((size_t)n);
+        for (int c = 0; c < comps; ++c)
+        {
+            CUDA_CHECK(cudaMemcpy(buf.data(), dst + (size_t)c * dstStride,
+                                  (size_t)n * sizeof(Real), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < n; ++i)
+                buf[i] = J.ckState[(size_t)(k0 + c) * N + (size_t)R.gid[i]];
+            CUDA_CHECK(cudaMemcpy(dst + (size_t)c * dstStride, buf.data(),
+                                  (size_t)n * sizeof(Real), cudaMemcpyHostToDevice));
+        }
+    };
+    up(R.S.g.x,    stride, 0, 3);
+    up(R.S.g.vx,   stride, 3, 3);
+    up(R.S.g.rho,  1,      6, 1);
+    up(R.S.g.SurF, 1,      7, 1);
+    up(R.S.g.A,    stride, 8, 9);
+    up(R.S.g.vecn, stride, 17, 3);
+    if constexpr (sizeof(Real) < sizeof(double))
+    {
+        up(R.S.g.u,    stride, 20, 3);
+        up(R.S.g.xc,   stride, 23, 3);
+        up(R.S.g.rhoc, 1,      26, 1);
+    }
+}
+
+template <class Real>
+static void save_d1_checkpoint(Job<Real>& J, Rank<Real>& R, long long step)
+{
+    if (g_ckpt_out == nullptr) return;
+    const int nvals = d1_state_nvals<Real>();
+    if (J.ckState.size() != (size_t)nvals * (size_t)J.num)
+    {
+        fprintf(stderr, "[ckpt] internal: checkpoint buffer has the wrong size\n");
+        std::exit(1);
+    }
+    const int n = R.S.g.d.num, N = R.S.g.d.numP;
+    const size_t NGlobal = (size_t)J.num;
+
+    J.bar.wait();
+    auto down = [&](const Real* src, int srcStride, int k0, int comps)
+    {
+        std::vector<Real> buf((size_t)n);
+        for (int c = 0; c < comps; ++c)
+        {
+            CUDA_CHECK(cudaMemcpy(buf.data(), src + (size_t)c * srcStride,
+                                  (size_t)n * sizeof(Real), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < n; ++i)
+                J.ckState[(size_t)(k0 + c) * NGlobal + (size_t)R.gid[i]] = buf[i];
+        }
+    };
+    down(R.S.g.x,    N, 0, 3);
+    down(R.S.g.vx,   N, 3, 3);
+    down(R.S.g.rho,  1, 6, 1);
+    down(R.S.g.SurF, 1, 7, 1);
+    down(R.S.g.A,    N, 8, 9);
+    down(R.S.g.vecn, N, 17, 3);
+    if constexpr (sizeof(Real) < sizeof(double))
+    {
+        down(R.S.g.u,    N, 20, 3);
+        down(R.S.g.xc,   N, 23, 3);
+        down(R.S.g.rhoc, 1, 26, 1);
+    }
+    J.bar.wait();
+
+    if (R.id == 0)
+    {
+        char tmp[520];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", g_ckpt_out);
+        FILE* f = fopen(tmp, "wb");
+        bool ok = (f != nullptr);
+        if (!ok) fprintf(stderr, "[ckpt] cannot write %s\n", tmp);
+        if (ok)
+        {
+            unsigned char h[160] = {0};
+            const char magic[8] = { 'S','P','H','D','1','C','K','\0' };
+            memcpy(h, magic, 8);
+            const uint32_t ver = 1, hs = 160, hn = (uint32_t)J.num,
+                           hnt = (uint32_t)J.ntotal, hsold = (uint32_t)J.solnum,
+                           hk = (uint32_t)J.K, hnval = (uint32_t)nvals,
+                           flags = d1_ckpt_flags<Real>(),
+                           gnx = (uint32_t)J.gnx, gny = (uint32_t)J.gny, gnz = (uint32_t)J.gnz;
+            const uint64_t payload = (uint64_t)nvals * (uint64_t)J.num * sizeof(Real);
+            memcpy(h + 8, &ver, 4);   memcpy(h + 12, &hs, 4);
+            memcpy(h + 16, &hn, 4);   memcpy(h + 20, &hnt, 4);
+            memcpy(h + 24, &hsold, 4); memcpy(h + 28, &hk, 4);
+            memcpy(h + 32, &hnval, 4); memcpy(h + 36, &flags, 4);
+            const uint64_t step64 = (uint64_t)step;
+            memcpy(h + 40, &step64, 8); memcpy(h + 48, &J.deck_fp, 8);
+            const double hsml = SPH_HSML, dt = SPH_DT;
+            const double c0 = SPH_C0, lamd = SPH_LAMD, muyou = SPH_MUYOU;
+            memcpy(h + 56, &hsml, 8);  memcpy(h + 64, &dt, 8);
+            memcpy(h + 72, &g_soldbox_z, 8);
+            memcpy(h + 80, &g_soldbox_y0, 8);
+            memcpy(h + 88, &g_soldbox_y1, 8);
+            memcpy(h + 96, &c0, 8);    memcpy(h + 104, &lamd, 8);
+            memcpy(h + 112, &muyou, 8); memcpy(h + 120, &payload, 8);
+            memcpy(h + 128, &gnx, 4);  memcpy(h + 132, &gny, 4); memcpy(h + 136, &gnz, 4);
+            ok = (fwrite(h, 1, sizeof(h), f) == sizeof(h));
+            if (ok) ok = (fwrite(J.ckState.data(), sizeof(Real), J.ckState.size(), f) == J.ckState.size());
+            ok = (fflush(f) == 0) && ok;
+            ok = (fclose(f) == 0) && ok;
+            if (!ok)
+            {
+                fprintf(stderr, "[ckpt] write failed: %s\n", tmp);
+                remove(tmp);
+            }
+            else
+            {
+                std::error_code ec;
+                std::filesystem::rename(tmp, g_ckpt_out, ec);
+                if (ec)
+                {
+                    fprintf(stderr, "[ckpt] cannot rename %s -> %s: %s\n", tmp, g_ckpt_out,
+                            ec.message().c_str());
+                }
+                else
+                {
+                    printf("[ckpt] %s: %lld steps, K=%d, %s, %.1f MB\n", g_ckpt_out, step,
+                           J.K, (sizeof(Real) < sizeof(double)) ? "fp32" : "fp64",
+                           (double)(160 + payload) / 1048576.0);
+                    fflush(stdout);
+                }
+            }
+        }
+    }
+    J.bar.wait();
+}
+
+
+// ---------------------------------------------------------------------------
 // Repartition (SPH_D1_REPART=N): recompute the blocks from the *current*
 // positions, move the state the deck cannot reproduce, and rebuild everything
 // that depends on ownership.  All rank threads run this together; the new
@@ -2900,24 +3206,39 @@ static void rank_main(Job<Real>* Jp, int r)
     CUDA_CHECK(cudaMemcpy(R.S.g.gid, R.gid.data(), R.gid.size() * sizeof(int),
                           cudaMemcpyHostToDevice));
 
-    launch_copy_xf(R.S.g, 0);
-    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: deck loaded, numP=%d\n", r, R.S.g.d.numP);
-    monitor_init(R);                  // C9: the reference for the displacement trigger
-    R.S.build_cells();
-    if (getenv("SPH_VERIFY")) R.S.verify_cells();
-    R.S.init_reference_state();
-    CUDA_CHECK(cudaDeviceSynchronize());
-    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: reference state ok\n", r);
-    J.bar.wait();
+    if (J.resume)
+    {
+        // The checkpoint holds global state by deck id, not a decomposition.
+        // Load the owned rows into the initial build_job() ranks, then refresh
+        // the halo from the restored current positions: that re-selects every
+        // ghost the run actually needs now, and the gid summation order still
+        // matches a straight run.
+        upload_owned_state(J, R);
+        repartition(J, R, (int)J.step0, "resume", false);
+        J.bar.wait();
+        if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: resume rebuild ok\n", r);
+    }
+    else
+    {
+        launch_copy_xf(R.S.g, 0);
+        if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: deck loaded, numP=%d\n", r, R.S.g.d.numP);
+        monitor_init(R);                  // C9: the reference for the displacement trigger
+        R.S.build_cells();
+        if (getenv("SPH_VERIFY")) R.S.verify_cells();
+        R.S.init_reference_state();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: reference state ok\n", r);
+        J.bar.wait();
 
-    // the ghost block's static fields, then the solid pack/list that needs them
-    xch_static(J, R);
-    launch_build_solid_pack(R.S.g, 0);
-    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: static exchange + pack ok\n", r);
-    if (sph_use_static_solid) R.S.build_solid_lists();
-    if (getenv("SPH_VERIFY")) R.S.verify_cells();
-    if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: solid lists ok (npair %d, nsolC %d)\n", r, R.S.g.npair, R.S.g.d.nsolC);
-    CUDA_CHECK(cudaDeviceSynchronize());
+        // the ghost block's static fields, then the solid pack/list that needs them
+        xch_static(J, R);
+        launch_build_solid_pack(R.S.g, 0);
+        if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: static exchange + pack ok\n", r);
+        if (sph_use_static_solid) R.S.build_solid_lists();
+        if (getenv("SPH_VERIFY")) R.S.verify_cells();
+        if (getenv("SPH_D1_DBG")) fprintf(stderr, "[dbg] rank %d: solid lists ok (npair %d, nsolC %d)\n", r, R.S.g.npair, R.S.g.d.nsolC);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 
     {
         const int nfb = gra_fallback_count();
@@ -2957,19 +3278,23 @@ static void rank_main(Job<Real>* Jp, int r)
     }
     for (int itime = 0; itime < J.maxStep; ++itime)
     {
+        const long long step = J.step0 + (long long)itime;
+        if (g_ckpt_out != nullptr && g_ckpt_every > 0 && step % g_ckpt_every == 0)
+            save_d1_checkpoint(J, R, step);
+
         const auto s0 = std::chrono::steady_clock::now();
-        step_d1(J, R, itime);
+        step_d1(J, R, (int)step);
         CUDA_CHECK(cudaDeviceSynchronize());
         const auto s1 = std::chrono::steady_clock::now();
         R.step_s += std::chrono::duration<double>(s1 - s0).count();
 
-        if (g_out_cadence > 0 && itime % g_out_cadence == 0)
+        if (g_out_cadence > 0 && step % g_out_cadence == 0)
         {
             // P14: hand the file to a writer thread and keep stepping.  Two stages
             // are enough: a stage is only reused two results later, and rank 0
             // waits for that writer before the barrier that releases it.
             // C20: derived, not stored -- every rank computes the same value
-            const int s = (itime / g_out_cadence) & 1;
+            const int s = (int)((step / g_out_cadence) & 1);
             if (r == 0 && J.outBusy[s])
             {
                 J.outFut[s].wait();
@@ -2980,7 +3305,7 @@ static void rank_main(Job<Real>* Jp, int r)
             J.bar.wait();                 // it now holds every rank's particles
             if (r == 0)
             {
-                const int idx = itime / g_out_cadence;
+                const int idx = (int)(step / g_out_cadence);
                 typename Job<Real>::OutBuf& O = J.out[s];
                 J.outFut[s] = std::async(std::launch::async,
                                          [&J, &O, idx] { write_global_result(J, O, idx); });
@@ -2991,11 +3316,11 @@ static void rank_main(Job<Real>* Jp, int r)
         // repartition at a step boundary, after the result write, so the file
         // still carries the decomposition it was fetched with
         bool due = false;
-        if (J.repart > 0 && itime > 0 && (itime % J.repart) == 0) due = true;
+        if (J.repart > 0 && step > 0 && (step % J.repart) == 0) due = true;
         // C9: the skin has been spent -- rebuild before a pair can be lost.  The
         // decision is identical on every rank (same maximum, same threshold).
         const bool skin_due = R.rebuild_due;
-        if ((due || skin_due) && itime < J.maxStep - 1)
+        if ((due || skin_due) && step < J.step0 + J.maxStep - 1)
         {
             char why[128];
             if (skin_due)
@@ -3003,9 +3328,11 @@ static void rank_main(Job<Real>* Jp, int r)
                          1000.0 * R.last_disp, 1000.0 * J.skin);
             else
                 snprintf(why, sizeof(why), "SPH_D1_REPART");
-            repartition(J, R, itime, why, due);
+            repartition(J, R, (int)step, why, due);
         }
     }
+    if (g_ckpt_out != nullptr)
+        save_d1_checkpoint(J, R, J.step0 + (long long)J.maxStep);
     if (r == 0)                       // P14: let the last writers finish
         for (int s = 0; s < 2; ++s)
             if (J.outBusy[s]) J.outFut[s].wait();
@@ -3179,7 +3506,22 @@ static int run_auto(const char* deck, int maxStep)
     if (skin < 0.0) skin = 0.0;
 
     std::vector<double> pred;
-    const int K = choose_auto_k(D, (int)devs.size(), skin, pred);
+    int K = 0;
+    if (g_ckpt_in != nullptr)
+    {
+        K = read_d1_checkpoint_K(g_ckpt_in);
+        if (K < 1 || K > (int)devs.size())
+        {
+            fprintf(stderr, "[D1] checkpoint needs %d rank(s), %zu device(s) are usable; "
+                            "set SPH_RANKS=K explicitly or free the devices\n", K, devs.size());
+            return 2;
+        }
+        std::printf("[D1] resume: keeping K=%d from %s\n", K, g_ckpt_in);
+    }
+    else
+    {
+        K = choose_auto_k(D, (int)devs.size(), skin, pred);
+    }
     std::vector<int> gpus;
     for (int i = 0; i < K; ++i) gpus.push_back(devs[(size_t)i].id);
     return run<Real>(deck, maxStep, K, gpus);
@@ -3215,6 +3557,16 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
 
     std::vector<double> rows;
     if (!read_deck(deck, rows, J.num, J.ntotal, J.solnum)) return 1;
+
+    if (g_ckpt_wanted) J.deck_fp = sph_deck_fingerprint(rows, J.num);
+    if (g_ckpt_in != nullptr)
+    {
+        if (!load_d1_checkpoint<Real>(g_ckpt_in, J.num, J.ntotal, J.solnum, K,
+                                      J.deck_fp, J.ckState, J.step0))
+            return 5;
+        J.resume = true;
+        if (J.step0 < 0) { fprintf(stderr, "[ckpt] negative step\n"); return 5; }
+    }
 
     // C13: E1 carries only the fluid and solid groups, so a wall ghost would
     // never see its owner's velocity.  Every wall of this deck is static (and a
@@ -3271,11 +3623,13 @@ static int run(const char* deck, int maxStep, int K, const std::vector<int>& gpu
     J.deckRows = std::move(rows);
     // C12 needs one slot per rank whatever the trigger configuration is
     J.a3_fat.assign((size_t)J.K, 0.0);
-    if (J.repart > 0 || J.skin > 0.0)
+    if (J.repart > 0 || J.skin > 0.0 || J.resume)
     {
         J.pos.assign((size_t)3 * J.num, 0.0);
         J.mig.assign((size_t)mig_n<Real> * J.num, 0.0);
     }
+    if (g_ckpt_out != nullptr && J.ckState.empty())
+        J.ckState.assign((size_t)d1_state_nvals<Real>() * (size_t)J.num, Real(0.0));
     if (J.repart > 0)
         std::printf("[D1] repartition every %d steps%s\n", J.repart,
                     J.regrid ? " (re-searching the block grid)" : "");
@@ -3663,7 +4017,9 @@ static void usage()
            "       SPH_RANKS=K / SPH_RANKS=auto, SPH_RANKS_GPUS=0,1,... (multi-GPU)\n"
            "  a resume needs the same deck, precision and solver switches as the run that wrote\n"
            "  the checkpoint; the checkpoint supplies x, vx, rho, SurF, A, vecn (+ u, xc, rhoc in\n"
-           "  fp32).  Checkpointing is single-GPU only.  See cuda/docs/CHECKPOINT.md.\n");
+           "  fp32).  The single-GPU container is SPHCHK; a decomposed run writes SPHD1CK\n"
+           "  (global state by deck id, no decomposition) and resumes by rebuilding from the\n"
+           "  restored positions.  See cuda/docs/CHECKPOINT.md.\n");
 }
 
 // PREC_FP32 / PREC_FP64 for a precision name (case-insensitive), -1 if the
@@ -3762,6 +4118,8 @@ int main(int argc, char** argv)
         return 2;
     }
     g_ckpt_wanted = (ckpt_out != nullptr) || (ckpt_in != nullptr);
+    g_ckpt_out = ckpt_out;
+    g_ckpt_in  = ckpt_in;
     if (ckpt_in != nullptr)
     {
         // the checkpoint carries the step count; --step0 only names a fresh run
@@ -3808,12 +4166,6 @@ int main(int argc, char** argv)
     // ------------------------------------------------------------------
     if (const char* e = getenv("SPH_RANKS"))
     {
-        if (ckpt_out != nullptr || ckpt_in != nullptr)
-        {
-            fprintf(stderr, "checkpoint/resume (SPH_CKPT / SPH_CKPT_IN / --resume) is only "
-                            "implemented for the single-GPU path; leave SPH_RANKS unset\n");
-            return 2;
-        }
         const int K = atoi(e);
         if (!strcmp(e, "auto"))             // L1: rank the devices, choose K
         {

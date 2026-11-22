@@ -71,7 +71,7 @@ Environment variables:
 | `SPH_OUTCADENCE=N` | write a result every N steps (default 500); 0 = no result frames |
 | `SPH_OUT_F32=1` | write results as float32 (half the size); `=0` keeps float64 |
 | `SPH_SOLDBOX="z,y0,y1"` / `=off` | solid wall clamp (default `0.01,0.00,3.31`, the 3.7M case); see below |
-| `SPH_CKPT=<file>` | write a restart state (single-GPU path) |
+| `SPH_CKPT=<file>` | write a restart state (both paths; container depends on it) |
 | `SPH_CKPT_IN=<file>` / `--resume=<file>` | resume from a restart state |
 | `SPH_CKPT_EVERY=N` | checkpoint cadence (0 = only at the end of the run) |
 | `SPH_STEP0=N` / `--step0=N` | absolute step number of a fresh run |
@@ -113,7 +113,7 @@ result-frame cadence are the same on one card and on K cards.
 | | single GPU (`SPH_RANKS` unset) | decomposed (`SPH_RANKS=K>1`) |
 |---|---|---|
 | precision | fp64 or fp32 | fp64 or fp32 |
-| checkpoint / resume | yes (`SPH_CKPT`, `SPH_CKPT_IN`) | no (refused at start-up) |
+| checkpoint / resume | yes (`SPH_CKPT`, `SPH_CKPT_IN`; container `SPHCHK`) | yes (`SPH_CKPT`, `SPH_CKPT_IN`; container `SPHD1CK`) |
 | `SPH_OUTCADENCE`, `SPH_OUT_F32` | yes | yes |
 | `SPH_SOLDBOX` | yes | yes (each rank clamps its owned solids) |
 | `SPH_SORTEDTHREADS` (S1) | yes | yes (fp32 auto; ghosts in `sorted[]` are skipped) |
@@ -148,6 +148,13 @@ float value crosses exactly and V2's byte identity holds for both.
 ```bat
 set SPH_RANKS=8
 sph_cuda.exe input.sphbin
+
+:: restart the same K ranks
+set SPH_CKPT=dam8.chk
+set SPH_CKPT_EVERY=50000
+sph_cuda.exe input.sphbin
+set SPH_MAXSTEP=100000
+sph_cuda.exe input.sphbin --resume=dam8.chk
 ```
 
 | variable | effect |
@@ -188,13 +195,21 @@ The same holds for fp32: 237k K=2 over 501 steps, 3.7M K=2 over 501 steps, and
 237k K=2 with `SPH_D1_REPART=100` (two repartitions) are byte-identical to the
 single fp32 run.
 
-Constraints: checkpoint/resume is single-GPU only (the ghosts would have to be
-saved with the owner's state), and a deck whose walls have a non-zero velocity
-is refused -- the exchange carries the fluid and solid groups only, so a moving
-wall would not reach its ghosts.  The solid wall clamp *is* applied on the
-decomposed path: each rank clamps its owned solids before the next exchange, so
-the ghosts inherit the clamped velocity and K > 1 still matches K = 1 bit for
-bit.
+Constraints: a deck whose walls have a non-zero velocity is refused -- the
+exchange carries the fluid and solid groups only, so a moving wall would not
+reach its ghosts.  The solid wall clamp *is* applied on the decomposed path:
+each rank clamps its owned solids before the next exchange, so the ghosts inherit
+the clamped velocity and K > 1 still matches K = 1 bit for bit.
+
+**Checkpoint on K ranks** uses a different container (`SPHD1CK`): it stores the
+state by deck id and no decomposition, so a resume rebuilds the initial
+`build_job` split from the deck and runs one halo refresh from the restored
+positions.  The rank count must be the same as the run that wrote it (the header
+records K and the loader refuses a mismatch); `SPH_RANKS=auto` reads K from the
+checkpoint before choosing devices.  The resume cost is one halo refresh, and the
+continuation is byte-identical to a straight run -- checked on 237k fp64/fp32,
+with periodic checkpoints, and on the 3.7M fp32 case.  The single-GPU container
+`SPHCHK` is not readable by the decomposed path, and vice versa.
 
 **fp32 on the decomposed path** uses the same fp32 physics kernels as the single
 path.  The exchange records and the repartition migration buffer are double
