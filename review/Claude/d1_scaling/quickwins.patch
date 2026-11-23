@@ -1,0 +1,463 @@
+Quick wins from REVIEW-2026-11-23-d1-scaling.md, against HEAD 5f05f99 (D1 code of f0b7700).
+
+  C21  disp_collect(): reduce the displacement over ALL K ranks, not the linked peers
+       (ranks disagreed on the refresh step -> use-after-free / hang); xch_pack() no
+       longer rewrites R.nSendE1 every step.
+  C22  repartition(): publish J.box = P.box with the new ownership on a re-cut.
+  P21  one host sync per step: no stream sync after the E1 unpack, no per-step
+       cudaDeviceSynchronize (kept under SPH_D1PROF); the E1 scatter also writes
+       xf / irho / p of the ghost slots, replacing k_xch_fixup and k_copy_xf.
+  P22  block size per launch from n and the SM count (SPH_BLK=32|64|128|256 forces one).
+
+Every change is byte-identical to K = 1 at HEAD: input.dat K=1 and K=8 (6001 steps, 22
+refreshes); dam.dat K=1, K=4 x-slabs, K=8 default split, K=8 re-grid (3001 steps each).
+
+Apply from the repository root:   git apply review/Claude/d1_scaling/quickwins.patch
+
+--- a/cuda/src/sph_kernels.cu
++++ b/cuda/src/sph_kernels.cu
+@@ -1696,6 +1696,14 @@
+     s.x[g]   = o[0]; s.x[N + g]   = o[1]; s.x[2 * N + g]   = o[2];
+     s.vx[g]  = o[3]; s.vx[N + g]  = o[4]; s.vx[2 * N + g]  = o[5];
+     s.rho[g] = o[6]; s.SurFD[g]   = o[7];
++    // PERF: what launch_copy_xf and k_xch_fixup did for this slot, same expressions
++    s.xf[g] = (float)o[0]; s.xf[N + g] = (float)o[1]; s.xf[2 * N + g] = (float)o[2];
++    const double rho = o[6];
++    s.irho[g] = 1.0 / rho;
++    const double C0 = SPH_C0;
++    double pv = C0 * C0 * (rho - 1000.0);
++    if (rho < 1000.0) pv = 0.0;
++    s.p[g] = pv;
+ }
+ 
+ __device__ __forceinline__ void sph_xch_read_s(const SphPtrsD& s, int q, double* o)
+@@ -1710,6 +1718,9 @@
+     s.x[g]  = o[0]; s.x[N + g]  = o[1]; s.x[2 * N + g]  = o[2];
+     s.vx[g] = o[3]; s.vx[N + g] = o[4]; s.vx[2 * N + g] = o[5];
+     s.rho[g] = o[6];
++    // PERF: was launch_copy_xf + k_xch_fixup (irho only for a ghost solid)
++    s.xf[g] = (float)o[0]; s.xf[N + g] = (float)o[1]; s.xf[2 * N + g] = (float)o[2];
++    s.irho[g] = 1.0 / o[6];
+ }
+ 
+ // irho of the ghost block, and p of the ghost *fluid* block: exactly the
+@@ -1839,11 +1850,46 @@
+ // ---------------------------------------------------------------------------
+ static const int BLK = 256;
+ 
++// PERF: block size per launch.  Every kernel here is one thread per particle and
++// the heavy ones are fp64-pipe bound (1/64 rate on GeForce), so the step time of a
++// kernel is set by the SM that received the most blocks.  With 256-thread blocks a
++// K=8 rank of the 237k deck (12.7k fluid) launches 50 blocks on a 170-SM card and
++// leaves 120 SMs idle.  Pick the size in {32..256} that minimises the per-SM
++// critical path ceil(ceil(n/bs)/SMs)*bs (ties -> larger).  Per-thread arithmetic is
++// unchanged, so the results are bit-identical.  SPH_BLK=32|64|128|256 forces one.
++static int sph_force_blk = [] {
++    const char* e = getenv("SPH_BLK");
++    const int b = e ? atoi(e) : 0;
++    return (b == 32 || b == 64 || b == 128 || b == 256) ? b : 0;
++}();
++static inline int sph_num_sms()
++{
++    static thread_local int dev = -1, sms = 0;
++    int d = 0;
++    cudaGetDevice(&d);
++    if (d != dev) { dev = d; cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, d); if (sms <= 0) sms = 1; }
++    return sms;
++}
++static inline int bs(int n)
++{
++    if (sph_force_blk) return sph_force_blk;
++    if (n <= 0) return BLK;
++    const long long sms = sph_num_sms();
++    int best = BLK;
++    long long bestT = -1;
++    for (int b = BLK; b >= 32; b >>= 1)
++    {
++        const long long nb = (n + b - 1) / b;
++        const long long t = ((nb + sms - 1) / sms) * b;
++        if (bestT < 0 || t < bestT) { bestT = t; best = b; }
++    }
++    return best;
++}
+ // at least one block: a <<<0, BLK>>> launch is an "invalid configuration"
+ // error, and a rank of the domain decomposition can own no solid at all (the
+ // solid-only kernels then have nothing to do; every one of them starts with an
+ // index bound check, so the dummy block is harmless).
+-static inline int nblocks(int n) { return n > 0 ? (n + BLK - 1) / BLK : 1; }
++static inline int nb(int n) { const int b = bs(n); return n > 0 ? (n + b - 1) / b : 1; }
+ 
+ // A3 switch, see sph.h: 0 = pre-A3 path (cell list walk every step)
+ int sph_use_static_solid = 1;
+@@ -1870,7 +1916,7 @@
+ template <class Real>
+ void launch_cell_hist(SphPtrsT<Real> s, int* d_count, int* d_solid, int* d_fluid, cudaStream_t st)
+ {
+-    k_cell_hist<Real><<<nblocks(s.d.numP), BLK, 0, st>>>(s, d_count, d_solid, d_fluid);
++    k_cell_hist<Real><<<nb(s.d.numP), bs(s.d.numP), 0, st>>>(s, d_count, d_solid, d_fluid);
+ }
+ 
+ template <class Real>
+@@ -1882,48 +1928,48 @@
+     // P13: owned solids first, then the ghost solids; walls and ghost fluids have
+     // no slot at all
+     if (s.d.solnum > 0)
+-        k_build_solid_pack<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal, 0, s.d.solnum);
++        k_build_solid_pack<Real><<<nb(s.d.solnum), bs(s.d.solnum), 0, st>>>(s, s.d.ntotal, 0, s.d.solnum);
+     if (s.d.ngs > 0)
+-        k_build_solid_pack<Real><<<nblocks(s.d.ngs), BLK, 0, st>>>(s, s.d.gs0, s.d.solnum, s.d.ngs);
++        k_build_solid_pack<Real><<<nb(s.d.ngs), bs(s.d.ngs), 0, st>>>(s, s.d.gs0, s.d.solnum, s.d.ngs);
+ }
+ 
+ template <class Real>
+ void launch_copy_xf(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_copy_xf<Real><<<nblocks(s.d.numP), BLK, 0, st>>>(s);
++    k_copy_xf<Real><<<nb(s.d.numP), bs(s.d.numP), 0, st>>>(s);
+ }
+ 
+ template <class Real>
+ void launch_solid_pair_count(SphPtrsT<Real> s, int* d_cnt, cudaStream_t st)
+ {
+-    k_solid_pair_count<Real><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s, d_cnt);
++    k_solid_pair_count<Real><<<nb(s.d.nsolC), bs(s.d.nsolC), 0, st>>>(s, d_cnt);
+ }
+ 
+ template <class Real>
+ void launch_solid_pair_fill(SphPtrsT<Real> s, int* d_cur, cudaStream_t st)
+ {
+     if (sph_a3_lean)
+-        k_solid_pair_fill<Real, true><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s, d_cur);
++        k_solid_pair_fill<Real, true><<<nb(s.d.nsolC), bs(s.d.nsolC), 0, st>>>(s, d_cur);
+     else
+-        k_solid_pair_fill<Real, false><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s, d_cur);
++        k_solid_pair_fill<Real, false><<<nb(s.d.nsolC), bs(s.d.nsolC), 0, st>>>(s, d_cur);
+ }
+ 
+ template <class Real>
+ void launch_fluid_nbr_build(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_fluid_nbr_build<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
++    k_fluid_nbr_build<Real><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s);
+ }
+ 
+ template <class Real>
+ void launch_pass1_fluid_over_list(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_pass1_fluid_body<Real, true><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
++    k_pass1_fluid_body<Real, true><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s);
+ }
+ 
+ void launch_cell_sort(const int* d_cellStart, int* d_sorted, int ncell,
+                       const int* d_gid, cudaStream_t st)
+ {
+-    k_cell_sort<<<(ncell + BLK - 1) / BLK, BLK, 0, st>>>(d_cellStart, d_sorted, ncell, d_gid);
++    k_cell_sort<<<nb(ncell), bs(ncell), 0, st>>>(d_cellStart, d_sorted, ncell, d_gid);
+ }
+ 
+ // P15: the exclusive scan over the cells used to be a single 512-thread block,
+@@ -1959,19 +2005,19 @@
+ template <class Real>
+ void launch_cell_scatter(SphPtrsT<Real> s, int* d_cursor, cudaStream_t st)
+ {
+-    k_cell_scatter<Real><<<nblocks(s.d.numP), BLK, 0, st>>>(s, d_cursor);
++    k_cell_scatter<Real><<<nb(s.d.numP), bs(s.d.numP), 0, st>>>(s, d_cursor);
+ }
+ 
+ template <class Real>
+ void launch_count_pairs(SphPtrsT<Real> s, int* d_niac, cudaStream_t st)
+ {
+-    k_count_pairs<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_niac);
++    k_count_pairs<Real><<<nb(s.d.num), bs(s.d.num), 0, st>>>(s, d_niac);
+ }
+ 
+ template <class Real>
+ void launch_nbr_count(SphPtrsT<Real> s, int* d_out, cudaStream_t st)
+ {
+-    k_nbr_count<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_out);
++    k_nbr_count<Real><<<nb(s.d.num), bs(s.d.num), 0, st>>>(s, d_out);
+ }
+ 
+ template <class Real>
+@@ -1983,14 +2029,14 @@
+ template <class Real>
+ void launch_bench_loads(SphPtrsT<Real> s, Real* out, bool scatter, cudaStream_t st)
+ {
+-    if (scatter) k_bench_loads<Real, true><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s, out);
+-    else         k_bench_loads<Real, false><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s, out);
++    if (scatter) k_bench_loads<Real, true><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s, out);
++    else         k_bench_loads<Real, false><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s, out);
+ }
+ 
+ template <class Real>
+ void launch_prepare(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_prepare<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s);
++    k_prepare<Real><<<nb(s.d.num), bs(s.d.num), 0, st>>>(s);
+ }
+ 
+ template <class Real>
+@@ -2005,7 +2051,7 @@
+ {
+     if (!sph_fast_fluid_loop)
+     {
+-        k_pass1_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
++        k_pass1_fluid<Real><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s);
+         return;
+     }
+     // P1: the list pays off only in fp64; fp32 is traversal bound and the fused
+@@ -2014,15 +2060,15 @@
+     {
+         if (sph_use_fluid_list && s.fwidth > 0)
+         {
+-            k_fluid_nbr_build<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
+-            k_pass1_fluid_body<Real, true><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
++            k_fluid_nbr_build<Real><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s);
++            k_pass1_fluid_body<Real, true><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s);
+             return;
+         }
+-        k_pass1_fluid_body<Real, false><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
++        k_pass1_fluid_body<Real, false><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s);
+     }
+     else
+     {
+-        k_pass1_fluid_body<Real, false><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
++        k_pass1_fluid_body<Real, false><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s);
+     }
+ }
+ 
+@@ -2032,18 +2078,18 @@
+     if (sph_use_static_solid)   // C19: one path for the whole run, even with no pair
+     {
+         if (sph_a3_lean)
+-            k_pass1_solid_static<Real, true><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s);
++            k_pass1_solid_static<Real, true><<<nb(s.d.nsolC), bs(s.d.nsolC), 0, st>>>(s);
+         else
+-            k_pass1_solid_static<Real, false><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s);
++            k_pass1_solid_static<Real, false><<<nb(s.d.nsolC), bs(s.d.nsolC), 0, st>>>(s);
+     }
+     else
+-        k_pass1_solid<Real><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s);
++        k_pass1_solid<Real><<<nb(s.d.nsolC), bs(s.d.nsolC), 0, st>>>(s);
+ }
+ 
+ template <class Real>
+ void launch_pass2_fluid(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_pass2_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s);
++    k_pass2_fluid<Real><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s);
+ }
+ 
+ template <class Real>
+@@ -2052,36 +2098,36 @@
+     if (sph_use_static_solid)   // C19: one path for the whole run, even with no pair
+     {
+         if (sph_a3_lean)
+-            k_pass2_solid_static<Real, true><<<nblocks(s.d.solnum), BLK, 0, st>>>(s);
++            k_pass2_solid_static<Real, true><<<nb(s.d.solnum), bs(s.d.solnum), 0, st>>>(s);
+         else
+-            k_pass2_solid_static<Real, false><<<nblocks(s.d.solnum), BLK, 0, st>>>(s);
++            k_pass2_solid_static<Real, false><<<nb(s.d.solnum), bs(s.d.solnum), 0, st>>>(s);
+     }
+     else
+-        k_pass2_solid<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
++        k_pass2_solid<Real><<<nb(s.d.solnum), bs(s.d.solnum), 0, st>>>(s, s.d.ntotal);
+ }
+ 
+ template <class Real>
+ void launch_update_fluid(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_update_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s, sph_reflect_guard);
++    k_update_fluid<Real><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s, sph_reflect_guard);
+ }
+ 
+ template <class Real>
+ void launch_update_solid(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_update_solid<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
++    k_update_solid<Real><<<nb(s.d.solnum), bs(s.d.solnum), 0, st>>>(s, s.d.ntotal);
+ }
+ 
+ template <class Real>
+ void launch_update_pos(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_update_pos<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s);
++    k_update_pos<Real><<<nb(s.d.num), bs(s.d.num), 0, st>>>(s);
+ }
+ 
+ template <class Real>
+ void launch_constitution(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_constitution<Real><<<nblocks(s.d.nsolC), BLK, 0, st>>>(s);
++    k_constitution<Real><<<nb(s.d.nsolC), bs(s.d.nsolC), 0, st>>>(s);
+ }
+ 
+ template <class Real>
+@@ -2094,33 +2140,33 @@
+ template <class Real>
+ void launch_update(SphPtrsT<Real> s, cudaStream_t st)
+ {
+-    k_update_fluid<Real><<<nblocks(s.d.ntotal), BLK, 0, st>>>(s, sph_reflect_guard);
+-    k_update_solid<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, s.d.ntotal);
+-    k_update_pos<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s);
++    k_update_fluid<Real><<<nb(s.d.ntotal), bs(s.d.ntotal), 0, st>>>(s, sph_reflect_guard);
++    k_update_solid<Real><<<nb(s.d.solnum), bs(s.d.solnum), 0, st>>>(s, s.d.ntotal);
++    k_update_pos<Real><<<nb(s.d.num), bs(s.d.num), 0, st>>>(s);
+ }
+ 
+ template <class Real>
+ void launch_nor_sumvecn(SphPtrsT<Real> s, Real* d_sumvecn, cudaStream_t st)
+ {
+-    k_nor_sumvecn<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_sumvecn);
++    k_nor_sumvecn<Real><<<nb(s.d.num), bs(s.d.num), 0, st>>>(s, d_sumvecn);
+ }
+ 
+ template <class Real>
+ void launch_nor_normalize(SphPtrsT<Real> s, Real* d_sumvecn, cudaStream_t st)
+ {
+-    k_nor_normalize<Real><<<nblocks(s.d.num), BLK, 0, st>>>(s, d_sumvecn);
++    k_nor_normalize<Real><<<nb(s.d.num), bs(s.d.num), 0, st>>>(s, d_sumvecn);
+ }
+ 
+ template <class Real>
+ void launch_gra_correc(SphPtrsT<Real> s, Real* d_a, cudaStream_t st)
+ {
+-    k_gra_correc<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, d_a, s.d.ntotal);
++    k_gra_correc<Real><<<nb(s.d.solnum), bs(s.d.solnum), 0, st>>>(s, d_a, s.d.ntotal);
+ }
+ 
+ template <class Real>
+ void launch_gra_invert(SphPtrsT<Real> s, Real* d_a, cudaStream_t st)
+ {
+-    k_gra_invert<Real><<<nblocks(s.d.solnum), BLK, 0, st>>>(s, d_a, s.d.ntotal);
++    k_gra_invert<Real><<<nb(s.d.solnum), bs(s.d.solnum), 0, st>>>(s, d_a, s.d.ntotal);
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -2140,9 +2186,9 @@
+     if (n <= 0) return;
+     switch (mode)
+     {
+-        case 0: k_xch_gather<0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
+-        case 1: k_xch_gather<1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
+-        default: k_xch_gather<4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_stage); break;
++        case 0: k_xch_gather<0><<<nb(n), bs(n), 0, st>>>(s, d_idx, d_off, n, d_stage); break;
++        case 1: k_xch_gather<1><<<nb(n), bs(n), 0, st>>>(s, d_idx, d_off, n, d_stage); break;
++        default: k_xch_gather<4><<<nb(n), bs(n), 0, st>>>(s, d_idx, d_off, n, d_stage); break;
+     }
+ }
+ 
+@@ -2152,9 +2198,9 @@
+     if (n <= 0) return;
+     switch (mode)
+     {
+-        case 0: k_xch_scatter<0><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
+-        case 1: k_xch_scatter<1><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
+-        default: k_xch_scatter<4><<<nblocks(n), BLK, 0, st>>>(s, d_idx, d_off, n, d_base); break;
++        case 0: k_xch_scatter<0><<<nb(n), bs(n), 0, st>>>(s, d_idx, d_off, n, d_base); break;
++        case 1: k_xch_scatter<1><<<nb(n), bs(n), 0, st>>>(s, d_idx, d_off, n, d_base); break;
++        default: k_xch_scatter<4><<<nb(n), bs(n), 0, st>>>(s, d_idx, d_off, n, d_base); break;
+     }
+ }
+ 
+@@ -2166,14 +2212,14 @@
+     const int n = s.d.numP - s.d.num;
+     if (n <= 0) return;
+     const int nfluid = s.d.gs0 - s.d.num;
+-    k_xch_fixup<<<nblocks(n), BLK, 0, st>>>(s, s.d.num, nfluid);
++    k_xch_fixup<<<nb(n), bs(n), 0, st>>>(s, s.d.num, nfluid);
+ }
+ 
+ void launch_disp_max(const SphPtrsD s, const double* d_xbuild,
+                      unsigned long long* d_max, cudaStream_t st)
+ {
+     if (s.d.num <= 0) return;
+-    k_disp_max<<<nblocks(s.d.num), BLK, 0, st>>>(s, d_xbuild, d_max);
++    k_disp_max<<<nb(s.d.num), bs(s.d.num), 0, st>>>(s, d_xbuild, d_max);
+ }
+ 
+ // P17: the reduced value goes into the tail of the E1 staging block, so it is
+--- a/cuda/src/sph_host.cu
++++ b/cuda/src/sph_host.cu
+@@ -1766,7 +1766,7 @@
+     (void)mode;                        // one exchange point left (P11)
+     size_t bytes = ((size_t)SPH_XCH_REC_F * R.nSend[0] +
+                     (size_t)SPH_XCH_REC_S * R.nSend[1]) * sizeof(double);
+-    R.nSendE1 = bytes / sizeof(double);
++    // C21: nSendE1 is fixed by build_ranks and read by every rank; do not rewrite it here
+     launch_xch_gather(S.g, 0, R.dSendIdx[0], R.dSendOff[0], R.nSend[0], R.dStage, 0);
+     launch_xch_gather(S.g, 1, R.dSendIdx[1], R.dSendOff[1], R.nSend[1], R.dStage, 0);
+     // P17: the halo trigger's input rides in the tail of this block, so the copy
+@@ -1818,11 +1818,10 @@
+         CUDA_CHECK(cudaMemcpyAsync(R.dStage, R.hRecv, bytes, cudaMemcpyHostToDevice, 0));
+     launch_xch_scatter(S.g, 0, R.dRecvIdx[0], R.dRecvOff[0], R.nRecv[0], R.dStage, 0);
+     launch_xch_scatter(S.g, 1, R.dRecvIdx[1], R.dRecvOff[1], R.nRecv[1], R.dStage, 0);
+-    // TASK 2 / P9: p and irho travel for free -- rebuild them for the ghost
+-    // block with the same expressions k_prepare uses on the owner (rho arrived
+-    // exact, so the bits match).
+-    launch_xch_fixup(S.g, 0);
+-    CUDA_CHECK(cudaStreamSynchronize(0));
++    // PERF: the scatter kernels now also rebuild irho/p and the float copy xf of
++    // the slots they write (was launch_xch_fixup + launch_copy_xf over numP).
++    // PERF: no stream sync here -- every later kernel is on the same stream, and
++    // hRecv/dStage are only rewritten after the next step's D2H sync.
+     const double t_sync = now_s();
+     R.x_h += t_sync - tr;
+     R.xch_s   += t_sync - t0;
+@@ -1908,7 +1907,7 @@
+         R.rebuild_due = (R.disp > thresh);
+         R.last_disp = R.disp;
+     }
+-    launch_copy_xf(S.g, 0);          // ghosts moved: refresh the float copy
++    // PERF: xf of the ghost slots is written by the E1 scatter itself
+ 
+     CUDA_CHECK(cudaMemsetAsync(S.g.cellCur, 0, (size_t)(S.g.d.ncell + 1) * sizeof(int), 0));
+     CUDA_CHECK(cudaMemsetAsync(S.g.cellSolid, 0, S.g.d.ncell * sizeof(int), 0));
+@@ -2105,11 +2104,17 @@
+ // blocks -- the same relay it already performs, no readback of its own.
+ static void disp_collect(Job& J, Rank& R)
+ {
+-    if (!R.dXBuild || R.nSendE1 == 0) { R.disp = 0.0; return; }
+-    double mx = R.hSendB[R.sendSlot][R.nSendE1];
+-    for (const DLink& L : R.links)
+-    {
+-        const double v = J.ranks[L.peer].hSendB[R.sendSlot][L.peerE1];
++    // C21: the rebuild is collective, so every rank must reach the same decision:
++    // reduce over ALL K tails, not just the linked peers.  Every rank's D2H has
++    // completed before it arrived at the E1 barrier, and no rank can rewrite this
++    // half before the next barrier, so reading a non-peer's block is as safe as the
++    // relay.  A rank that sends no E1 record still writes its tail at offset 0.
++    double mx = 0.0;
++    for (int r = 0; r < J.K; ++r)
++    {
++        const Rank& P = J.ranks[(size_t)r];
++        if (!P.dXBuild) continue;
++        const double v = P.hSendB[R.sendSlot][P.nSendE1];
+         if (v > mx) mx = v;
+     }
+     R.disp = mx;
+@@ -2248,6 +2253,10 @@
+                 J.gnx = P.nx; J.gny = P.ny; J.gnz = P.nz;
+             }
+             J.owner = P.owner;
++            // C22: the ghost selection below tests against J.box, so a re-cut must
++            // publish the new boxes with the new ownership (P16 dropped this line;
++            // the halo was then chosen around the previous layout's boxes).
++            J.box = P.box;
+         }
+         else
+         {
+@@ -2478,8 +2487,12 @@
+     {
+         const auto s0 = std::chrono::steady_clock::now();
+         step_d1(J, R, itime);
+-        CUDA_CHECK(cudaDeviceSynchronize());
++        // PERF: no per-step device sync -- the next step's E1 D2H sync waits for
++        // this step's kernels anyway; the host runs ahead and enqueues meanwhile.
++        if (J.prof) CUDA_CHECK(cudaDeviceSynchronize());
+         const auto s1 = std::chrono::steady_clock::now();
++        // PERF: without the per-step sync this is host enqueue time, not GPU time;
++        // only the wall clock (t_start/t_end) is reported (P19)
+         R.step_s += std::chrono::duration<double>(s1 - s0).count();
+ 
+         if (itime % 500 == 0)
