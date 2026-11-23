@@ -4,6 +4,7 @@ out/
 
 # Simulation output
 result*.dat
+sim-demo-*.dat
 *.sphbin
 gpu_*.bin
 
@@ -23,7 +24,12 @@ __pycache__/
 
 # Archives and local notes
 *.zip
+*.rar
 NEXT_SESSION.md
+
+# Rendered demos (local video and stills)
+*.mp4
+*_末帧.png
 
 # OS clutter
 Thumbs.db
